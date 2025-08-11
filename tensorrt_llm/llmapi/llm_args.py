@@ -2257,6 +2257,7 @@ class TorchLlmArgs(BaseLlmArgs):
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
+        logger.info(f"llm_args.py line 2260 self.cuda_graph_config: {self.cuda_graph_config}")
         return PyTorchConfig(
             extra_resource_managers=self.extra_resource_managers,
             use_cuda_graph=bool(self.cuda_graph_config is not None),

@@ -159,6 +159,7 @@ class TransformersTokenizer(TokenizerBase):
         """
         # HF incremental detokenization implementation is faster than TRTLLM when stream_interval is smaller.
         if (TLLM_INCREMENTAL_DETOKENIZATION_BACKEND == "TRTLLM"
+                or not hasattr(self.tokenizer, '_tokenizer')
                 or stream_interval >= TLLM_STREAM_INTERVAL_THRESHOLD
                 or spaces_between_special_tokens is False):
             return self.trtllm_decode_incrementally(

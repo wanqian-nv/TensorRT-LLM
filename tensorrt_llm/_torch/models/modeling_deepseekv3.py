@@ -524,7 +524,10 @@ class Deepseekv3MoE(nn.Module):
                               all_rank_num_tokens, all_rank_max_num_tokens,
                               do_finalize):
         # max-throughput
-        use_dp_padding = False
+        if self.use_dp:
+            use_dp_padding = True
+        else:
+            use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
             if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
@@ -533,6 +536,19 @@ class Deepseekv3MoE(nn.Module):
                                           sizes=all_rank_num_tokens)
 
         router_logits = self.gate(hidden_states)
+        if use_dp_padding:
+            if hidden_states is not None:
+                hidden_states = torch.nn.functional.pad(
+                    hidden_states,
+                    (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
+            if hidden_states_fp4 is not None:
+                hidden_states_fp4 = torch.nn.functional.pad(
+                    hidden_states_fp4,
+                    (0, 0, 0, all_rank_max_num_tokens - hidden_states_fp4.shape[0]))
+            if router_logits is not None:
+                router_logits = torch.nn.functional.pad(
+                    router_logits,
+                    (0, 0, 0, all_rank_max_num_tokens - router_logits.shape[0]))
 
         routed_output = self.experts(
             hidden_states_fp4 or hidden_states,
@@ -745,8 +761,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+
         if residual is None:
             residual = hidden_states
+            if hidden_states.shape[0] == 0:
+                logger.warning(f'modeleling_deepseekv3.py: line 768, layernorm hidden_states.shape[0] == 0')
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
         hidden_states = self.self_attn(
@@ -779,6 +798,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> torch.Tensor:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
+
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
@@ -786,7 +806,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                          or self.mapping.tp_size == 1)),
+                                            or self.mapping.tp_size == 1)),
                 do_finalize=do_finalize,
             )
 
@@ -807,16 +827,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
+            # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
             not (hidden_states.shape[0] <= self.moe_allreduce.max_token
-                 and self.fusion_config.POST_MOE_FUSION
-                 and self.model_config.moe_backend == "TRTLLM"
-                 and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
+                    and self.fusion_config.POST_MOE_FUSION
+                    and self.model_config.moe_backend == "TRTLLM"
+                    and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
         hidden_states = _run_MoE(hidden_states,
-                                 hidden_states_fp4=None,
-                                 do_finalize=do_finalize)
+                                    hidden_states_fp4=None,
+                                    do_finalize=do_finalize)
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
@@ -853,6 +873,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
+
 
         return hidden_states, residual
 
@@ -1177,6 +1198,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+
+        logger.info(f'attn_metadata.all_rank_num_tokens: {attn_metadata.all_rank_num_tokens}')
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
         hidden_states = self.model(
             input_ids=input_ids,

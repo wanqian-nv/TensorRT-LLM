@@ -168,6 +168,7 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.enable_cuda_graph = model_engine.pytorch_backend_config.use_cuda_graph
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -436,12 +437,12 @@ class PyExecutor:
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
                 logger.info(
+                    f"time_stamp = {formatted_timestamp}, "
                     f"iter = {self.model_engine.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, "
                     f"elapsed_time = {end_time - start_time}s, "
-                    f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
 
@@ -888,7 +889,7 @@ class PyExecutor:
                 "probably run out of resource.")
 
         self.num_scheduled_requests = scheduled_batch.batch_size
-        logger.debug(
+        logger.info(
             f'has {len(self.active_requests)} active_request, '
             f'scheduled {len(scheduled_batch.context_requests)} context requests and '
             f'{len(scheduled_batch.generation_requests)} generation requests')
@@ -915,13 +916,13 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 if scheduled_batch is None:
                     break
-
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0 or (
-                        self.enable_attention_dp and self.dist.tp_size > 1):
+                    self.enable_attention_dp and self.dist.tp_size > 1):
+
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -934,13 +935,15 @@ class PyExecutor:
                     if self.drafter is not None and self.use_spec_decode:
                         self.drafter.prepare_draft_tokens(
                             scheduled_batch, self.resource_manager)
-
+                            
+                    # if scheduled_batch.batch_size > 0 or self.enable_cuda_graph:
                     batch_outputs = self._forward_step(scheduled_batch)
+
                     self._execute_guided_decoder(scheduled_batch,
-                                                 batch_outputs['logits'])
+                                                batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
+                                                    batch_outputs)
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state)
@@ -957,7 +960,7 @@ class PyExecutor:
                     self.resource_manager.update_resources(scheduled_batch)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
-
+                    
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
 
@@ -970,6 +973,8 @@ class PyExecutor:
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
+
+                    logger.info(f'iter_stats: {iter_stats.to_json_str()}')
 
     def _prepare_draft_requests(self):
         try:
@@ -1483,9 +1488,6 @@ class PyExecutor:
         new_responses = []
         requests_to_terminate = []
         new_active_requests = []
-        logger.debug(
-            f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
-        )
         for request in self.active_requests:
             req_id = request.py_request_id
             # no responses for dummy request, and finish it

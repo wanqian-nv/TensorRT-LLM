@@ -534,7 +534,8 @@ class WideEPMoE(MoE):
                             self.scaling_vector_size,
                             sfUseUE8M0=False,
                             swizzedLayout=False)
-                    x_sf = x_sf.view((x_row, -1))
+                    # x_sf = x_sf.view((x_row, -1))
+                    x_sf = x_sf.view((x_row, x_col if x_row == 0 else -1))
 
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
@@ -725,6 +726,7 @@ class WideEPMoE(MoE):
         all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
+
         assert all_rank_num_tokens is not None
         assert use_dp_padding is not None
 

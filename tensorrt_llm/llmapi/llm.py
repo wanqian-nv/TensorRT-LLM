@@ -143,6 +143,7 @@ class BaseLLM:
                         f"{self.__class__.__name__} got invalid argument: {key}"
                     )
 
+            logger.info(f"llm.py line 146 kwargs: {kwargs}")
             self.args = llm_args_cls.from_kwargs(
                 model=model,
                 tokenizer=tokenizer,
@@ -154,6 +155,7 @@ class BaseLLM:
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
                 **kwargs)
+            logger.info(f"llm.py line 157 LLM.args: {self.args}")
 
         except Exception as e:
             logger.error(

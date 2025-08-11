@@ -266,11 +266,25 @@ class CutlassFusedMoE(MoE):
                 assert len(
                     x_sf.shape
                 ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
-            x, x_sf, token_selected_experts, token_final_scales = allgather(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                self.mapping,
-                dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
+                        
+            try:
+                x, x_sf, token_selected_experts, token_final_scales = allgather(
+                    [x, x_sf, token_selected_experts, token_final_scales],
+                    self.mapping,
+                    dim=0,
+                    sizes=None if use_dp_padding else all_rank_num_tokens)
+            except Exception as allgather_e:
+                print(f"[DEBUG] allgather failed with error: {allgather_e}")
+                print(f"[DEBUG] Error type: {type(allgather_e)}")
+                print(f"  x.shape: {x.shape if x is not None else 'None'}")
+                print(f"  x_sf.shape: {x_sf.shape if x_sf is not None else 'None'}")
+                print(f"  token_selected_experts.shape: {token_selected_experts.shape if token_selected_experts is not None else 'None'}")
+                print(f"  token_final_scales.shape: {token_final_scales.shape if token_final_scales is not None else 'None'}")
+                print(f"  self.mapping.tp_size: {self.mapping.tp_size}")
+                print(f"  self.mapping.tp_rank: {self.mapping.tp_rank}")
+                print(f"  use_dp_padding: {use_dp_padding}")
+                print(f"  all_rank_num_tokens: {all_rank_num_tokens if not use_dp_padding else 'None'}")
+                raise
             x_row = x.shape[0]
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
@@ -324,6 +338,7 @@ class CutlassFusedMoE(MoE):
         all_rank_max_num_tokens: Optional[int] = None,
         use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
+
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
         if self.use_dp:
             assert all_rank_num_tokens is not None

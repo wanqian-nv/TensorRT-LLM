@@ -166,6 +166,7 @@ def allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
+
     if mapping.tp_size == 1:
         return input
 

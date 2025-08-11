@@ -15,6 +15,9 @@ from ..distributed import Distributed
 from .llm_request import ExecutorRequest, executor_request_to_llm_request
 from .sampler import Sampler, TorchSampler
 
+from tensorrt_llm.logger import logger
+
+
 SHUTDOWN_REQUEST_ID = -1
 
 
@@ -324,6 +327,7 @@ class ExecutorRequestQueue:
         for num_active_requests in responses_list:
             all_ranks_num_active_requests.append(num_active_requests)
 
+        logger.info(f"executor_request_queue.py line 327 all_ranks_num_active_requests: {all_ranks_num_active_requests}")
         total_num_active_requests = sum(all_ranks_num_active_requests)
         total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
 

@@ -439,6 +439,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
+    logger.info(f"serve.py line 442 disagg_cfg: {disagg_cfg}")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.
@@ -465,6 +466,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         f"mpi_session is provided for LLM instance. Global MPI rank: {global_mpi_rank()}, sub-comm MPI rank: {mpi_rank()}"
     )
 
+
     # Leader ranks will start the trtllm-server using it's own server config
     # and start a RemoteMPISessionServer to accept MPI tasks
     if is_leader:
@@ -475,6 +477,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
+        logger.info(f"instance_idx: {instance_idx}, llm_args: {llm_args}")
 
         _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
                                      log_level)
