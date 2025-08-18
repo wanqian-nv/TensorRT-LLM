@@ -345,6 +345,7 @@ async def benchmark(
     print(f"Traffic request rate: {request_rate}")
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
+    print(f"Number of prompts: {len(input_requests)}")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
