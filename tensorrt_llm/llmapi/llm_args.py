@@ -1304,6 +1304,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    paused_priority: int = Field(default=0,
+                                 description="The priority of the paused blocks.")
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1321,7 +1324,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             use_uvm=self.use_uvm,
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
-            max_gpu_total_bytes=self.max_gpu_total_bytes)
+            max_gpu_total_bytes=self.max_gpu_total_bytes,
+            paused_priority=self.paused_priority)
 
     @field_validator('max_gpu_total_bytes')
     @classmethod

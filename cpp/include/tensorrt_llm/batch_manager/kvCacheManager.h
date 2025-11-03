@@ -236,6 +236,10 @@ struct KvCacheStats
     std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
     // GPU bytes allocated for KV-cache
     std::size_t allocatedBytes{};
+
+    SizeType32 onboardedBlocks;
+    SizeType32 offloadedBlocks;
+    SizeType32 pausedBlocks;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -587,7 +591,7 @@ public:
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
         std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
-        std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr);
+        std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr, executor::RetentionPriority pausedPriority = 0);
 
     ~WindowBlockManager();
 
@@ -820,6 +824,21 @@ public:
         return 0;
     }
 
+    [[nodiscard]] SizeType32 getNumOnboardedBlocks() const;
+    [[nodiscard]] SizeType32 getNumOffloadedBlocks() const;
+
+    void setPausedRequestPriority(LlmRequest::RequestIdType requestId);
+
+    [[nodiscard]] SizeType32 getNumPausedBlocks() const noexcept
+    {
+        return mPausedBlocks;
+    }
+
+    void resetPausedBlockCounts() noexcept
+    {
+        mPausedBlocks = 0;
+    }
+
     //! \brief Return whether this window is SWA.
     [[nodiscard]] bool isSWA() const
     {
@@ -946,6 +965,9 @@ private:
     bool mEnablePartialReuse;
     // Whether partially matched blocks that are already in use should be copied and reused.
     bool mCopyOnPartialReuse;
+
+    SizeType32 mPausedBlocks;
+    executor::RetentionPriority mPausedPriority;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
 
@@ -978,7 +1000,8 @@ public:
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnPartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
-        std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt);
+        std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt,
+        executor::RetentionPriority pausedPriority = 0);
 
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
@@ -1262,6 +1285,16 @@ public:
     //! \brief Update cache offsets for block at index
     void updateCacheBlockOffsetsAtIdx(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
 
+    [[nodiscard]] SizeType32 getNumOnboardedBlocks() const;
+    [[nodiscard]] SizeType32 getNumOffloadedBlocks() const;
+
+    void setPausedRequestPriority(LlmRequest::RequestIdType requestId);
+
+    [[nodiscard]] SizeType32 getNumPausedBlocks() const
+    {
+        return sumWindows([](auto const& manager) { return manager.getNumPausedBlocks(); });
+    }
+
     //! \brief Add/detach block(s) to/from the sequence if needed
     //! \details When we need a new block, we add it. For sliding window
     //! attention (SWA), when a block goes out-of-window (OOW), we detach it
@@ -1498,6 +1531,8 @@ public:
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
 
+    virtual void setPausedRequestPriority(LlmRequest::RequestIdType requestId) = 0;
+
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
     // Sum of numLayers * kvFactor * numKvHeads * sizePerHead for each pool
@@ -1585,7 +1620,8 @@ public:
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnpartialReuse = true,
-        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
+        executor::RetentionPriority pausedPriority = 0);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1596,7 +1632,8 @@ public:
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnpartialReuse = true,
-        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
+        executor::RetentionPriority pausedPriority = 0);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1691,6 +1728,9 @@ public:
                 / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
         kvCacheStats.numFreeBlocksPerWindowSize = getNumFreeBlocksPerWindowSize();
         kvCacheStats.allocatedBytes = mAllocatedBytes;
+        kvCacheStats.onboardedBlocks = getNumOnboardedBlocks();
+        kvCacheStats.offloadedBlocks = getNumOffloadedBlocks();
+        kvCacheStats.pausedBlocks = getNumPausedBlocks();
         return kvCacheStats;
     }
 
@@ -1881,6 +1921,16 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
+    [[nodiscard]] SizeType32 getNumOnboardedBlocks() const;
+    [[nodiscard]] SizeType32 getNumOffloadedBlocks() const;
+
+    void setPausedRequestPriority(LlmRequest::RequestIdType requestId);
+
+    [[nodiscard]] SizeType32 getNumPausedBlocks() const
+    {
+        return mBlockManager.getNumPausedBlocks();
+    }
+    
 private:
     // Maximum number of sequences
     SizeType32 mMaxNumSequences;

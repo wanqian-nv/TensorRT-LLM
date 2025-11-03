@@ -123,7 +123,7 @@ void initConfigBindings(pybind11::module_& m)
         .def(py::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&, bool,
                  std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&, bool, bool, bool,
-                 SizeType32, std::optional<RuntimeDefaults> const&, uint64_t const&>(),
+                 SizeType32, std::optional<RuntimeDefaults> const&, uint64_t const&, tle::RetentionPriority const&>(),
             py::arg("enable_block_reuse") = true, py::arg("max_tokens") = py::none(),
             py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none(),
             py::arg("free_gpu_memory_fraction") = py::none(), py::arg("host_cache_size") = py::none(),
@@ -131,7 +131,7 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0, py::kw_only(),
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true, py::arg("use_uvm") = false,
             py::arg("attention_dp_events_gather_period_ms") = 5, py::arg("runtime_defaults") = py::none(),
-            py::arg("max_gpu_total_bytes") = 0)
+            py::arg("max_gpu_total_bytes") = 0, py::arg("paused_priority") = 0)
         .def_property(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_property("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
@@ -149,6 +149,8 @@ void initConfigBindings(pybind11::module_& m)
             &tle::KvCacheConfig::setCrossKvCacheFraction)
         .def_property("secondary_offload_min_priority", &tle::KvCacheConfig::getSecondaryOffloadMinPriority,
             &tle::KvCacheConfig::setSecondaryOffloadMinPriority)
+        .def_property("paused_priority", &tle::KvCacheConfig::getPausedPriority,
+            &tle::KvCacheConfig::setPausedPriority)
         .def_property("event_buffer_max_size", &tle::KvCacheConfig::getEventBufferMaxSize,
             &tle::KvCacheConfig::setEventBufferMaxSize)
         .def_property("enable_partial_reuse", &tle::KvCacheConfig::getEnablePartialReuse,

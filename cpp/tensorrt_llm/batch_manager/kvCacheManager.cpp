@@ -51,6 +51,12 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
+auto const kMinPriority = tle::KvCacheRetentionConfig::kMinRetentionPriority;
+auto const kMaxPriority = tle::KvCacheRetentionConfig::kMaxRetentionPriority;
+
+auto const kDefaultPriority = tle::KvCacheRetentionConfig::kDefaultRetentionPriority;
+    
+
 inline uint8_t getNthByte(SizeType32 hashPart, uint8_t byteIdx) noexcept
 {
     return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
@@ -551,7 +557,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
-    std::optional<BaseAgentConfig> agentConfig)
+    std::optional<BaseAgentConfig> agentConfig,
+    executor::RetentionPriority pausedPriority)
     : mNumLayers{static_cast<SizeType32>(numKvHeadsPerLayer.size())}
     , mTokensPerBlock{tokensPerBlock}
     , mEventManager{std::move(eventManager)}
@@ -591,7 +598,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize, numKvHeadsPerLayer,
             sizePerHead, tokensPerBlock, /*isSWA=*/windowSize < maxSequenceLength, allottedPrimaryBlocks,
             allottedSecondaryBlocks, maxNumSequences, stream, onboardBlocks, cacheType, secondaryOffloadMinPriority,
-            mEventManager, enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager, mLoopbackAgent);
+            mEventManager, enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager, mLoopbackAgent, pausedPriority);
     }
 
     auto const numAllPools = getNumPools();
@@ -648,7 +655,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
-    std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent)
+    std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent, executor::RetentionPriority pausedPriority)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -675,6 +682,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
     , mKvCacheConnectorManager{std::move(kvCacheConnectorManager)}
+    , mPausedPriority{pausedPriority}
 {
     std::map<SizeType32, SizeType32> numLayersPerPool;
 
@@ -747,16 +755,16 @@ WindowBlockManager::~WindowBlockManager()
     float cacheHitRate = mReusedBlocks == 0
         ? 0
         : static_cast<float>(mReusedBlocks) / (static_cast<float>(mReusedBlocks + mMissedBlocks));
-    TLLM_LOG_DEBUG("%s - total allocated blocks:              %lu  ", mLogPrefix.c_str(), mAllocTotalBlocks);
-    TLLM_LOG_DEBUG("%s - allocated new blocks:                %lu  ", mLogPrefix.c_str(), mAllocNewBlocks);
-    TLLM_LOG_DEBUG("%s - missed blocks:                       %lu  ", mLogPrefix.c_str(), mMissedBlocks);
-    TLLM_LOG_DEBUG("%s - reused blocks:                       %lu  ", mLogPrefix.c_str(), mReusedBlocks);
-    TLLM_LOG_DEBUG("%s - reused unique blocks:                %lu  ", mLogPrefix.c_str(), mReusedUniqueBlocks);
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_INFO("%s - total allocated blocks:              %lu  ", mLogPrefix.c_str(), mAllocTotalBlocks);
+    TLLM_LOG_INFO("%s - allocated new blocks:                %lu  ", mLogPrefix.c_str(), mAllocNewBlocks);
+    TLLM_LOG_INFO("%s - missed blocks:                       %lu  ", mLogPrefix.c_str(), mMissedBlocks);
+    TLLM_LOG_INFO("%s - reused blocks:                       %lu  ", mLogPrefix.c_str(), mReusedBlocks);
+    TLLM_LOG_INFO("%s - reused unique blocks:                %lu  ", mLogPrefix.c_str(), mReusedUniqueBlocks);
+    TLLM_LOG_INFO(
         "%s - reused unique blocks percentage (%%): %.2f ", mLogPrefix.c_str(), reusedUniqueBlocksPercentage);
-    TLLM_LOG_DEBUG("%s - cache hit rate:                      %.2f ", mLogPrefix.c_str(), cacheHitRate);
-    TLLM_LOG_DEBUG("%s - reused tokens:                       %.0f ", mLogPrefix.c_str(), mReusedTokens);
-    TLLM_LOG_DEBUG("%s - reused tokens percentage (%%):        %.2f ", mLogPrefix.c_str(),
+    TLLM_LOG_INFO("%s - cache hit rate:                      %.2f ", mLogPrefix.c_str(), cacheHitRate);
+    TLLM_LOG_INFO("%s - reused tokens:                       %.0f ", mLogPrefix.c_str(), mReusedTokens);
+    TLLM_LOG_INFO("%s - reused tokens percentage (%%):        %.2f ", mLogPrefix.c_str(),
         100.0 * mReusedTokens / mTotalInputTokens);
 }
 
@@ -841,7 +849,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
 
         nvinfer1::Dims const cacheShape = ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
 
-        TLLM_LOG_DEBUG("[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads", mLogPrefix.c_str(),
+        TLLM_LOG_INFO("[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads", mLogPrefix.c_str(),
             mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads);
 
         if (useUvm)
@@ -853,7 +861,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
         {
             nvinfer1::Dims const cacheShapeOffload
                 = ITensor::makeShape({mNumSecondaryBlocks, pool.numLayers, mKVFactor, blockSize});
-            TLLM_LOG_DEBUG("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
+            TLLM_LOG_INFO("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
                 mLogPrefix.c_str(), mNumSecondaryBlocks, pool.numLayers, pool.numKvHeads);
             pool.secondaryPtr = BufferManager::pinned(cacheShapeOffload, poolDtype);
         }
@@ -903,6 +911,12 @@ void WindowBlockManager::startScheduling()
             allocatedBlock->startScheduling();
         }
     }
+    resetPausedBlockCounts();
+    if (mTransferManager)
+    {
+        mTransferManager->resetBlockCounts();
+        TLLM_LOG_DEBUG("%s - Reset onboard/offload block counts to 0", mLogPrefix.c_str());
+    }
 }
 
 void WindowBlockManager::freeChildren(BlockPtr const& block)
@@ -940,6 +954,19 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     // 2. Eviction policy indicated block can be offloaded
     // 3. At least one free block in secondary memory
     // 4. Onboarding is enabled (allowing block to be brought back into primary)
+    bool hasTokens = !block->getUniqueTokens().empty();
+    bool canOffloadBlock = canOffload;
+    bool hasFreeSecondaryBlocks = mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0;
+    bool onboardBlocksEnabled = mOnboardBlocks;
+    TLLM_LOG_DEBUG("%s::getFreeBlock - Offload conditions for block %d: hasTokens=%s, canOffload=%s, hasFreeSecondaryBlocks=%s, onboardBlocksEnabled=%s, Priority=%d, HasDuration=%s",
+        mLogPrefix.c_str(), block->getBlockId(), 
+        hasTokens ? "true" : "false",
+        canOffloadBlock ? "true" : "false", 
+        hasFreeSecondaryBlocks ? "true" : "false",
+        onboardBlocksEnabled ? "true" : "false",
+        block->getPriority(),
+        block->getDurationMs().has_value() ? "true" : "false");
+    
     if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
         && mOnboardBlocks)
     {
@@ -1179,6 +1206,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             : std::make_tuple(false, 0, nullptr);
         if (matchingBlock != nullptr)
         {
+            matchingBlock->setPriority(kDefaultPriority);
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
             numMatchedTokens += numMatched > 0 ? numMatched : blockItr->uniqueTokens.size();
@@ -1883,6 +1911,14 @@ void BlockManager::schedulingReleaseBlocks(RequestIdType requestId)
     }
 }
 
+void BlockManager::setPausedRequestPriority(RequestIdType requestId)
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.setPausedRequestPriority(requestId);
+    }
+}
+
 void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 {
     for (auto& block : mAllocatedBlocksPerSeq.at(requestId))
@@ -1894,6 +1930,23 @@ void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
         {
             mSchedulingNumFreeBlocks++;
         }
+    }
+}
+
+void WindowBlockManager::setPausedRequestPriority(RequestIdType requestId)
+{
+    if (mOnboardBlocks && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
+    {
+        for (auto& block : mAllocatedBlocksPerSeq.at(requestId))
+        {
+            mPausedBlocks++;
+            if (mPausedPriority > 0)
+            {
+                block->setPriority(mPausedPriority);        
+            }
+        }
+        TLLM_LOG_INFO("setPausedRequestPriority: requestId %u, priority %d numPausedBlocks %d", requestId, mPausedPriority, mPausedBlocks);
+
     }
 }
 
@@ -1917,12 +1970,13 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     SizeType32 sinkTokenLength, int64_t stream, runtime::SizeType32 maxSequenceLength, bool enableBlockReuse,
     bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
-    std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager)
+    std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
+    executor::RetentionPriority pausedPriority)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
         maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
         enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse,
-        copyOnPartialReuse, kvCacheConnectorManager)
+        copyOnPartialReuse, kvCacheConnectorManager, pausedPriority)
 {
 }
 
@@ -1933,7 +1987,8 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     SizeType32 sinkTokenLength, CudaStreamPtr stream, runtime::SizeType32 maxSequenceLength, bool enableBlockReuse,
     bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
-    std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager)
+    std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
+    executor::RetentionPriority pausedPriority)
     : mMaxBeamWidth(maxBeamWidth)
     , mDataType(dtype)
     , mMaxAttentionWindow(*std::max_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
@@ -1943,7 +1998,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     , mBlockManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
           std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype,
           mSinkBubbleLength, onboardBlocks, cacheType, secondaryOffloadMinPriority, std::move(eventManager),
-          enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager))
+          enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager), std::nullopt, pausedPriority)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
@@ -1956,7 +2011,8 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     // we fill that block with a "bubble" to reach the number of tokens per block.
 
     TLLM_CHECK(mSinkBlockTokenLength % tokensPerBlock == 0);
-    TLLM_LOG_DEBUG("KV cache block reuse is %s", mEnableBlockReuse ? "enabled" : "disabled");
+    TLLM_LOG_INFO("KV cache block reuse is %s", mEnableBlockReuse ? "enabled" : "disabled");
+    TLLM_LOG_INFO("KV cache paused priority is %d", pausedPriority);
     mSequences.reserve(maxNumSequences);
 }
 
@@ -2422,6 +2478,14 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
     mBlockManager.schedulingReleaseBlocks(requestId);
 }
 
+void KVCacheManager::setPausedRequestPriority(RequestIdType requestId)
+{
+    if (mEnableBlockReuse)
+    {
+        mBlockManager.setPausedRequestPriority(requestId);
+    }
+}
+
 void KVCacheManager::pinBlocks(RequestIdType requestId)
 {
     auto& sequence = getSequence(requestId);
@@ -2529,7 +2593,7 @@ std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
     auto const freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
     auto const freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
 
-    TLLM_LOG_DEBUG("Calculated free memory: {.freePrimaryMemBytes=%" PRIu64 ", .freeSecondaryMemBytes=%" PRIu64 "}",
+    TLLM_LOG_INFO("Calculated free memory: {.freePrimaryMemBytes=%" PRIu64 ", .freeSecondaryMemBytes=%" PRIu64 "}",
         freePrimaryMemBytes, freeSecondaryMemBytes);
 
     return std::make_tuple(freePrimaryMemBytes, freeSecondaryMemBytes);
@@ -2570,7 +2634,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
     uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor)
 {
-    TLLM_LOG_DEBUG("Calculating max num blocks for %s: {.allottedPrimaryMemBytes=%" PRIu64
+    TLLM_LOG_INFO("Calculating max num blocks for %s: {.allottedPrimaryMemBytes=%" PRIu64
                    ", .allottedSecondaryMemBytes=%" PRIu64 "}",
         isCrossAttention ? "Cross KvCacheManager" : "Self KvCacheManager", allottedPrimaryMemBytes,
         allottedSecondaryMemBytes);
@@ -2594,13 +2658,13 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     }
     bool const isVSWA = cacheSizeBytesPerTokenPerWindow.size() > 1;
 
-    TLLM_LOG_DEBUG("extraCostMemory [Gib]: %0.2f", extraCostMemory / static_cast<double>(1 << 30));
+    TLLM_LOG_INFO("extraCostMemory [Gib]: %0.2f", extraCostMemory / static_cast<double>(1 << 30));
     allottedPrimaryMemBytes = allottedPrimaryMemBytes - extraCostMemory;
     auto const tokensPerBlock = modelConfig.getTokensPerBlock();
     auto const calculatePrimaryBlocks
         = [&](SizeType32 windowSize, float windowSizeShare, SizeType32 cacheSizeBytesPerToken)
     {
-        TLLM_LOG_DEBUG("windowSizeShare: %f, cacheSizeBytesPerToken: %d", windowSizeShare, cacheSizeBytesPerToken);
+        TLLM_LOG_INFO("windowSizeShare: %f, cacheSizeBytesPerToken: %d", windowSizeShare, cacheSizeBytesPerToken);
         auto maxTokens = static_cast<uint64_t>(
             allottedPrimaryMemBytes * windowSizeShare / static_cast<double>(cacheSizeBytesPerToken));
         // kv_cache_config.max_tokens is not effective in VSWA scheme
@@ -2613,9 +2677,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
                 maxTokens = std::min(maxTokensFromConfig, maxTokens);
             }
         }
-        TLLM_LOG_DEBUG("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
+        TLLM_LOG_INFO("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
         SizeType32 const blocksInPrimaryPool = tc::ceilDiv(maxTokens, tokensPerBlock);
-        TLLM_LOG_DEBUG(
+        TLLM_LOG_INFO(
             "Number of blocks in KV cache primary pool for windowSize %d: %d", windowSize, blocksInPrimaryPool);
         return blocksInPrimaryPool;
     };
@@ -2626,7 +2690,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         auto const maxTokensSecondary
             = static_cast<SizeType32>(allottedSecondaryMemBytes * windowSizeShare / cacheSizeBytesPerToken);
         SizeType32 const blocksInSecondaryPool = std::max(0, maxTokensSecondary / tokensPerBlock);
-        TLLM_LOG_DEBUG(
+        TLLM_LOG_INFO(
             "Number of blocks in KV cache secondary pool for windowSize %d: %d, onboard blocks to primary memory "
             "before reuse: %s",
             windowSize, blocksInSecondaryPool, config.getOnboardBlocks() ? "true" : "false");
@@ -2923,4 +2987,33 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     return std::min(outputLength + leftoverBlockCapacity * tokensPerBlock, inputLength + outputLength);
 }
 
+[[nodiscard]] SizeType32 WindowBlockManager::getNumOnboardedBlocks() const
+{
+    return mTransferManager->getNumOnboardedBlocks();
+}
+
+[[nodiscard]] SizeType32 WindowBlockManager::getNumOffloadedBlocks() const
+{
+    return mTransferManager->getNumOffloadedBlocks();
+}
+
+[[nodiscard]] SizeType32 BlockManager::getNumOnboardedBlocks() const
+{
+    return sumWindows([](auto const& manager) { return manager.getNumOnboardedBlocks(); });
+}
+
+[[nodiscard]] SizeType32 BlockManager::getNumOffloadedBlocks() const
+{
+    return sumWindows([](auto const& manager) { return manager.getNumOffloadedBlocks(); });
+}
+
+[[nodiscard]] SizeType32 KVCacheManager::getNumOnboardedBlocks() const
+{
+    return mBlockManager.getNumOnboardedBlocks();
+}
+
+[[nodiscard]] SizeType32 KVCacheManager::getNumOffloadedBlocks() const
+{
+    return mBlockManager.getNumOffloadedBlocks();
+}
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

@@ -260,6 +260,13 @@ struct KvCacheStats
     SizeType32 missedBlocks;
     /// @brief Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
+    /// @brief Number of onboarded blocks
+    SizeType32 onboardedBlocks;
+    /// @brief Number of offloaded blocks
+    SizeType32 offloadedBlocks;
+    /// @brief Number of paused blocks
+    SizeType32 pausedBlocks;
+
 };
 
 /// @brief Struct that holds the stats of static batching models for a single iteration

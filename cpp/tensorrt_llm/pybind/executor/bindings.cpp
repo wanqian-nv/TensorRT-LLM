@@ -112,7 +112,10 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("alloc_new_blocks", &tle::KvCacheStats::allocNewBlocks)
         .def_readwrite("reused_blocks", &tle::KvCacheStats::reusedBlocks)
         .def_readwrite("missed_blocks", &tle::KvCacheStats::missedBlocks)
-        .def_readwrite("cache_hit_rate", &tle::KvCacheStats::cacheHitRate);
+        .def_readwrite("cache_hit_rate", &tle::KvCacheStats::cacheHitRate)
+        .def_readwrite("onboarded_blocks", &tle::KvCacheStats::onboardedBlocks)
+        .def_readwrite("offloaded_blocks", &tle::KvCacheStats::offloadedBlocks)
+        .def_readwrite("paused_blocks", &tle::KvCacheStats::pausedBlocks);
 
     py::class_<tle::StaticBatchingStats>(m, "StaticBatchingStats")
         .def(py::init<>())

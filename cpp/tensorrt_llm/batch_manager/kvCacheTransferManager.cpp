@@ -27,6 +27,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 
 #ifdef ENABLE_CUFILE
 #include <cufile.h>
@@ -93,6 +94,8 @@ KVCacheTransferManager::KVCacheTransferManager(
     , mOnboardManager(std::make_shared<tr::CudaStream>())
     , mOffloadManager(std::make_shared<tr::CudaStream>())
     , mLoopbackAgent{loopbackAgent}
+    , mOnboardedBlocks(0)
+    , mOffloadedBlocks(0)
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
@@ -223,6 +226,7 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr cons
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
+    NVTX3_SCOPED_RANGE(onboard);
     if (mode != executor::KvCacheTransferMode::DRAM
         && mPendingOffloads.find(offloadBlock->getBlockId()) == mPendingOffloads.end())
     {
@@ -236,15 +240,25 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr cons
         mOnboardManager.getStream().wait(mPendingOffloads[offloadBlock->getBlockId()]);
     }
     copyBlock(offloadBlock, block, pools, false, numTokensToCopy, mode, directory);
+    if (!offloadBlock->isPrimary())
+    {
+        mOnboardedBlocks++;
+        TLLM_LOG_INFO("onboard: onboarded blocks: %d", mOnboardedBlocks);
+    }
 }
 
 void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
+    NVTX3_SCOPED_RANGE(offload);
     mPendingOffloads[block->getBlockId()] = tr::CudaEvent();
     copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
     mOffloadManager.getStream().record(mPendingOffloads[block->getBlockId()]);
+    if (!offloadBlock->isPrimary())
+    {
+        mOffloadedBlocks++;
+    }
 }
 
 void KVCacheTransferManager::syncTransfers()

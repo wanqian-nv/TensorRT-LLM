@@ -386,6 +386,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             && beneficialToSkip(
                 req, kvCacheManager, std::nullopt, newlyContributedContextBlocks, newlyContributedCrossContextBlocks))
         {
+            TLLM_LOG_DEBUG("beneficialToSkip: request ID %lu -> skip", req->mRequestId);
             reqIt++;
             continue;
         }
@@ -409,7 +410,8 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
                 // Here we simulate freeing the kvCache blocks associated with that sequence
                 kvCacheManager.schedulingRemoveSequence((*lastStartedReqIt)->mRequestId);
                 pausedRequests.emplace_back(*lastStartedReqIt);
-                TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
+                kvCacheManager.setPausedRequestPriority((*lastStartedReqIt)->mRequestId);
+                TLLM_LOG_INFO("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
                 reqItEnd = std::next(lastStartedReqIt).base();
             }
             else
@@ -453,6 +455,7 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
             return true;
         }
     }
+    TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu failed to schedule", req->mRequestId);
     return false;
 }
 

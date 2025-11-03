@@ -90,6 +90,9 @@ public:
             auto const scheduledTotal = numScheduled + required;
             bool const hasFreeBlocks
                 = mKvCacheManager.getBlockManager().schedulingHasFreeBlocks(scheduledTotal, windowSize);
+            TLLM_LOG_DEBUG("MaxUtilizationScheduler: has free blocks %i for request ID %lu required blocks %i",
+                mKvCacheManager.getBlockManager().getNumFreeBlocks(), req.mRequestId, required);
+    
             if (!hasFreeBlocks)
             {
                 return std::nullopt;

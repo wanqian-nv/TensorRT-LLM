@@ -747,6 +747,9 @@ class PyExecutor:
             kv_stats_to_save.reused_blocks = kv_stats.reused_blocks
             kv_stats_to_save.missed_blocks = kv_stats.missed_blocks
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
+            kv_stats_to_save.onboarded_blocks = kv_stats.onboarded_blocks
+            kv_stats_to_save.offloaded_blocks = kv_stats.offloaded_blocks
+            kv_stats_to_save.paused_blocks = kv_stats.paused_blocks
             stats.kv_cache_stats = kv_stats_to_save
 
         stats.inflight_batching_stats.num_scheduled_requests = len(
@@ -763,6 +766,7 @@ class PyExecutor:
         if stats.specdec_stats is not None:
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 stats.specdec_stats.iter_latency_ms) / float(iter_latency_ms)
+        logger.info(f"iter_stats: {stats.to_json_str()}")
         return stats
 
     def _append_iter_stats(self,
@@ -1229,6 +1233,7 @@ class PyExecutor:
                         BatchState(sample_state=sample_state,
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
+                    logger.info(f"iter_stats: {iter_stats.to_json_str()}")
 
     def _prepare_draft_requests(self):
         try:
@@ -1393,6 +1398,7 @@ class PyExecutor:
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
+                        
 
                     self.previous_batch = BatchState(
                         sample_state=sample_state,

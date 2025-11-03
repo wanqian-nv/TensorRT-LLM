@@ -1,0 +1,250 @@
+Script started on 2025-10-13 09:12:32-07:00 [<not executed on terminal>]
+    1  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx
+    2  2025-10-13 08:22:02 clear
+    3  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx --extra-cmake-vars DTRTLLM_BUILD_WITH_NVSHMEM=OFF
+    4  2025-10-13 08:22:02 python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures "100-real" --clean
+    5  2025-10-13 08:22:02 exit
+    6  2025-09-29 02:14:11 . "/home/serli/.cursor-server/bin/a8e95743c5268be73767c46944a71f4465d05c90/out/vs/workbench/contrib/terminal/common/scripts/shellIntegration-bash.sh"
+    7  2025-09-29 02:14:11 ls -la /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM/tensorrt_llm/llmapi/trtllm-llmapi-launch
+    8  2025-09-29 02:14:19 ls -la workspace/TensorRT-LLM/tensorrt_llm/llmapi/trtllm-llmapi-launch
+    9  2025-09-29 02:14:25 which trtllm-llmapi-launch
+   10  2025-09-29 02:14:29 echo $PATH
+   11  2025-09-29 02:14:36 pip show tensorrt-llm
+   12  2025-09-29 02:14:45 find /usr/local/bin -name "*trtllm*" 2>/dev/null
+   13  2025-09-29 02:16:05 python -c "import site; print(site.getsitepackages())"
+   14  2025-09-29 02:16:28 ls -la /cm/local/apps/python3/bin/ | grep trtllm
+   15  2025-09-29 02:38:40 find /root/.local -name "*trtllm*" 2>/dev/null | head -10
+   16  2025-09-28 23:29:44 cd workspace/TensorRT-LLM/
+   17  2025-09-28 23:29:53 git branch 
+   18  2025-09-28 23:29:58 git log
+   19  2025-09-28 23:30:04 clear
+   20  2025-09-29 00:52:08 salloc -p batch --nodes=2 --ntasks=8 --ntasks-per-node=4 --gres=gpu:4 --time 4:00:00 -A coreai_comparch_trtllm -J trtllm_60 --segment=2 --exclude=nvl72080-T06,nvl72042-T13,nvl72029-T08,nvl72011-T12,nvl72014-T14,nvl72093-T01,nvl72012-T12,nvl72016-T18,nvl72015-T07,nvl72057-T[01-12],nvl72077-T[03,06-13,16],nvl72110-T[07-08],nvl72089-T[18,07]
+   21  2025-09-29 02:32:09 cd ../../
+   22  2025-09-29 02:32:19 ./scripts/gb200-ifb/ifb_torch.sh 1 8 2 200 false 0.01 250 "2" 2 true 1 /lustre/fsw/portfolios/coreai/users/serli/datasets/aa/k2-100-20-20_for_bench.json 30
+   23  2025-09-29 02:41:00 kill 51
+   24  2025-09-29 02:41:05 kill %1
+   25  2025-09-29 02:41:25 clear
+   26  2025-09-29 02:41:27 ps
+   27  2025-09-29 03:28:09 squeue -u serli
+   28  2025-09-29 03:28:35 scancel -u serli
+   29  2025-09-29 03:41:29 cd workspace/TensorRT-LLM/
+   30  2025-09-29 03:45:04 git log
+   31  2025-09-29 03:45:10 clear
+   32  2025-09-29 03:45:29 git branch
+   33  2025-09-29 03:45:41 git log --online serli_kvcache_offloading
+   34  2025-09-29 03:45:52 git log serli_kvcache_offloading
+   35  2025-09-29 03:48:47 git show 8ccb4e8825da6efa49f51275e7aae89ea609e95b
+   36  2025-09-29 03:49:58 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b
+   37  2025-09-29 03:50:42 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b --tensorrt_llm/_torch/models/modeling_deepseekv3.py
+   38  2025-09-29 03:50:54 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b -- tensorrt_llm/_torch/models/modeling_deepseekv3.py
+   39  2025-09-29 04:26:37 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b：tensorrt_llm/_torch/models/modeling_deepseekv3.py
+   40  2025-09-29 04:26:52 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b:tensorrt_llm/_torch/models/modeling_deepseekv3.py
+   41  2025-09-29 04:27:23 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b -- tensorrt_llm/_torch/models/modeling_deepseekv3.py
+   42  2025-09-29 04:27:33 git show 8ccb4e8825da6efa49f51275e7aae89ea609e95b
+   43  2025-09-29 04:35:38 git branch -v
+   44  2025-09-29 04:35:46 git log
+   45  2025-09-29 04:35:51 clear
+   46  2025-09-29 04:36:06 git cherry-pick 0ec424bf504310fc12cade5b9dd26052e72f40f7
+   47  2025-09-29 03:28:59 clear
+   48  2025-09-29 03:37:53 squeue -u serli
+   49  2025-09-29 03:38:09 history | grep build
+   50  2025-09-29 03:38:21 history | grep script
+   51  2025-09-29 03:38:54 clear
+   52  2025-09-29 03:38:57 ./scripts/gb200-ifb/ifb_torch.sh 1 8 1 256 false 0.1 256 1 1 true 3 /lustre/fsw/portfolios/coreai/users/serli/datasets/aa/k2-100[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     1  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx
+[?2004l1: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     2  2025-10-13 08:22:02 clear M
+[?2004l2: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     3  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx --extra-cmake-vars DTRTLLM_BUILD_WITH_NVSHMEM=OFF
+[?2004l3: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     4  2025-10-13 08:22:02 python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures "100-real" --clean
+[?2004l4: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     5  2025-10-13 08:22:02 exit
+[?2004l5: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     6  2025-09-29 02:14:11 . "/home/serli/.cursor-server/bin/a8e95743c5268be73767c46944a71f4465d05c90/out/vs/workbench/contrib/terminal/common/scripts/shellIntegration-bash.sh"
+[?2004l6: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     7  2025-09-29 02:14:11 ls -la /lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM/tensorrt_llm/llmapi/trtllm-llmapi-launch
+[?2004l7: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     8  2025-09-29 02:14:19 ls -la workspace/TensorRT-LLM/tensorrt_llm/llmapi/trtllm-llmapi-launch
+[?2004l8: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$     9  2025-09-29 02:14:25 which trtllm-llmapi-launch
+[?2004l9: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    10  2025-09-29 02:14:29 echo $PATH
+[?2004l10: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    11  2025-09-29 02:14:36 pip show tensorrt-llm
+[?2004l11: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    12  2025-09-29 02:14:45 find /usr/local/bin -name "*trtllm*" 2>/dev/null
+[?2004l[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    13  2025-09-29 02:16:05 python -c "import site; print(site.getsitepackages())"
+[?2004l13: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    14  2025-09-29 02:16:28 ls -la /cm/local/apps/python3/bin/ | grep trtllm
+[?2004l14: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    15  2025-09-29 02:38:40 find /root/.local -name "*trtllm*" 2>/dev/null | head -10
+[?2004l[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    16  2025-09-28 23:29:44 cd workspace/TensorRT-LLM/
+[?2004l16: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    17  2025-09-28 23:29:53 git branch 
+[?2004l17: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    18  2025-09-28 23:29:58 git log
+[?2004l18: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    19  2025-09-28 23:30:04 clear M
+[?2004l19: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    20  2025-09-29 00:52:08 salloc -p batch --nodes=2 --ntasks=8 --ntasks-per-node=4 --gres=gpu:4 --time 4:00:00 -A coreai_comparch_trtllm -J trtllm_60 --segment=2 --exclude=nvl72080-T06,nvl72042-T13,nvl72029-T08,nvl72011-T12,nvl72014-T14,nvl72093-T01,nvl72012-T12,nvl72016-T18,nvl72015-T07,nvl72057-T[01-12],nvl72077-T[03,06-13,16],nvl72110-T[07-08],nvl72089-T[18,07]
+[?2004l20: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    21  2025-09-29 02:32:09 cd ../../
+[?2004l21: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    22  2025-09-29 02:32:19 ./scripts/gb200-ifb/ifb_torch.sh 1 8 2 200 false 0.01 250 "2" 2 true 1 /lustre/fsw/portfolios/coreai/users/serli/datasets/aa/k2-100-20-20_for_bench.json 30
+[?2004l22: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    23  2025-09-29 02:41:00 kill 51
+[?2004l23: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    24  2025-09-29 02:41:05 kill %1
+[?2004l24: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    25  2025-09-29 02:41:25 clear M
+[?2004l25: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    26  2025-09-29 02:41:27 ps
+[?2004l26: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    27  2025-09-29 03:28:09 squeue -u serli
+[?2004l27: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    28  2025-09-29 03:28:35 scancel -u serli
+[?2004l28: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    29  2025-09-29 03:41:29 cd workspace/TensorRT-LLM/
+[?2004l29: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    30  2025-09-29 03:45:04 git log
+[?2004l30: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    31  2025-09-29 03:45:10 clear M
+[?2004l31: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    32  2025-09-29 03:45:29 git branch
+[?2004l32: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    33  2025-09-29 03:45:41 git log --online serli_kvcache_offloading
+[?2004l33: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    34  2025-09-29 03:45:52 git log serli_kvcache_offloading
+[?2004l34: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    35  2025-09-29 03:48:47 git show 8ccb4e8825da6efa49f51275e7aae89ea609e95b
+[?2004l35: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    36  2025-09-29 03:49:58 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b
+[?2004l36: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    37  2025-09-29 03:50:42 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b --tensorrt_llm/_torch/models/modeling_deepseekv3.py
+[?2004l37: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    38  2025-09-29 03:50:54 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b -- tensorrt_llm/_torch/models/modeling_deepseekv3.py
+[?2004l38: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    39  2025-09-29 04:26:37 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b：tensorrt_llm/_torch/models/modeling_deepseekv3.py
+[?2004l39: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    40  2025-09-29 04:26:52 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b:tensorrt_llm/_torch/models/modeling_deepseekv3.py
+[?2004l40: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    41  2025-09-29 04:27:23 git show --name-only 8ccb4e8825da6efa49f51275e7aae89ea609e95b -- tensorrt_llm/_torch/models/modeling_deepseekv3.py
+[?2004l41: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    42  2025-09-29 04:27:33 git show 8ccb4e8825da6efa49f51275e7aae89ea609e95b
+[?2004l42: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    43  2025-09-29 04:35:38 git branch -v
+[?2004l43: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    44  2025-09-29 04:35:46 git log
+[?2004l44: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    45  2025-09-29 04:35:51 clear M
+[?2004l45: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    46  2025-09-29 04:36:06 git cherry-pick 0ec424bf504310fc12cade5b9dd26052e72f40f7
+[?2004l46: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    47  2025-09-29 03:28:59 clear M
+[?2004l47: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    48  2025-09-29 03:37:53 squeue -u serli
+[?2004l48: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    49  2025-09-29 03:38:09 history | grep build
+[?2004l49: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    50  2025-09-29 03:38:21 history | grep script
+[?2004l50: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    51  2025-09-29 03:38:54 clear M
+[?2004l51: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    52  2025-09-29 03:38:57 ./scripts/gb200-ifb/ifb_torch.sh 1 8 1 256 false 0.1 256 1 1 true 3 /lustre/fsw/portfolios/coreai/users/serli/datasets/aa/k2-100-20-20_for_bench.json 30
+[?2004l52: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    53  2025-09-28 22:05:53 squeue -u serli
+[?2004l53: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    54  2025-09-28 22:06:00 pwd
+[?2004l54: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    55  2025-09-28 22:08:07 cd workspace/TensorRT-LLM/
+[?2004l55: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    56  2025-09-28 22:08:15 git branch
+[?2004l56: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    57  2025-09-28 22:08:20 pwd
+[?2004l57: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    58  2025-09-28 22:08:37 cd ../
+[?2004l58: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    59  2025-09-28 23:14:36 cd workspace/TensorRT-LLM/
+[?2004l59: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    60  2025-09-28 23:14:38 clear M
+[?2004l60: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    61  2025-09-28 23:14:47 git branch
+[?2004l61: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    62  2025-09-28 23:14:58 git checkout latest
+[?2004l62: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    63  2025-09-28 23:17:20 cd ../../
+[?2004l63: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    64  2025-09-28 23:24:49 ./scripts/docker_run.sh --pty bash
+[?2004l64: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    65  2025-09-28 23:25:01 salloc -p batch --nodes=2 --ntasks=8 --ntasks-per-node=4 --gres=gpu:4 --time 4:00:00 -A coreai_comparch_trtllm -J trtllm_60 --segment=2 --exclude=nvl72080-T06,nvl72042-T13,nvl72029-T08,nvl72011-T12,nvl72014-T14,nvl72093-T01,nvl72012-T12,nvl72016-T18,nvl72015-T07,nvl72057-T[01-12],nvl72077-T[03,06-13,16],nvl72110-T[07-08],nvl72089-T[18,07]
+[?2004l65: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    66  2025-09-28 23:27:13 ./scripts/docker_run.sh --pty bash
+[?2004l66: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    67  2025-09-29 02:08:10 clear M
+[?2004l67: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    68  2025-09-29 02:08:38 history | grep script
+[?2004l68: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    69  2025-09-29 02:09:19 clear M
+[?2004l69: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    70  2025-09-29 02:09:25 ./scripts/gb200-ifb/ifb_torch.sh 1 8 2 200 false 0.01 250 "2" 2 true 1 /lustre/fsw/portfolios/coreai/users/serli/datasets/aa/k2-100-20-20_for_bench.json 30
+[?2004l70: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    71  2025-09-29 02:13:48 pwd
+[?2004l71: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    72  2025-09-29 02:16:22 which trtllm-llmapi-launch
+[?2004l72: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    73  2025-09-29 02:19:54 ./scripts/gb200-ifb/ifb_torch.sh 1 8 2 200 false 0.01 250 "2" 2 true 1 /lustre/fsw/portfolios/coreai/users/serli/datasets/aa/k2-100-20-20_for_bench.json 30
+[?2004l73: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    74  2025-09-29 03:28:45 clear M
+[?2004l74: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    75  2025-09-29 03:28:48 salloc -p batch --nodes=2 --ntasks=8 --ntasks-per-node=4 --gres=gpu:4 --time 4:00:00 -A coreai_comparch_trtllm -J trtllm_60 --segment=2 --exclude=nvl72080-T06,nvl72042-T13,nvl72029-T08,nvl72011-T12,nvl72014-T14,nvl72093-T01,nvl72012-T12,nvl72016-T18,nvl72015-T07,nvl72057-T[01-12],nvl72077-T[03,06-13,16],nvl72110-T[07-08],nvl72089-T[18,07],nvl72035-T[01-02]
+[?2004l75: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    76  2025-10-13 08:22:02 clear M
+[?2004l76: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    77  2025-10-13 08:22:02 history | grep build
+[?2004l77: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    78  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx
+[?2004l78: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    79  2025-10-13 08:22:02 cd workspace/TensorRT-LLM/
+[?2004l79: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    80  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx
+[?2004l80: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    81  2025-10-13 08:22:02 exit
+[?2004l81: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    82  2025-09-29 20:13:08 . "/home/serli/.cursor-server/bin/a8e95743c5268be73767c46944a71f4465d05c90/out/vs/workbench/contrib/terminal/common/scripts/shellIntegration-bash.sh"
+[?2004l82: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    83  2025-09-29 20:13:09 python3 -c "import tensorrt_llm.bindings.executor; print(tensorrt_llm.bindings.executor.__file__)"
+[?2004l83: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    84  2025-09-29 20:13:21 cd workspace/TensorRT-LLM && find . -name "executor.py" -type f
+[?2004l84: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    85  2025-10-13 08:22:02 clear M
+[?2004l85: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    86  2025-10-13 08:22:02 cd workspace/TensorRT-LLM/
+[?2004l86: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    87  2025-10-13 08:22:02 clear M
+[?2004l87: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    88  2025-10-13 08:22:02 history | grep build
+[?2004l88: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    89  2025-10-13 08:22:02 python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures "100-real" --clean
+[?2004l89: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    90  2025-10-13 08:22:02 python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --cuda_architectures "100-real" --clean --binding_type pybind
+[?2004l90: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    91  2025-10-13 08:22:02 exit
+[?2004l91: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    92  2025-10-13 08:22:02 clear M
+[?2004l92: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    93  2025-10-13 08:22:02 history | grep build
+[?2004l93: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    94  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx --cuda_architectures "100-real" --binding_type pybind
+[?2004l94: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    95  2025-10-13 08:22:02 cd workspace/TensorRT-LLM/
+[?2004l95: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    96  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx --cuda_architectures "100-real" --binding_type pybind
+[?2004l96: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    97  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx --cuda_architectures "100-real" --binding_type pybind
+[?2004l97: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    98  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx --cuda_architectures "100-real" --binding_type pybind
+[?2004l98: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$    99  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx --cuda_architectures "100-real" --binding_type pybind
+[?2004l99: command not found
+[?2004h[01;32mserli@oci-hsg-cs-001-login-01[00m:[01;34m/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/serli/workspace/TensorRT-LLM[00m$   100  2025-10-13 08:22:02 python3 scripts/build_wheel.py --use_ccache --nvtx --cuda_architectures "100-rea
+Script done on 2025-10-13 09:12:42-07:00 [COMMAND_EXIT_CODE="0"]

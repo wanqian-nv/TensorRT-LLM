@@ -344,6 +344,8 @@ class KVCacheManager(BaseResourceManager):
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
+            "secondary_offload_min_priority": kv_cache_config.secondary_offload_min_priority,
+            "paused_priority": kv_cache_config.paused_priority,
         }
 
         if self.event_buffer_max_size > 0:

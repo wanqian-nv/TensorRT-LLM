@@ -49,6 +49,22 @@ public:
     //! \brief Synchronize the offload/onboard streams with the bufferManager stream.
     void syncTransfers();
 
+    [[nodiscard]] SizeType32 getNumOnboardedBlocks() const noexcept
+    {
+        return mOnboardedBlocks;
+    }
+
+    [[nodiscard]] SizeType32 getNumOffloadedBlocks() const noexcept
+    {
+        return mOffloadedBlocks;
+    }
+
+    void resetBlockCounts() noexcept
+    {
+        mOnboardedBlocks = 0;
+        mOffloadedBlocks = 0;
+    }
+
 private:
     //! \brief Get pointer to pool specified by cache block.
     static tr::ITensor::SharedPtr computeBlockPointer(
@@ -77,6 +93,9 @@ private:
 
     // Track the block ids offloaded in this iteration.
     std::unordered_map<int32_t, tr::CudaEvent> mPendingOffloads;
+
+    SizeType32 mOnboardedBlocks;
+    SizeType32 mOffloadedBlocks;
     // Reference to parent loopback agent
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;
