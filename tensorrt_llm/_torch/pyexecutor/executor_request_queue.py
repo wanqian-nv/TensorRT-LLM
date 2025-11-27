@@ -1,12 +1,15 @@
 import dataclasses
+from dataclasses import field
 import datetime
 import heapq
 import queue
 import threading
 import time
+import os
 from collections import deque, namedtuple
 from itertools import repeat
 from typing import Dict, Iterable, List, Optional, Tuple
+from tensorrt_llm.logger import logger
 
 import torch
 
@@ -16,8 +19,49 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
+from .lazy_prefix_tree import hash_func, LazyPrefixTree
+
+import tensorrt_llm.bindings
+LlmRequestState = tensorrt_llm.bindings.LlmRequestState
 
 SHUTDOWN_REQUEST_ID = -1
+
+class ProfilingStats:
+    # 1. GEMM/Comm overhead
+    num_total_tokens: int
+    num_scheduled_reqs: int
+    # 2. Attention overhead (Assume the requests from previous iterations all become generation requests)
+    num_total_precompute_tokens: int
+    # 3. Capacity budget
+    free_num_blocks: int
+    # 4. req_item's hit rate, each rank has an lazy_prefix_tree
+    context_requests: List[Tuple[int, int]]
+
+    def __init__(self):
+        self.num_total_tokens = 0
+        self.num_scheduled_reqs = 0
+        self.num_total_precompute_tokens = 0
+        self.free_num_blocks = 0
+        self.context_requests = []
+
+    def update(self, extra_stats: Dict[str, int]):
+        self.num_total_tokens += extra_stats["num_total_tokens"]
+        self.num_scheduled_reqs += extra_stats["num_scheduled_reqs"]
+        self.num_total_precompute_tokens += extra_stats["num_total_precompute_tokens"]
+        self.free_num_blocks -= extra_stats["free_num_blocks"]
+        self.context_requests.append(extra_stats["context_requests"])
+
+    def __repr__(self) -> str:
+        return (
+            f"ProfilingStats(\n"
+            f"  num_total_tokens={self.num_total_tokens},\n"
+            f"  num_scheduled_reqs={self.num_scheduled_reqs},\n"
+            f"  num_total_precompute_tokens={self.num_total_precompute_tokens},\n"
+            f"  free_num_blocks={self.free_num_blocks},\n"
+            f"  context_requests={self.context_requests}\n"
+            f")"
+        )
+        
 
 
 @dataclasses.dataclass
@@ -28,6 +72,7 @@ class RequestQueueItem:
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
+    block_hash: Optional[List[str]] = field(default_factory=list)
 
     @property
     def is_shutdown_request(self):
@@ -44,7 +89,8 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 batch_wait_timeout_ms: float, is_disaggregated: bool):
+                 batch_wait_timeout_ms: float, is_disaggregated: bool,
+                 tokens_per_block: int):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -60,6 +106,7 @@ class ExecutorRequestQueue:
         self.start_times = {}
         self.active = True
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+        self.tokens_per_block = tokens_per_block
 
         # State tracking
         self.num_fetch_requests = 0
@@ -70,6 +117,11 @@ class ExecutorRequestQueue:
         self.should_exclude_last_generation_logits = False
 
         self._disable_mpi = mpi_disabled()
+
+        self.cache_aware_adp_balance = int(os.environ.get("TLLM_CACHE_AWARE_ADP_BALANCE", "0"))
+        self.max_num_blocks = int(os.environ.get("TLLM_LAZY_PREFIX_TREE_MAX_NUM_BLOCKS", "10000"))
+        self.profiling_stats = ProfilingStats()
+        self.lazy_prefix_tree = LazyPrefixTree(max_num_blocks=10000, block_size=self.tokens_per_block)
 
     def _get_from_request_queue(
             self,
@@ -358,10 +410,13 @@ class ExecutorRequestQueue:
             enable_attention_dp=True,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
 
+        self._update_requests_hash(new_requests)
+
         # Schedule attention dp requests
         all_ranks_new_requests = self._schedule_attention_dp_requests(
             new_requests, all_ranks_num_active_requests,
-            all_ranks_num_active_tokens)
+            all_ranks_num_active_tokens,
+            activate_requests)
         new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
         # Update performance metrics
@@ -380,7 +435,8 @@ class ExecutorRequestQueue:
     def _schedule_attention_dp_requests(
             self, new_requests: List[RequestQueueItem],
             all_ranks_num_active_requests: List[int],
-            all_ranks_num_active_tokens: List[int]) -> List[RequestQueueItem]:
+            all_ranks_num_active_tokens: List[int],
+            activate_requests: List[LlmRequest]) -> List[RequestQueueItem]:
         """Schedule attention dp requests."""
 
         # Map from ranks to new requests
@@ -401,6 +457,7 @@ class ExecutorRequestQueue:
 
         # Try to put the requests to the target dp rank until the max_num_active_requests is reached
         remaining_unscheduled = []
+
         for req_item in new_requests:
             scheduled = False
             scheduling_params = getattr(req_item.request,
@@ -425,11 +482,103 @@ class ExecutorRequestQueue:
             max(all_ranks_num_active_requests),
         )
 
-        all_ranks_new_requests = self._balance_requests_across_ranks(
-            remaining_unscheduled, all_ranks_new_requests,
-            all_ranks_num_active_requests, all_ranks_num_active_tokens)
+        if self.cache_aware_adp_balance == 0:
+            all_ranks_new_requests = self._balance_requests_across_ranks(
+                remaining_unscheduled, all_ranks_new_requests,
+                all_ranks_num_active_requests, all_ranks_num_active_tokens)
+        else:
+            all_ranks_new_requests = self._cache_aware_balance_requests(
+                remaining_unscheduled, activate_requests, 
+                all_ranks_new_requests)
+            all_ranks_num_active_requests = self.dist.tp_allgather(len(activate_requests))
+            self.expected_num_active_requests = max(
+                (total_num_active_requests + num_new_requests_all_ranks +
+                self.dist.tp_size - 1) // self.dist.tp_size,
+                max(all_ranks_num_active_requests),
+            )
 
         return all_ranks_new_requests
+
+    def _cache_aware_balance_requests(
+            self,
+            remaining_unscheduled: List[RequestQueueItem],
+            activate_requests: List[LlmRequest],
+            all_ranks_new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
+        """
+        Cache-aware balance requests.
+        1. Re-schedule the non-scheduled activate requests.
+        2. Schedule the remaining unscheduled requests.
+        """
+        all_ranks_active_requests = self.dist.tp_allgather(activate_requests)
+        rescheduled_requests = []
+        for rank, req_list in enumerate(all_ranks_active_requests):
+            for req in req_list:
+                if req.state == LlmRequestState.CONTEXT_INIT:
+                    rescheduled_requests.append((rank, req))
+        removed_activate_req_ids = []
+        for request in rescheduled_requests:
+            self._select_opt_rank(request, activate_requests, all_ranks_new_requests, removed_activate_req_ids)
+        activate_requests[:] = [req for req in activate_requests if req.request_id not in removed_activate_req_ids]
+        for req_item in remaining_unscheduled:
+            self._select_opt_rank(req_item, activate_requests, all_ranks_new_requests, None)
+
+        return all_ranks_new_requests
+    
+    def _select_opt_rank(
+            self,
+            req_item: RequestQueueItem | Tuple[int, LlmRequest],
+            activate_requests: List[LlmRequest],
+            all_ranks_new_requests: List[RequestQueueItem],
+            removed_activate_req_ids: List[int] = None) -> int:
+        """Select the optimal rank for the request."""
+        metric, extra_stats = self._estimate_request_performance(req_item)
+        all_ranks_metrics = self.dist.tp_allgather(metric)
+        target_rank = all_ranks_metrics.index(min(all_ranks_metrics))
+        if isinstance(req_item, RequestQueueItem):
+            all_ranks_new_requests[target_rank].append(req_item)
+        else:
+            rank, req = req_item
+            if self.dist.rank == target_rank and rank != self.dist.rank:
+                activate_requests.append(req)
+            if self.dist.rank != target_rank and rank == self.dist.rank:
+                removed_activate_req_ids.append(req.request_id)
+
+        if self.dist.rank == target_rank:
+            self.profiling_stats.update(extra_stats)
+            self.lazy_prefix_tree.insert_request(req_item)
+        if isinstance(req_item, RequestQueueItem):
+            logger.info(f"Waiting request {req_item.id} scheduled to rank {target_rank}")
+        else:
+            logger.info(f"Activate request {req_item[1].request_id} from rank {rank} scheduled to rank {target_rank}")
+        logger.info(f"profiling stats: {self.profiling_stats}")
+
+    def _estimate_request_performance(
+            self,
+            req_item: RequestQueueItem | Tuple[int, LlmRequest]) -> Tuple[int, Dict[str, int]]:
+        """Estimate the performance of the request."""
+        if isinstance(req_item, RequestQueueItem):
+            input_len = len(req_item.request.input_token_ids)
+            logger.info(f"Waiting request {req_item.id} starts")
+        else:
+            req_item = req_item[1]
+            input_len = len(req_item.input_tokens)
+            logger.info(f"Activate request {req_item.request_id} starts")
+        reused_tokens = self.lazy_prefix_tree.match(req_item)
+        missed_tokens = input_len - reused_tokens
+        metric = missed_tokens + self.profiling_stats.num_total_tokens
+        logger.info(f'Reused tokens: {reused_tokens}, Missed tokens: {missed_tokens}, num_total_tokens: {self.profiling_stats.num_total_tokens}, metric: {metric}')
+        all_ranks_reused_tokens = self.dist.tp_allgather(reused_tokens)
+        all_ranks_metric = self.dist.tp_allgather(metric)
+        logger.info(f"all_ranks_reused_tokens: {all_ranks_reused_tokens}")
+        logger.info(f"all_ranks_metric: {all_ranks_metric}")
+        extra_stats = {
+            "num_total_tokens": missed_tokens,
+            "num_scheduled_reqs": 1,
+            "num_total_precompute_tokens": 0,
+            "free_num_blocks": missed_tokens // self.tokens_per_block,
+            "context_requests": [reused_tokens, missed_tokens]
+        }
+        return metric, extra_stats
 
     def _handle_request_broadcasting(self,
                                      new_requests: List[RequestQueueItem]):
@@ -670,11 +819,26 @@ class ExecutorRequestQueue:
                 _should_exclude_last_generation_logits(),
                 input_token_ids=input_ids_this_rank,
                 position_ids=position_ids_this_rank,
+                block_hash=req_item.block_hash,
             )
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)
         return req_with_children
+
+    def _update_requests_hash(
+        self, requests: List[RequestQueueItem]):
+        for req_item in requests:
+            request = req_item.request
+            input_ids = request.input_token_ids
+            num_blocks = len(input_ids) // self.tokens_per_block
+            parent_block_hash = None
+            for id in range(num_blocks):
+                token_ids = input_ids[id * self.tokens_per_block: (id + 1) * self.tokens_per_block]
+                block_hash = hash_func(token_ids, parent_block_hash)
+                parent_block_hash = block_hash
+                req_item.block_hash.append(block_hash)
+            logger.info(f"Request {req_item.id} block hashes: {req_item.block_hash}")
 
     @nvtx_range("_merge_requests")
     def _merge_requests(
@@ -697,7 +861,9 @@ class ExecutorRequestQueue:
         for req_item in new_requests:
             req = executor_request_to_llm_request(
                 req_item.id, req_item.request, req_item.child_req_ids,
-                self._should_exclude_last_generation_logits())
+                self._should_exclude_last_generation_logits(),
+                block_hash=req_item.block_hash,
+            )
             req_with_children.append(req)
             if req.child_requests:
                 req_with_children.extend(req.child_requests)

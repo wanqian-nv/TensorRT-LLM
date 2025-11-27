@@ -452,6 +452,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        self.block_hash = kwargs.pop("block_hash", None)
+
         if llm_request is not None:
             super().__init__(llm_request)
         else:
@@ -629,6 +631,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.child_requests.append(py_request)
 
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, LlmRequest):
+            return False
+        return self.request_id == other.request_id
+    
+    def __hash__(self) -> int:
+        return hash(self.request_id)
+
 
 def convert_wordlist(word_list) -> List[List[int]]:
     """Converts a wordlist from format:
@@ -673,7 +683,8 @@ def executor_request_to_llm_request(
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
-        position_ids: Optional[List] = None) -> LlmRequest:
+        position_ids: Optional[List] = None,
+        block_hash: Optional[List[bytes]] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
@@ -764,7 +775,9 @@ def executor_request_to_llm_request(
         cache_salt_id=executor_request.cache_salt_id,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None))
+                                   None),
+        block_hash=block_hash
+        )
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

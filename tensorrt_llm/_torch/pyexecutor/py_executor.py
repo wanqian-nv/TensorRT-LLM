@@ -42,7 +42,7 @@ from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from ..speculative.speculation_gate import SpeculationGate
-from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
+from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem, ProfilingStats
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
@@ -54,6 +54,8 @@ from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
 from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
+from .lazy_prefix_tree import LazyPrefixTree
+
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -144,7 +146,6 @@ class BatchState:
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
     scheduled_ctx_reqs: list[LlmRequest] = None
-
 
 class PyExecutor:
 
@@ -241,6 +242,7 @@ class PyExecutor:
         self.block_reuse_enabled = True if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse else False
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        self.tokens_per_block = self.kv_cache_manager.tokens_per_block
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -287,6 +289,7 @@ class PyExecutor:
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
+            tokens_per_block=self.tokens_per_block,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
@@ -776,6 +779,21 @@ class PyExecutor:
         with self.stats_lock:
             self.stats.append((stats, req_stats))
 
+    def _update_profiling_stats(self,
+                                stats: ProfilingStats,
+                                batch_stats: IterationStats,
+                                req_stats: List[RequestStats]):
+
+        kv_stats: KvCacheStats = batch_stats.kv_cache_stats
+        ifb_stats = batch_stats.inflight_batching_stats
+        stats.num_scheduled_reqs = ifb_stats.num_scheduled_requests
+        stats.num_total_tokens = ifb_stats.num_gen_requests + ifb_stats.num_ctx_tokens
+        # TODO: Need to check if req.scheduled includes the finished requests
+        stats.num_total_precompute_tokens = sum([req.context_prefill_position + req.num_generated_tokens for req in req_stats if req.scheduled and req.stage != RequestStage.GENERATION_COMPLETE])
+        stats.free_num_blocks = kv_stats.free_num_blocks
+        stats.context_requests = []
+
+
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
                             active_requests: List[LlmRequest],
                             batch_state: BatchState):
@@ -794,6 +812,10 @@ class PyExecutor:
             self._update_iter_stats(
                 batch_state.iter_stats, iter_latency_ms, len(finished_requests),
                 batch_state.sample_state.scheduled_requests), req_stats)
+
+        self._update_profiling_stats(
+            self.executor_request_queue.profiling_stats,
+            batch_state.iter_stats, req_stats)
 
     def _executor_loop_cleanup(self):
 
@@ -1497,6 +1519,9 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+
+        all_ranks_num_active_requests = self.dist.tp_allgather(len(self.active_requests))
+        self.expected_num_active_requests = max(all_ranks_num_active_requests)
         return validated_requests
 
     def _add_kv_cache_events(self):
