@@ -290,6 +290,7 @@ class PyExecutor:
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
             tokens_per_block=self.tokens_per_block,
+            max_num_tokens=self.max_num_tokens,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
             self.disable_overlap_scheduler, self.dist.pp_size)
@@ -769,7 +770,16 @@ class PyExecutor:
         if stats.specdec_stats is not None:
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 stats.specdec_stats.iter_latency_ms) / float(iter_latency_ms)
+
+        all_ranks_num_scheduled_reqs = self.dist.tp_allgather(stats.inflight_batching_stats.num_scheduled_requests)
+        all_ranks_num_ctx_tokens = self.dist.tp_allgather(stats.inflight_batching_stats.num_ctx_tokens)
+        all_ranks_free_num_blocks = self.dist.tp_allgather(stats.kv_cache_stats.free_num_blocks)
         logger.info(f"iter_stats: {stats.to_json_str()}")
+        logger.info('--------------------------------')
+        logger.info(f"all_ranks_num_scheduled_reqs: {all_ranks_num_scheduled_reqs}")
+        logger.info(f"all_ranks_num_ctx_tokens: {all_ranks_num_ctx_tokens}")
+        logger.info(f"all_ranks_free_num_blocks: {all_ranks_free_num_blocks}")
+        logger.info('--------------------------------')
         return stats
 
     def _append_iter_stats(self,
@@ -784,14 +794,21 @@ class PyExecutor:
                                 batch_stats: IterationStats,
                                 req_stats: List[RequestStats]):
 
+        # Assume in each iteration scheduled_requests = executed_requests, and no delayed requests
         kv_stats: KvCacheStats = batch_stats.kv_cache_stats
         ifb_stats = batch_stats.inflight_batching_stats
-        stats.num_scheduled_reqs = ifb_stats.num_scheduled_requests
-        stats.num_total_tokens = ifb_stats.num_gen_requests + ifb_stats.num_ctx_tokens
+        # num_scheduled_reqs includes the finished requests, and shouldn't be included in the next iteration's stats
+        stats.num_scheduled_reqs = ifb_stats.num_scheduled_requests - batch_stats.num_completed_requests
+        stats.num_total_tokens = stats.num_scheduled_reqs
         # TODO: Need to check if req.scheduled includes the finished requests
         stats.num_total_precompute_tokens = sum([req.context_prefill_position + req.num_generated_tokens for req in req_stats if req.scheduled and req.stage != RequestStage.GENERATION_COMPLETE])
+        # For capacity limitation check, it actually need minus stats.num_scheduled_reqs // tokens_per_block, but we can ignore this for now
         stats.free_num_blocks = kv_stats.free_num_blocks
-        stats.context_requests = []
+        # Can be further corrected by the non-scheduled active_requests
+        stats.context_requests = [
+            [req.reused_blocks_per_request*self.tokens_per_block, req.missed_blocks_per_request*self.tokens_per_block]
+            for req in req_stats if not req.scheduled and req.stage not in [RequestStage.GENERATION_COMPLETE, RequestStage.QUEUED]
+        ]
 
 
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
@@ -813,9 +830,17 @@ class PyExecutor:
                 batch_state.iter_stats, iter_latency_ms, len(finished_requests),
                 batch_state.sample_state.scheduled_requests), req_stats)
 
-        self._update_profiling_stats(
-            self.executor_request_queue.profiling_stats,
-            batch_state.iter_stats, req_stats)
+        if self.executor_request_queue.cache_aware_adp_balance:
+            self._update_profiling_stats(
+                self.executor_request_queue.profiling_stats,
+                batch_state.iter_stats,
+                req_stats)
+            self._free_finished_requests(finished_requests)
+
+    def _free_finished_requests(self, finished_requests: list[LlmRequest]):
+        for req in finished_requests:
+            logger.info(f"Freeing request {req.request_id} osl={req.max_new_tokens}")
+            self.executor_request_queue.lazy_prefix_tree.free_request(req)
 
     def _executor_loop_cleanup(self):
 
@@ -1255,7 +1280,6 @@ class PyExecutor:
                         BatchState(sample_state=sample_state,
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
-                    logger.info(f"iter_stats: {iter_stats.to_json_str()}")
 
     def _prepare_draft_requests(self):
         try:
@@ -1520,8 +1544,6 @@ class PyExecutor:
 
         self.active_requests.extend(validated_requests)
 
-        all_ranks_num_active_requests = self.dist.tp_allgather(len(self.active_requests))
-        self.expected_num_active_requests = max(all_ranks_num_active_requests)
         return validated_requests
 
     def _add_kv_cache_events(self):

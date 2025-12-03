@@ -2,6 +2,7 @@ import dataclasses
 from dataclasses import field
 import datetime
 import heapq
+from math import inf
 import queue
 import threading
 import time
@@ -41,7 +42,7 @@ class ProfilingStats:
         self.num_total_tokens = 0
         self.num_scheduled_reqs = 0
         self.num_total_precompute_tokens = 0
-        self.free_num_blocks = 0
+        self.free_num_blocks = inf
         self.context_requests = []
 
     def update(self, extra_stats: Dict[str, int]):
@@ -87,6 +88,7 @@ class ExecutorRequestQueue:
     """Handles fetching and processing of new requests from the request queue."""
 
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
+                 max_num_tokens: int,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
                  batch_wait_timeout_ms: float, is_disaggregated: bool,
@@ -96,6 +98,7 @@ class ExecutorRequestQueue:
         self.waiting_queue: deque[RequestQueueItem] = deque()
         self.canceled_req_ids = []
         self.enable_attention_dp = enable_attention_dp
+        self.max_num_tokens = max_num_tokens
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
@@ -509,64 +512,46 @@ class ExecutorRequestQueue:
         1. Re-schedule the non-scheduled activate requests.
         2. Schedule the remaining unscheduled requests.
         """
-        all_ranks_active_requests = self.dist.tp_allgather(activate_requests)
-        rescheduled_requests = []
-        for rank, req_list in enumerate(all_ranks_active_requests):
-            for req in req_list:
-                if req.state == LlmRequestState.CONTEXT_INIT:
-                    rescheduled_requests.append((rank, req))
-        removed_activate_req_ids = []
-        for request in rescheduled_requests:
-            self._select_opt_rank(request, activate_requests, all_ranks_new_requests, removed_activate_req_ids)
-        activate_requests[:] = [req for req in activate_requests if req.request_id not in removed_activate_req_ids]
         for req_item in remaining_unscheduled:
-            self._select_opt_rank(req_item, activate_requests, all_ranks_new_requests, None)
+            self._select_opt_rank(req_item, all_ranks_new_requests)
 
         return all_ranks_new_requests
     
     def _select_opt_rank(
             self,
-            req_item: RequestQueueItem | Tuple[int, LlmRequest],
-            activate_requests: List[LlmRequest],
-            all_ranks_new_requests: List[RequestQueueItem],
-            removed_activate_req_ids: List[int] = None) -> int:
+            req_item: RequestQueueItem,
+            all_ranks_new_requests: List[RequestQueueItem]) -> int:
         """Select the optimal rank for the request."""
         metric, extra_stats = self._estimate_request_performance(req_item)
         all_ranks_metrics = self.dist.tp_allgather(metric)
-        target_rank = all_ranks_metrics.index(min(all_ranks_metrics))
-        if isinstance(req_item, RequestQueueItem):
-            all_ranks_new_requests[target_rank].append(req_item)
-        else:
-            rank, req = req_item
-            if self.dist.rank == target_rank and rank != self.dist.rank:
-                activate_requests.append(req)
-            if self.dist.rank != target_rank and rank == self.dist.rank:
-                removed_activate_req_ids.append(req.request_id)
+        min_metric = min(all_ranks_metrics)
+        if min_metric == float('inf'):
+            logger.info(f"Request {req_item.id} is not available to schedule")
+            return
+        target_rank = all_ranks_metrics.index(min_metric)
+        all_ranks_new_requests[target_rank].append(req_item)
 
         if self.dist.rank == target_rank:
             self.profiling_stats.update(extra_stats)
             self.lazy_prefix_tree.insert_request(req_item)
-        if isinstance(req_item, RequestQueueItem):
-            logger.info(f"Waiting request {req_item.id} scheduled to rank {target_rank}")
-        else:
-            logger.info(f"Activate request {req_item[1].request_id} from rank {rank} scheduled to rank {target_rank}")
+        logger.info(f"Waiting request {req_item.id} scheduled to rank {target_rank}")
         logger.info(f"profiling stats: {self.profiling_stats}")
 
     def _estimate_request_performance(
             self,
-            req_item: RequestQueueItem | Tuple[int, LlmRequest]) -> Tuple[int, Dict[str, int]]:
+            req_item: RequestQueueItem) -> Tuple[int, Dict[str, int]]:
         """Estimate the performance of the request."""
-        if isinstance(req_item, RequestQueueItem):
-            input_len = len(req_item.request.input_token_ids)
-            logger.info(f"Waiting request {req_item.id} starts")
-        else:
-            req_item = req_item[1]
-            input_len = len(req_item.input_tokens)
-            logger.info(f"Activate request {req_item.request_id} starts")
+        logger.info(f"Waiting request {req_item.id} starts")
+        input_len = len(req_item.request.input_token_ids)
         reused_tokens = self.lazy_prefix_tree.match(req_item)
         missed_tokens = input_len - reused_tokens
-        metric = missed_tokens + self.profiling_stats.num_total_tokens
-        logger.info(f'Reused tokens: {reused_tokens}, Missed tokens: {missed_tokens}, num_total_tokens: {self.profiling_stats.num_total_tokens}, metric: {metric}')
+        num_total_tokens = missed_tokens + self.profiling_stats.num_total_tokens
+        num_scheduled_reqs = self.profiling_stats.num_scheduled_reqs + 1
+        is_available = (num_total_tokens <= self.max_num_tokens) and (num_scheduled_reqs <= self.max_batch_size) \
+            and ((num_scheduled_reqs + missed_tokens) // self.tokens_per_block <= self.profiling_stats.free_num_blocks)
+        metric = num_total_tokens if is_available else float('inf')
+
+        logger.info(f'Reused tokens: {reused_tokens}, Missed tokens: {missed_tokens}, num_total_tokens: {self.profiling_stats.num_total_tokens}, num_scheduled_reqs: {self.profiling_stats.num_scheduled_reqs}, metric: {metric}')
         all_ranks_reused_tokens = self.dist.tp_allgather(reused_tokens)
         all_ranks_metric = self.dist.tp_allgather(metric)
         logger.info(f"all_ranks_reused_tokens: {all_ranks_reused_tokens}")

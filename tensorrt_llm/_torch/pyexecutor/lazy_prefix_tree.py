@@ -42,26 +42,27 @@ class FreeBlocksList:
         self.tail = FreeBlocksNode('TAIL')
         self.head.next = self.tail
         self.tail.prev = self.head
+        self.hash_to_node = {}
 
-    def add(self, block_hash: str):
+    def add(self, block_hash):
         node = FreeBlocksNode(block_hash)
         node.next = self.head.next
         node.prev = self.head
         self.head.next.prev = node
         self.head.next = node
+        self.hash_to_node[block_hash] = node
 
-    def remove(self, node: FreeBlocksNode):
+    def remove(self, block_hash):
+        node = self.hash_to_node[block_hash]
         node.prev.next = node.next
         node.next.prev = node.prev
-        node.next = None
-        node.prev = None
-        return node
+        del self.hash_to_node[block_hash]
 
     def pop_left(self) -> str:
         if self.head.next == self.tail:
             return None
         node = self.head.next
-        self.remove(node)
+        self.remove(node.block_hash)
         return node.block_hash
 
 
@@ -106,7 +107,13 @@ class LazyPrefixTree:
         """
         Remove the request from the lazy prefix tree
         """
-        raise NotImplementedError("Not implemented")
+        for hash in request.block_hash:
+            ref_cnt = self.hash_table[hash]
+            ref_cnt -= 1
+            assert ref_cnt >= 0
+            if ref_cnt == 0:
+                self.free_blocks_list.add(hash)
+            self.hash_table[hash] = ref_cnt
 
     def lazy_evict(self):
         """
