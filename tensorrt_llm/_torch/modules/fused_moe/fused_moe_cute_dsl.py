@@ -23,6 +23,7 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
+from tensorrt_llm.logger import logger
 
 
 @torch.compile(options={"max-autotune": True})
@@ -354,6 +355,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
+        logger.info(f"CuteDslFusedMoE init: initial_local_expert_ids: {self.initial_local_expert_ids} experts per worker: {self.expert_size_per_partition}")
+
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled

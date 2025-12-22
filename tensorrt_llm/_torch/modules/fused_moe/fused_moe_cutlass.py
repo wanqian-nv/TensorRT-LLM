@@ -7,6 +7,7 @@ import torch
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm.logger import logger
+from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
@@ -25,6 +26,7 @@ from .quantization import (
     WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
+from tensorrt_llm.logger import logger
 
 
 class CutlassFusedMoE(MoE):
@@ -106,10 +108,6 @@ class CutlassFusedMoE(MoE):
             self.hidden_size = ((self.hidden_size + 127) // 128) * 128
             self.intermediate_size_per_partition = (
                 (self.intermediate_size_per_partition + 127) // 128) * 128
-
-        # Note: num_slots, expert_size_per_partition, initial_global_assignments,
-        # slot_start, slot_end, initial_local_expert_ids are all initialized by
-        # base class's _init_load_balancer() method
 
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
