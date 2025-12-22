@@ -1853,6 +1853,18 @@ class _ModelWrapper:
         return self.model if isinstance(self.model, str) else None
 
 
+class DwdpConfig(StrictBaseModel):
+    """
+    Configuration for DWDP.
+    """
+    enabled: bool = Field(default=False, description="Whether to enable DWDP.")
+    dwdp_size: int = Field(default=1, description="The number of DWDP workers.")
+    experts_per_worker: int = Field(default=0, description="The number of experts per worker.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
 class BaseLlmArgs(StrictBaseModel):
     """
     Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
@@ -2789,6 +2801,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description="NVFP4 GEMM backend config.",
         status="beta")
 
+    dwdp_config: DwdpConfig = Field(
+        default_factory=DwdpConfig,
+        description="DWDP (Distributed Weight Data Parallelism) config.",
+        status="beta")
+
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.",
                               status="beta")
@@ -3319,6 +3336,7 @@ def update_llm_args_with_extra_dict(
         "attention_dp_config": AttentionDpConfig,
         "sparse_attention_config": BaseSparseAttentionConfig,
         "kv_cache_config": KvCacheConfig,
+        "dwdp_config": DwdpConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

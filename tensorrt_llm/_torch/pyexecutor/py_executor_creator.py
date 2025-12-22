@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, mpi_disabled
+from tensorrt_llm._utils import get_sm_version, global_mpi_rank, mpi_disabled
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           GuidedDecodingConfig, LoadFormat,
@@ -40,6 +40,7 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
+from .dwdp import DwdpManager
 
 
 class _ExecutorMemoryMonitor:
@@ -327,6 +328,12 @@ def create_py_executor(
         chunk_size=max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
+
+    # Initialize DWDP Manager (only for context workers in disaggregated serving)
+    if llm_args.dwdp_config is not None and llm_args.dwdp_config.enabled:
+        assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
+        dwdp_manager = DwdpManager(config=llm_args.dwdp_config, dist=dist)
+        logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
     mem_monitor = _ExecutorMemoryMonitor()
 
