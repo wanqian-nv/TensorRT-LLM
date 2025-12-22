@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
@@ -20,6 +21,7 @@ from .quantization import (
     WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
+from tensorrt_llm.logger import logger
 
 
 class CutlassFusedMoE(MoE):
@@ -97,19 +99,42 @@ class CutlassFusedMoE(MoE):
             self.intermediate_size_per_partition = (
                 (self.intermediate_size_per_partition + 127) // 128) * 128
 
-        self.num_slots = self.num_experts
-        self.expert_size_per_partition = self.num_experts // self.ep_size
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
-            self.num_experts for ep_rank in range(self.ep_size)
-            for local_slot_id in range(self.expert_size_per_partition)
-        ]
-        self.slot_start = self.ep_rank * self.expert_size_per_partition
-        self.slot_end = self.slot_start + self.expert_size_per_partition
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
-        assert len(
-            self.initial_local_expert_ids) == self.expert_size_per_partition
+        # Check if DWDP is enabled
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None:
+            self.num_slots = self.num_experts
+            self.expert_size_per_partition = dwdp_manager.experts_per_worker
+            
+            # For DWDP, ep_size is dwdp_size
+            dwdp_size = dwdp_manager.dwdp_size
+            self.initial_global_assignments = [
+                (ep_rank * self.num_experts // dwdp_size + local_slot_id) %
+                self.num_experts for ep_rank in range(dwdp_size)
+                for local_slot_id in range(self.expert_size_per_partition)
+            ]
+            
+            # For DWDP, slot_start is directly from start_expert_id
+            self.slot_start = dwdp_manager.start_expert_id
+            self.slot_end = self.slot_start + self.expert_size_per_partition
+            self.initial_local_expert_ids = list(range(self.slot_start, self.slot_end))
+            
+            assert len(self.initial_local_expert_ids) == self.expert_size_per_partition
+        else:
+            # Standard EP mode
+            self.num_slots = self.num_experts
+            self.expert_size_per_partition = self.num_experts // self.ep_size
+            self.initial_global_assignments = [
+                (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
+                self.num_experts for ep_rank in range(self.ep_size)
+                for local_slot_id in range(self.expert_size_per_partition)
+            ]
+            self.slot_start = self.ep_rank * self.expert_size_per_partition
+            self.slot_end = self.slot_start + self.expert_size_per_partition
+            self.initial_local_expert_ids = self.initial_global_assignments[
+                self.slot_start:self.slot_end]
+            assert len(
+                self.initial_local_expert_ids) == self.expert_size_per_partition
+        logger.info(f"Loading weights for expert ids: {self.initial_local_expert_ids}")
 
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
         moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
