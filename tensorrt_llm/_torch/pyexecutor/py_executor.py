@@ -57,6 +57,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput)
+from .dwdp import DwdpManager
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -139,7 +140,8 @@ class PyExecutor:
                  peft_cache_config: Optional[PeftCacheConfig] = None,
                  virtual_memory_pools: Optional[dict] = None,
                  hang_detection_timeout: Optional[int] = None,
-                 execution_stream: Optional[torch.cuda.Stream] = None):
+                 execution_stream: Optional[torch.cuda.Stream] = None,
+                 dwdp_manager: Optional[DwdpManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -341,6 +343,8 @@ class PyExecutor:
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
+
+        self.dwdp_manager = dwdp_manager
 
         if start_worker:
             self.start_worker()
