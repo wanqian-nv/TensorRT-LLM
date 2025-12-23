@@ -41,7 +41,7 @@ from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
-
+from .dwdp import DwdpManager
 GB = 1 << 30
 
 
@@ -667,6 +667,7 @@ def create_py_executor_instance(
     peft_cache_config: Optional[PeftCacheConfig] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
     cache_transceiver_config: Optional[trtllm.CacheTransceiverConfig] = None,
+    dwdp_manager: Optional[DwdpManager] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -815,7 +816,9 @@ def create_py_executor_instance(
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=kv_connector_manager,
         max_seq_len=max_seq_len,
-        peft_cache_config=peft_cache_config)
+        peft_cache_config=peft_cache_config,
+        dwdp_manager=dwdp_manager,
+    )
 
 
 def create_torch_sampler_args(mapping: Mapping, *, max_seq_len: int,

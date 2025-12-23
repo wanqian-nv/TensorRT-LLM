@@ -311,6 +311,7 @@ def create_py_executor(
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     # Initialize DWDP Manager (only for context workers in disaggregated serving)
+    dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None and llm_args.dwdp_config.enabled:
         assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config, dist=dist)
@@ -574,6 +575,17 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
+    # Exchange IPC Handles and Initialize Dwdp Prefetch Buffer
+    if dwdp_manager is not None:
+        dwdp_manager.exchange_all_handles()
+        dwdp_manager.initialize_prefetch_buffer()
+        logger.info(f'[DWDP] rank {dwdp_manager.rank} local_ipc_handles:')
+        for layer_idx, ipc_collector in enumerate(dwdp_manager.ipc_collectors):
+            logger.info(f'    layer_idx: {layer_idx}, local_ipc_handles: {ipc_collector.local_ipc_handles}')
+            for key, peer_ptr in ipc_collector.peer_ptrs.items():
+                logger.info(f'    rank: {key[0]}, param_name: {key[1]}, ptr: {peer_ptr}')
+        dwdp_manager.verify_ipc_communication(num_elements=10)
+
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
     # to provide a resource manager if required.
@@ -673,6 +685,7 @@ def create_py_executor(
                 peft_cache_config=peft_cache_config,
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,
+                dwdp_manager=dwdp_manager,
             )
 
     _adjust_torch_mem_fraction(pytorch_backend_config)

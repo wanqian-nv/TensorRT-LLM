@@ -11,6 +11,7 @@ from ...utils import AuxStreamType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
+from ...pyexecutor.dwdp import get_global_dwdp_manager
 
 
 def swiglu_fused_moe(x):
@@ -140,6 +141,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
         )
 
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None:
+            self.dwdp_handle_collector = dwdp_manager.add_layer(
+                layer_idx=layer_idx,
+            )
+        else:
+            self.dwdp_handle_collector = None
+
     def forward_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -247,3 +256,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
         return final_hidden_states
+
+    def load_weights(self, weights: Dict[str, torch.Tensor]):
+        super().load_weights(weights)
+        if self.dwdp_handle_collector is not None:
+            self.dwdp_handle_collector.register_weights(self)
+            
