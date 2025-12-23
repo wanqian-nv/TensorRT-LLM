@@ -14,6 +14,7 @@ from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 from tensorrt_llm.logger import logger
+from ...pyexecutor.dwdp import get_global_dwdp_manager
 
 
 @torch.compile(options={"max-autotune": True})
@@ -199,6 +200,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
         )
+
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None:
+            self.dwdp_handle_collector = dwdp_manager.add_layer(
+                layer_idx=layer_idx,
+            )
+        else:
+            self.dwdp_handle_collector = None
+
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
         if AuxStreamType.MoeOutputMemset not in self.aux_stream_dict:
@@ -546,3 +556,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                          x_sf=x_sf,
                          enable_alltoall=False)
         return x
+
+    def load_weights(self, weights: Dict[str, torch.Tensor]):
+        super().load_weights(weights)
+        if self.dwdp_handle_collector is not None:
+            self.dwdp_handle_collector.register_weights(self)
