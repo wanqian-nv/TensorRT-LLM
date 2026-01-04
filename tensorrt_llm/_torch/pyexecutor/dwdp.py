@@ -7,10 +7,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._utils import global_mpi_rank
 from mpi4py.MPI import COMM_WORLD
-try:
-    from cuda.bindings import runtime as cudart
-except ImportError:
-    from cuda import cudart
+
+from cuda.bindings import runtime as cudart
+from cuda.bindings import driver as cuda_driver
+
 
 
 # Parameter names to collect handles for
@@ -18,10 +18,10 @@ WEIGHT_PARAMS = ['w3_w1_weight', 'w2_weight']
 BIAS_PARAMS = ['w3_w1_bias', 'w2_bias']
 # Quant scale params vary by quantization method
 QUANT_SCALE_PARAMS = [
-    'w3_w1_weight_scaling_factor', 'w2_weight_scaling_factor',  # FP8
     'w3_w1_weight_scale', 'w2_weight_scale',  # NVFP4/MXFP4
-    'fc31_alpha', 'fc2_alpha',  # NVFP4 alpha
+     'fc31_alpha', 'fc2_alpha',  # NVFP4 alpha
 ]
+
 
 
 _global_dwdp_manager: Optional["DwdpManager"] = None
@@ -56,11 +56,16 @@ class DwdpLayerHandleCollector:
 
         # Local IPC handles: param_name -> handle_bytes
         self.local_ipc_handles: Dict[str, bytes] = {}
+        # Local pointers: param_name -> data_ptr (for verification)
+        self.local_ptrs: Dict[str, int] = {}
+        # Local offsets: param_name -> offset from allocation base
+        # IPC handle points to allocation base, we need offset to get actual tensor data
+        self.local_offsets: Dict[str, int] = {}
         # Parameter shapes: param_name -> shape (without expert dim)
         self.param_shapes: Dict[str, torch.Size] = {}
         # Parameter dtypes: param_name -> dtype
         self.param_dtypes: Dict[str, torch.dtype] = {}
-        # Peer pointers: (peer_rank, param_name) -> ptr
+        # Peer pointers: (peer_rank, param_name) -> ptr (already adjusted with offset)
         self.peer_ptrs: Dict[Tuple[int, str], int] = {}
 
     def register_weights(self, module: nn.Module):
@@ -73,35 +78,73 @@ class DwdpLayerHandleCollector:
             module: The MoE module with loaded weights
         """
         # Collect all parameter types
+        # Debug: print all parameter names in this module
+        all_param_names = [name for name, _ in module.named_parameters(recurse=False)]
+        logger.info(f"[DWDP Debug] Module {module.__class__.__name__} has parameters: {all_param_names}")
+        
         params_to_register = []
-        # Weights (always present)
-        params_to_register.extend(WEIGHT_PARAMS)
+        # Weights (check if present and not None)
+        for param_name in WEIGHT_PARAMS:
+            if hasattr(module, param_name) and getattr(module, param_name, None) is not None:
+                params_to_register.append(param_name)
         # Bias (optional)
         if hasattr(module, 'bias'):
             params_to_register.extend(BIAS_PARAMS)
         # Quant scales (optional, depends on quant method)
         for param_name in QUANT_SCALE_PARAMS:
-            if hasattr(module, param_name):
+            if hasattr(module, param_name) and getattr(module, param_name, None) is not None:
                 params_to_register.append(param_name)
-                
+        logger.info(f"Registering {len(params_to_register)} parameters: {params_to_register}")
+
         # Register each parameter
         for param_name in params_to_register:
             param = getattr(module, param_name)
             if isinstance(param, nn.Parameter):
                 param = param.data
+            if param is None:
+                continue
             if not param.is_cuda or not param.is_contiguous():
                 raise ValueError(f"Parameter {param_name} is not on GPU or is not contiguous")
             self._register_param(param_name, param)
             logger.info(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
 
     def _register_param(self, param_name: str, param: torch.Tensor):
-        # Get IPC handle
-        err, handle = cudart.cudaIpcGetMemHandle(param.data_ptr())
+        # Get IPC handle - note: handle points to the CUDA allocation base, not tensor's data_ptr
+        tensor_ptr = param.data_ptr()
+        err, handle = cudart.cudaIpcGetMemHandle(tensor_ptr)
         check_cuda_error(err, f"get handle for {param_name}")
         
+        # Get allocation base address using Driver API cuMemGetAddressRange
+        # This returns the actual base address and size of the CUDA allocation
+        # cudaPointerGetAttributes.devicePointer returns the input pointer, not base!
+        err, alloc_base, alloc_size = cuda_driver.cuMemGetAddressRange(tensor_ptr)
+        if err != cuda_driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuMemGetAddressRange failed for {param_name}: {err}")
+        
+        # Calculate offset from allocation base
+        # Convert CUdeviceptr to int for arithmetic
+        offset = tensor_ptr - int(alloc_base)
+        
         self.local_ipc_handles[param_name] = bytes(handle.reserved)
+        self.local_ptrs[param_name] = tensor_ptr
+        self.local_offsets[param_name] = offset
         self.param_shapes[param_name] = param.shape[1:]
         self.param_dtypes[param_name] = param.dtype
+        
+        if offset != 0:
+            logger.info(f"[DWDP] Parameter {param_name} has non-zero offset: {offset} base: {hex(int(alloc_base))} bytes from allocation base (alloc_size={alloc_size})")
+            # Read data at alloc_base for debugging (need cudaMemcpy since we only have raw pointer)
+            debug_tensor = torch.zeros(1, dtype=param.dtype, device='cuda')
+            err, = cudart.cudaMemcpy(
+                debug_tensor.data_ptr(),
+                int(alloc_base),
+                debug_tensor.numel() * debug_tensor.element_size(),
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+            )
+            logger.info(f"[DWDP] Data at alloc_base: {debug_tensor.cpu().tolist()}")
+            # Directly read actual tensor data (no cudaMemcpy needed)
+            logger.info(f"[DWDP] Data at tensor_ptr: {param.flatten()[:10].cpu().tolist()}")
+        logger.info(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
 
     def get_peer_ptr(self, peer_rank: int, param_name: str) -> int:
         """Get pointer to parameter on peer rank."""
@@ -273,6 +316,7 @@ class DwdpManager:
             local_data['ipc_collectors'].append({
                 'layer_idx': collector.layer_idx,
                 'handles': collector.local_ipc_handles,
+                'offsets': collector.local_offsets,  # Include offsets for IPC pointer adjustment
             })
             
         # AllGather from all Context workers in DWDP group
@@ -285,95 +329,139 @@ class DwdpManager:
                 continue
             for layer_idx, ipc_collector in enumerate(peer_data['ipc_collectors']):
                 collector = self.ipc_collectors[layer_idx]
+                peer_offsets = ipc_collector['offsets']
                 for param_name, handle_bytes in ipc_collector['handles'].items():
+                    logger.info(f"Opening handle for param {param_name} from rank {peer_rank} layer {layer_idx}")
                     # Reconstruct and open handle
                     handle = cudart.cudaIpcMemHandle_t()
                     handle.reserved = list(handle_bytes)
                     
-                    err, ptr = cudart.cudaIpcOpenMemHandle(
+                    err, base_ptr = cudart.cudaIpcOpenMemHandle(
                         handle,
                         cudart.cudaIpcMemLazyEnablePeerAccess
                     )
                     check_cuda_error(err, f"open handle rank={peer_rank}")
-                    collector.peer_ptrs[(peer_rank, param_name)] = ptr
+                    
+                    # Apply offset to get actual tensor pointer
+                    # IPC handle points to allocation base, offset gives us the tensor location
+                    offset = peer_offsets[param_name]
+                    actual_ptr = base_ptr + offset
+                    if offset != 0:
+                        logger.info(f"[DWDP] Applying offset {offset} base: {hex(base_ptr)} for {param_name} from rank {peer_rank}")
+                    collector.peer_ptrs[(peer_rank, param_name)] = actual_ptr
 
     def verify_ipc_communication(self, num_elements: int = 10):
 
-        logger.info(f"[DWDP] Rank {self.rank}: Starting IPC communication verification with {num_elements} elements")
 
-        for layer_idx, collector in enumerate(self.ipc_collectors):
-            logger.info(f"[DWDP] Rank {self.rank}: Verifying layer {layer_idx}")
+        x = torch.empty(1024 * 1024, device='cuda', dtype=torch.uint8)
+        real_base = x.data_ptr()
+
+        # 2. 取中间的一个切片
+        y = x[512:]
+        offset_ptr = y.data_ptr()
+
+        # 3. 查询 offset_ptr 的属性
+        err, attr = cudart.cudaPointerGetAttributes(offset_ptr)
+        err, base_ptr, size = cuda_driver.cuMemGetAddressRange(offset_ptr)
+
+        logger.info(f"x: {hex(real_base)} y: {hex(offset_ptr)}")
+        logger.info(f"devicePointer: {hex(attr.devicePointer)}")
+        logger.info(f"cuMemGetAddressRange: {hex(int(base_ptr))}")
+        logger.info(f"Is same? {real_base == attr.devicePointer}")
+        logger.info(f"Is same? {real_base == base_ptr}")
+
+        logger.info(f"[DWDP] Rank {self.rank}: Starting IPC communication verification with {num_elements} elements")
             
-            for param_name, local_ptr in collector.local_ipc_handles.items():
-                param_shape = collector.param_shapes[param_name]
-                param_dtype = collector.param_dtypes[param_name]
-                
-                # Calculate actual number of elements to copy
-                total_elements = param_shape.numel()
-                copy_elements = min(num_elements, total_elements)
-                
-                # Create a local tensor for verification
-                local_tensor = torch.zeros(copy_elements, dtype=param_dtype, device='cuda')
-                local_tensor.fill_(float(self.rank))  # Fill with rank number for identification
-                
-                # Copy local tensor data to local IPC memory
-                src_ptr = local_tensor.data_ptr()
-                bytes_to_copy = copy_elements * local_tensor.element_size()
-                err, = cudart.cudaMemcpy(
-                    local_ptr,
-                    src_ptr,
-                    bytes_to_copy,
-                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
-                )
-                check_cuda_error(err, f"rank {self.rank} local memcpy layer={layer_idx} param={param_name}")
-                
-                logger.info(
-                    f"[DWDP] Rank {self.rank}: Written {copy_elements} elements "
-                    f"(value={float(self.rank)}) to local ptr for {param_name}"
-                )
-            
-            # Synchronize before reading from peers
-            torch.cuda.synchronize()
-            self.dwdp_group.barrier()
-            
-            # Now read from peer ranks
-            for (peer_rank, param_name), peer_ptr in collector.peer_ptrs.items():
-                param_shape = collector.param_shapes[param_name]
-                param_dtype = collector.param_dtypes[param_name]
-                
-                total_elements = param_shape.numel()
-                copy_elements = min(num_elements, total_elements)
-                
-                recv_tensor = torch.zeros(copy_elements, dtype=param_dtype, device='cuda')
-                
-                dst_ptr = recv_tensor.data_ptr()
-                bytes_to_copy = copy_elements * recv_tensor.element_size()
-                err, = cudart.cudaMemcpy(
-                    dst_ptr,
-                    peer_ptr,
-                    bytes_to_copy,
-                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
-                )
-                check_cuda_error(err, f"rank {self.rank} peer memcpy from rank {peer_rank}")
-                
-                expected_value = float(peer_rank)
-                actual_values = recv_tensor.cpu().numpy()
-                
-                if torch.allclose(recv_tensor, torch.full_like(recv_tensor, expected_value)):
-                    logger.info(
-                        f"[DWDP] ✅ Rank {self.rank}: Successfully verified IPC from rank {peer_rank}, "
-                        f"layer={layer_idx}, param={param_name}, "
-                        f"received values={actual_values[:5]}... (expected {expected_value})"
-                    )
-                else:
-                    logger.error(
-                        f"[DWDP] ❌ Rank {self.rank}: FAILED IPC verification from rank {peer_rank}, "
-                        f"layer={layer_idx}, param={param_name}, "
-                        f"expected {expected_value}, got {actual_values[:5]}..."
-                    )
-            
-            self.dwdp_group.barrier()
+        collector = self.ipc_collectors[0]
+        layer_idx = 0
+        logger.info(f"[DWDP] Rank {self.rank}: Verifying layer {layer_idx}")
         
+        # Step 1: Read local weight samples for each parameter
+        local_samples = {}  # param_name -> tensor (on CPU)
+        for param_name, local_ptr in collector.local_ptrs.items():
+            param_shape = collector.param_shapes[param_name]
+            param_dtype = collector.param_dtypes[param_name]
+            
+            total_elements = param_shape.numel()
+            copy_elements = min(num_elements, total_elements)
+            
+            # Create buffer and read local data
+            local_tensor = torch.zeros(copy_elements, dtype=param_dtype, device='cuda')
+            bytes_to_copy = copy_elements * local_tensor.element_size()
+            err, = cudart.cudaMemcpy(
+                local_tensor.data_ptr(),
+                local_ptr,
+                bytes_to_copy,
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+            )
+            check_cuda_error(err, f"rank {self.rank} read local data for {param_name}")
+            local_samples[param_name] = local_tensor.cpu().numpy().tolist()
+            logger.info(f"Local sample for {param_name}: dtype: {param_dtype} bytes: {bytes_to_copy} sample: {local_samples[param_name]}")
+        
+        # Synchronize before allgather
+        torch.cuda.synchronize()
+        self.dwdp_group.barrier()
+        
+        # Step 2: Exchange local samples via MPI allgather (ground truth)
+        local_data = {
+            'rank': self.rank,
+            'samples': local_samples,
+        }
+        all_samples = self.dwdp_group.allgather(local_data)
+        
+        # Build ground truth map: (peer_rank, param_name) -> expected_values
+        ground_truth = {}
+        for peer_data in all_samples:
+            peer_rank = peer_data['rank']
+            if peer_rank != self.rank:
+                for param_name, values in peer_data['samples'].items():
+                    ground_truth[(peer_rank, param_name)] = values
+        
+        logger.info(f"[DWDP] Rank {self.rank}: Collected ground truth from {len(all_samples)-1} peers")
+        
+        # Step 3 & 4: Read via IPC and compare with ground truth
+        for (peer_rank, param_name), peer_ptr in collector.peer_ptrs.items():
+            param_shape = collector.param_shapes[param_name]
+            param_dtype = collector.param_dtypes[param_name]
+            
+            total_elements = param_shape.numel()
+            copy_elements = min(num_elements, total_elements)
+            
+            # Read via IPC
+            recv_tensor = torch.zeros(copy_elements, dtype=param_dtype, device='cuda')
+            bytes_to_copy = copy_elements * recv_tensor.element_size()
+            err, = cudart.cudaMemcpy(
+                recv_tensor.data_ptr(),
+                peer_ptr,
+                bytes_to_copy,
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+            )
+            check_cuda_error(err, f"rank {self.rank} IPC read from rank {peer_rank}")
+            
+            ipc_values = recv_tensor.cpu().numpy().tolist()
+            expected_values = ground_truth.get((peer_rank, param_name), None)
+            
+            if expected_values is None:
+                logger.error(
+                    f"[DWDP] ❌ Rank {self.rank}: No ground truth for rank {peer_rank}, param={param_name}"
+                )
+                continue
+            
+            # Compare IPC values with ground truth
+            if ipc_values == expected_values:
+                logger.info(
+                    f"[DWDP] ✅ Rank {self.rank}: IPC verified from rank {peer_rank}, "
+                    f"layer={layer_idx}, param={param_name}, "
+                    f"values match! sample={ipc_values[:3]}..."
+                )
+            else:
+                logger.error(
+                    f"[DWDP] ❌ Rank {self.rank}: IPC MISMATCH from rank {peer_rank}, "
+                    f"layer={layer_idx}, param={param_name}, "
+                    f"expected={expected_values[:3]}..., got={ipc_values[:3]}..."
+                )
+        
+        self.dwdp_group.barrier()
         logger.info(f"[DWDP] Rank {self.rank}: IPC communication verification completed")
 
     def initialize_prefetch_buffer(self):
