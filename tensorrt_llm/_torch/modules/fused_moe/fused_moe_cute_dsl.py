@@ -347,9 +347,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             without_comm=without_comm,
         )
 
-        dwdp_manager = get_global_dwdp_manager()
-        if dwdp_manager is not None:
-            self.dwdp_handle_collector = dwdp_manager.add_layer(
+        # Store dwdp_manager reference for prefetch/compute synchronization
+        self.dwdp_manager = get_global_dwdp_manager()
+        if self.dwdp_manager is not None:
+            self.dwdp_handle_collector = self.dwdp_manager.add_layer(
                 layer_idx=layer_idx,
             )
         else:
@@ -678,8 +679,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Returns:
             final_hidden_states tensor.
         """
+        # DWDP: Wait for prefetch to complete before using data
+        if self.dwdp_manager is not None:
+            buffer_data = self.dwdp_manager.wait_prefetch_and_get_buffer(self.layer_idx)
+        
+        # Execute MoE computation
         if self.has_nvfp4:
-            return self.run_moe_nvfp4(
+            result = self.run_moe_nvfp4(
                 x=x,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
@@ -687,7 +693,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 moe_output=moe_output,
                 enable_alltoall=enable_alltoall)
         elif self.has_deepseek_fp8_block_scales:
-            return self.run_moe_fp8_block_scales(
+            result = self.run_moe_fp8_block_scales(
                 x=x,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
@@ -697,6 +703,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
             )
+        
+        # DWDP: Record compute completion and trigger next prefetch
+        if self.dwdp_manager is not None:
+            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+        
+        return result
 
     def forward_chunk(
             self,

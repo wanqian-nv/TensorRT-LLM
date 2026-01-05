@@ -10,6 +10,7 @@ from mpi4py.MPI import COMM_WORLD
 
 from cuda.bindings import runtime as cudart
 from cuda.bindings import driver as cuda_driver
+from tensorrt_llm._utils import nvtx_range
 
 
 
@@ -67,6 +68,9 @@ class DwdpLayerHandleCollector:
         self.param_dtypes: Dict[str, torch.dtype] = {}
         # Peer pointers: (peer_rank, param_name) -> ptr (already adjusted with offset)
         self.peer_ptrs: Dict[Tuple[int, str], int] = {}
+        # Local samples for verification: param_name -> list of sampled values
+        # Sample at positions [0, 8, 16, ..., 56] * expert_size
+        self.local_samples: Dict[str, List[float]] = {}
 
     def register_weights(self, module: nn.Module):
         """
@@ -144,6 +148,18 @@ class DwdpLayerHandleCollector:
             logger.info(f"[DWDP] Data at alloc_base: {debug_tensor.cpu().tolist()}")
             # Directly read actual tensor data (no cudaMemcpy needed)
             logger.info(f"[DWDP] Data at tensor_ptr: {param.flatten()[:10].cpu().tolist()}")
+        
+        # Sample param for verification: sample at expert positions [0, 8, 16, ..., 56]
+        # Each sample takes the first element of that expert's data
+        num_experts = param.shape[0]
+        sample_positions = list(range(0, min(64, num_experts), 8))  # [0, 8, 16, 24, 32, 40, 48, 56]
+        samples = []
+        for expert_idx in sample_positions:
+            sample_value = param[expert_idx].flatten()[0].item()
+            samples.append(sample_value)
+        self.local_samples[param_name] = samples
+        logger.info(f"[DWDP Sample] {param_name}: sampled {len(samples)} experts at positions {sample_positions}, values={samples[:4]}...")
+        
         logger.info(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
 
     def get_peer_ptr(self, peer_rank: int, param_name: str) -> int:
@@ -181,14 +197,16 @@ class DwdpPrefetchBuffer:
         self,
         dwdp_size: int,
         experts_per_worker: int,
+        num_prefetch_experts: int,
         num_layers: int,
         param_shapes: Dict[str, torch.Size],
         param_dtypes: Dict[str, torch.dtype],
     ):
 
-        self.num_peer_ranks = dwdp_size - 1
+        self.dwdp_size = dwdp_size
+        self.num_prefetch_experts = num_prefetch_experts
         self.experts_per_worker = experts_per_worker
-        self.num_prefetch_experts = self.num_peer_ranks * self.experts_per_worker
+        self.num_experts = self.num_prefetch_experts * (self.dwdp_size - 1) + self.experts_per_worker
         self.num_layers = num_layers
         self.num_buffers = 2  # Ping-pong
         
@@ -198,12 +216,15 @@ class DwdpPrefetchBuffer:
         self.device = torch.cuda.current_device()
         
         self.buffers: List[Dict[str, torch.Tensor]] = []
+
+        logger.info(f"[DWDP] Initializing prefetch buffer with {self.num_experts} experts")
         
+        # Use num_experts size so we can index by global expert_id
         for _ in range(self.num_buffers):
             buffer = {}
             for param_name, shape in param_shapes.items():
                 dtype = param_dtypes[param_name]
-                buffer_shape = (self.num_prefetch_experts,) + tuple(shape)
+                buffer_shape = (self.num_experts,) + tuple(shape)
                 buffer[param_name] = torch.empty(
                     buffer_shape,
                     dtype=dtype,
@@ -211,12 +232,15 @@ class DwdpPrefetchBuffer:
                 )
             self.buffers.append(buffer)
             
+        # Use (num_layers + 3) to account for dense layers before MoE layers
+        # e.g., DeepSeek has 3 dense layers, so global layer_idx starts from 3
+        self.max_layer_idx = num_layers + 3
         self.prefetch_events: List[List[torch.cuda.Event]] = [
-            [torch.cuda.Event() for _ in range(num_layers//self.num_buffers)]
+            [torch.cuda.Event() for _ in range(self.max_layer_idx//self.num_buffers + 1)]
             for _ in range(self.num_buffers)
         ]
         self.compute_events: List[List[torch.cuda.Event]] = [
-            [torch.cuda.Event() for _ in range(num_layers//self.num_buffers)]
+            [torch.cuda.Event() for _ in range(self.max_layer_idx//self.num_buffers + 1)]
             for _ in range(self.num_buffers)
         ]
         self.prefetch_stream = torch.cuda.Stream(device=self.device)
@@ -226,15 +250,19 @@ class DwdpPrefetchBuffer:
             self.compute_events[buffer_idx][0].record(torch.cuda.current_stream())
     
     def record_prefetch_event(self, layer_idx: int):
+        logger.info(f"[DWDP] Record prefetch event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(self.prefetch_stream)
     
     def record_compute_event(self, layer_idx: int):
+        logger.info(f"[DWDP] Record compute event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(torch.cuda.current_stream())
         
     def wait_prefetch_event(self, layer_idx: int):
+        logger.info(f"[DWDP] Wait prefetch event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         torch.cuda.current_stream().wait_event(self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers])
     
     def wait_compute_event(self, layer_idx: int):
+        logger.info(f"[DWDP] Wait compute event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.prefetch_stream.wait_event(self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers])
 
 
@@ -268,6 +296,18 @@ class DwdpManager:
         # Prefetch buffer (initialized later in create_py_executor)
         self.prefetch_buffer: Optional[DwdpPrefetchBuffer] = None
 
+        # Peer expert ranges: (peer_rank, (start_expert_id, end_expert_id))
+        self.peer_expert_ranges: Dict[int, Tuple[int, int]] = {}
+        # All samples for verification: (layer_idx, param_name) -> {rank: samples}
+        # Samples are taken at expert positions [0, 8, 16, ..., 56]
+        self.all_samples: Dict[Tuple[int, str], Dict[int, List[float]]] = {}
+
+        self.num_prefetch_experts = config.num_prefetch_experts
+        self.start_expert_id = self.num_prefetch_experts * self.rank
+        self.end_expert_id = self.start_expert_id + self.experts_per_worker
+        
+        logger.info(f"Rank {self.rank} expert range: [{self.start_expert_id}, {self.end_expert_id}), prefetch={self.num_prefetch_experts}")
+
         set_global_dwdp_manager(self)
 
     def _init_dwdp_group(self):
@@ -278,7 +318,6 @@ class DwdpManager:
         ranks = list(range(self.dwdp_size))
         new_group = COMM_WORLD.group.Incl(ranks)
         self.dwdp_group = COMM_WORLD.Create_group(new_group)
-        self.start_expert_id = self.rank * self.experts_per_worker
         logger.info(f"Rank {self.rank} initialized Dwdp Group with ranks: {ranks} from MPI_COMM_WORLD")
 
     def is_enabled(self) -> bool:
@@ -310,6 +349,7 @@ class DwdpManager:
         local_data = {
             'rank': self.rank,
             'expert_start_id': self.start_expert_id,
+            'expert_end_id': self.end_expert_id,
             'ipc_collectors': [],
         }
         for collector in self.ipc_collectors:
@@ -317,6 +357,7 @@ class DwdpManager:
                 'layer_idx': collector.layer_idx,
                 'handles': collector.local_ipc_handles,
                 'offsets': collector.local_offsets,  # Include offsets for IPC pointer adjustment
+                'samples': collector.local_samples,  # Include samples for verification
             })
             
         # AllGather from all Context workers in DWDP group
@@ -325,6 +366,17 @@ class DwdpManager:
         # Open handles from peer workers
         for peer_data in all_data:
             peer_rank = peer_data['rank']
+            self.peer_expert_ranges[peer_rank] = (peer_data['expert_start_id'], peer_data['expert_end_id'])
+            
+            # Save samples from all ranks (including self) for verification
+            for layer_idx, ipc_collector in enumerate(peer_data['ipc_collectors']):
+                peer_samples = ipc_collector.get('samples', {})
+                for param_name, samples in peer_samples.items():
+                    key = (layer_idx, param_name)
+                    if key not in self.all_samples:
+                        self.all_samples[key] = {}
+                    self.all_samples[key][peer_rank] = samples
+            
             if peer_rank == self.rank:
                 continue
             for layer_idx, ipc_collector in enumerate(peer_data['ipc_collectors']):
@@ -473,9 +525,201 @@ class DwdpManager:
         self.prefetch_buffer = DwdpPrefetchBuffer(
             dwdp_size=self.dwdp_size,
             experts_per_worker=self.experts_per_worker,
+            num_prefetch_experts=self.num_prefetch_experts,
             num_layers=len(self.ipc_collectors),
             param_shapes=self.ipc_collectors[0].param_shapes,
             param_dtypes=self.ipc_collectors[0].param_dtypes,
         )
         self.prefetch_buffer.initialize_compute_events()
         
+    def prefetch_first_layers(self):
+        """Prefetch the first num_buffers layers as warmup."""
+        assert self.prefetch_buffer is not None, "Prefetch buffer is not initialized"
+        for layer_idx in range(3, 3 + self.prefetch_buffer.num_buffers):
+            self.prefetch_layer(layer_idx)
+            self.prefetch_buffer.record_prefetch_event(layer_idx)
+            logger.info(f"[DWDP] Warmup prefetch completed for layer {layer_idx}")
+
+    def wait_prefetch_and_get_buffer(self, layer_idx: int) -> Optional[Dict[str, torch.Tensor]]:
+        """Wait for prefetch to complete and return the buffer for this layer."""
+        assert self.prefetch_buffer is not None, "Prefetch buffer is not initialized"
+        self.prefetch_buffer.wait_prefetch_event(layer_idx)
+        buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
+        logger.info(f"[DWDP] Wait prefetch and get buffer for layer {layer_idx} buffer_idx: {buffer_idx}")
+        return self.prefetch_buffer.buffers[buffer_idx]
+
+    def record_compute_and_prefetch_next(self, layer_idx: int):
+        """Record compute completion and trigger prefetch for layer_idx + num_buffers."""
+        assert self.prefetch_buffer is not None, "Prefetch buffer is not initialized"
+        # Record compute event for current layer
+        self.prefetch_buffer.record_compute_event(layer_idx)
+
+        next_layer_idx = layer_idx + self.prefetch_buffer.num_buffers
+        if next_layer_idx >= self.prefetch_buffer.max_layer_idx:
+            return
+        # prefetch_layer handles stream internally: local copy on default stream, peer copy on prefetch stream
+        self.prefetch_layer(next_layer_idx, wait_compute_layer_idx=layer_idx)
+        self.prefetch_buffer.record_prefetch_event(next_layer_idx)
+        logger.info(f"[DWDP] Record compute and prefetch next for layer {layer_idx} next_layer_idx: {next_layer_idx}")
+
+    def verify_prefetch_buffer(self, layer_idx: int):
+        """
+        Verify prefetch buffer contains correct data by comparing with original samples.
+        
+        The ground truth is built by concatenating samples from all ranks in order.
+        Then we sample the prefetch buffer at the same positions and compare.
+        """
+        buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
+        collector = self.ipc_collectors[layer_idx]
+        
+        for param_name in collector.param_shapes.keys():
+            key = (layer_idx, param_name)
+            # Build ground truth: concatenate samples from all ranks in order
+            # Each rank samples at [0, 8, 16, ..., 56] within their local experts
+            ground_truth = []
+            for rank in range(self.dwdp_size):
+                ground_truth.extend(self.all_samples[key][rank])
+            
+            # Sample prefetch buffer at the same positions
+            # Global positions: rank0's [0,8,16,...] + rank1's [0,8,16,...] + ...
+            # = [0, 8, 16, ..., 56, experts_per_worker+0, experts_per_worker+8, ...]
+            buffer_tensor = self.prefetch_buffer.buffers[buffer_idx][param_name]
+            
+            buffer_samples = []
+            for rank in range(self.dwdp_size):
+                rank_start = self.peer_expert_ranges[rank][0]
+                sample_positions = list(range(0, min(64, self.experts_per_worker), 8))
+                for local_expert_idx in sample_positions:
+                    global_expert_idx = rank_start + local_expert_idx
+                    sample_value = buffer_tensor[global_expert_idx].flatten()[0].item()
+                    buffer_samples.append(sample_value)
+            
+            # Compare
+            if len(ground_truth) != len(buffer_samples):
+                logger.error(f"[DWDP Verify] ❌ Layer {layer_idx} param {param_name}: "
+                           f"length mismatch ground_truth={len(ground_truth)} buffer={len(buffer_samples)}")
+                continue
+            
+            match = True
+            for i, (gt, buf) in enumerate(zip(ground_truth, buffer_samples)):
+                if gt != buf:
+                    match = False
+                    logger.error(f"[DWDP Verify] ❌ Layer {layer_idx} param {param_name} idx {i}: "
+                               f"expected {gt}, got {buf}")
+            
+            if match:
+                logger.info(f"[DWDP Verify] ✅ Layer {layer_idx} param {param_name}: "
+                          f"all {len(ground_truth)} samples match! first_4={ground_truth[:4]}")
+            
+
+    def _get_prefetch_range_from_peer(self, peer_rank: int) -> Tuple[int, int, int, int]:
+        """
+        Calculate what experts to fetch from a peer and where to put them.
+        
+        Returns:
+            (src_offset, dst_global_id)
+            
+        Example: 256 experts, rank0: [0, 200), rank1: [56, 256)
+        - rank0 needs [200, 256) from rank1:
+          src_offset = 200 - 56 = 144, dst_global_id = 200, count = 56
+        - rank1 needs [0, 56) from rank0:
+          src_offset = 0 - 0 = 0, dst_global_id = 0, count = 56
+        """
+        peer_start, peer_end = self.peer_expert_ranges[peer_rank]
+        
+        # What I need = global - what I have
+        # From peer = what I need ∩ what peer has
+        if self.rank < peer_rank:
+            # I'm earlier rank, need experts after my end
+            prefetch_end = peer_end
+            prefetch_start = prefetch_end - self.num_prefetch_experts
+        else:
+            # I'm later rank, need experts before my start
+            prefetch_start = peer_start
+            prefetch_end = prefetch_start + self.num_prefetch_experts
+        
+        src_offset = prefetch_start - peer_start
+        dst_global_id = prefetch_start
+        
+        return src_offset, dst_global_id
+
+    @nvtx_range("dwdp_prefetch_weights")
+    @nvtx_range("dwdp_prefetch_layer")
+    def prefetch_layer(self, layer_idx: int, wait_compute_layer_idx: Optional[int] = None):
+        """
+        Prefetch layer data from local and peer ranks.
+        
+        Args:
+            layer_idx: The layer to prefetch
+            wait_compute_layer_idx: If provided, wait for this layer's compute to complete
+                                    before overwriting buffer (used when prefetching next layer)
+        
+        Local copy runs on default stream, peer copy runs on prefetch stream.
+        """
+        param_names = self.ipc_collectors[layer_idx-3].param_shapes.keys()
+        collector = self.ipc_collectors[layer_idx-3]
+        buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
+
+        # Step 1: Local copy on default stream
+        # No need to wait for compute_event here because local copy and compute
+        # are on the same stream (default stream), so they are naturally serialized
+        for param_name in param_names:
+            param_shape = collector.param_shapes[param_name]
+            param_dtype = collector.param_dtypes[param_name]
+            expert_size = param_shape.numel() * param_dtype.itemsize
+            
+            # src_ptr is local param data
+            src_ptr = collector.local_ptrs[param_name]
+            
+            # dst_ptr at local expert range in prefetch buffer
+            dst_tensor = self.prefetch_buffer.buffers[buffer_idx][param_name]
+            dst_ptr = dst_tensor.data_ptr() + self.start_expert_id * expert_size
+            
+            data_size = self.experts_per_worker * expert_size
+            
+            err, = cudart.cudaMemcpyAsync(
+                dst_ptr,
+                src_ptr,
+                data_size,
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                torch.cuda.current_stream().cuda_stream,
+            )
+            check_cuda_error(err, f"prefetch layer {layer_idx} local copy {param_name}")
+        logger.info(f"prefetch layer {layer_idx} local copy to [{self.start_expert_id}, {self.end_expert_id})")
+
+        # Step 2: Peer copy on prefetch stream
+        with torch.cuda.stream(self.prefetch_buffer.prefetch_stream):
+            # Also wait on prefetch stream (both streams need to wait for compute)
+            if wait_compute_layer_idx is not None:
+                self.prefetch_buffer.wait_compute_event(wait_compute_layer_idx)
+            
+            for peer_rank in range(self.dwdp_size):
+                if peer_rank == self.rank:
+                    continue  # Skip local rank, already handled above
+                
+                src_expert_offset, dst_global_id = self._get_prefetch_range_from_peer(peer_rank)
+                logger.info(f"prefetch layer {layer_idx} rank {peer_rank} src_expert_offset: {src_expert_offset} dst_global_id: {dst_global_id}")
+                
+                for param_name in param_names:
+                    param_shape = collector.param_shapes[param_name]
+                    param_dtype = collector.param_dtypes[param_name]
+                    expert_size = param_shape.numel() * param_dtype.itemsize
+                    
+                    # src_ptr points to peer's tensor start, add offset for specific experts
+                    base_ptr = collector.get_peer_ptr(peer_rank, param_name)
+                    src_ptr = base_ptr + src_expert_offset * expert_size
+                    
+                    # dst_ptr in prefetch buffer using global expert id
+                    dst_tensor = self.prefetch_buffer.buffers[buffer_idx][param_name]
+                    dst_ptr = dst_tensor.data_ptr() + dst_global_id * expert_size
+                    
+                    data_size = self.num_prefetch_experts * expert_size
+
+                    err, = cudart.cudaMemcpyAsync(
+                        dst_ptr,
+                        src_ptr,
+                        data_size,
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                        self.prefetch_buffer.prefetch_stream.cuda_stream,
+                    )
+                    check_cuda_error(err, f"prefetch layer {layer_idx} rank {peer_rank} {param_name}")
