@@ -1376,6 +1376,9 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
+                    if self.dwdp_manager is not None:
+                        self.dwdp_manager.prefetch_first_layers()
+
                     batch_outputs = self._forward_step(scheduled_batch)
 
                     guided_decoder_failed_requests = None

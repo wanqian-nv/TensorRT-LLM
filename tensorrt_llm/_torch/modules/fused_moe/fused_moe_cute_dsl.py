@@ -201,9 +201,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             without_comm=without_comm,
         )
 
-        dwdp_manager = get_global_dwdp_manager()
-        if dwdp_manager is not None:
-            self.dwdp_handle_collector = dwdp_manager.add_layer(
+        # Store dwdp_manager reference for prefetch/compute synchronization
+        self.dwdp_manager = get_global_dwdp_manager()
+        if self.dwdp_manager is not None:
+            self.dwdp_handle_collector = self.dwdp_manager.add_layer(
                 layer_idx=layer_idx,
             )
         else:
@@ -289,6 +290,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         assert self.has_nvfp4
         output_dtype = torch.bfloat16
         tile_size = 128
+
+        logger.info(f'slot_start: {self.slot_start}, expert_size_per_partition: {self.expert_size_per_partition} num_slots: {self.num_slots}')
+        logger.info(f'weight shapes: {self.w3_w1_weight.shape}, {self.w2_weight.shape}')
+        logger.info(f'quant_scales: {self.quant_scales.fc1_weight_block.shape}, {self.quant_scales.fc2_weight_block.shape}')
+        logger.info(f'alpha: {self.quant_scales.fc1_global.shape}, {self.quant_scales.fc2_global.shape}')
+        logger.info(f'x: {x.shape}, x_sf: {x_sf.shape} global_sf: {self.fc2_input_scale.shape}')
+        logger.info(f'moe_ep_size: {self.mapping.moe_ep_size} enable_alltoall: {enable_alltoall}')
 
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
@@ -500,8 +508,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Returns:
             final_hidden_states tensor.
         """
+        # DWDP: Wait for prefetch to complete before using data
+        if self.dwdp_manager is not None:
+            buffer_data = self.dwdp_manager.wait_prefetch_and_get_buffer(self.layer_idx)
+        
+        # Execute MoE computation
         if self.has_nvfp4:
-            return self.run_moe_nvfp4(
+            result = self.run_moe_nvfp4(
                 x=x,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
@@ -509,7 +522,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 moe_output=moe_output,
                 enable_alltoall=enable_alltoall)
         elif self.has_deepseek_fp8_block_scales:
-            return self.run_moe_fp8_block_scales(
+            result = self.run_moe_fp8_block_scales(
                 x=x,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
@@ -519,6 +532,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
             )
+        
+        # DWDP: Record compute completion and trigger next prefetch
+        if self.dwdp_manager is not None:
+            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+        
+        return result
 
     def forward_chunk(
             self,
