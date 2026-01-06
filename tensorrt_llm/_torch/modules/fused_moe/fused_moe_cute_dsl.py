@@ -432,6 +432,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         x_sf: Optional[torch.Tensor] = None,
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
+        # DWDP: optional override parameters from prefetch buffer
+        w3_w1_weight: Optional[torch.Tensor] = None,
+        fc1_weight_block: Optional[torch.Tensor] = None,
+        fc1_global: Optional[torch.Tensor] = None,
+        w2_weight: Optional[torch.Tensor] = None,
+        fc2_weight_block: Optional[torch.Tensor] = None,
+        fc2_global: Optional[torch.Tensor] = None,
+        expert_size_per_partition: Optional[int] = None,
+        slot_start: Optional[int] = None,
     ) -> torch.Tensor:
         assert self.has_nvfp4
         output_dtype = torch.bfloat16
@@ -485,8 +494,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             token_final_scales=token_final_scales,
             num_experts=self.num_slots,
             top_k=self.routing_method.experts_per_token,
-            local_expert_offset=self.slot_start,
-            local_num_experts=self.expert_size_per_partition,
+            local_expert_offset=_slot_start,
+            local_num_experts=_expert_size_per_partition,
             tile_tokens_dim=tile_size,
         )
 
@@ -497,10 +506,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
-            weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+            weight=_w3_w1_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
-            weight_scale=self.quant_scales.fc1_weight_block.view(torch.uint8),
-            alpha=self.quant_scales.fc1_global,
+            weight_scale=_fc1_weight_block.view(torch.uint8),
+            alpha=_fc1_global,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -508,8 +517,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             global_sf=self.fc2_input_scale,
             num_experts=self.num_slots,
             top_k=self.routing_method.experts_per_token,
-            num_local_experts=self.expert_size_per_partition,
-            local_expert_offset=self.slot_start,
+            num_local_experts=_expert_size_per_partition,
+            local_expert_offset=_slot_start,
             tile_size=tile_size,
         )
 
@@ -533,11 +542,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
             torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
-                weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
+                weight=_w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
-                weight_scale=self.quant_scales.fc2_weight_block.view(
+                weight_scale=_fc2_weight_block.view(
                     torch.uint8),
-                alpha=self.quant_scales.fc2_global,
+                alpha=_fc2_global,
                 output=moe_output,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -546,25 +555,25 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 token_final_scales=token_final_scales,
                 num_experts=self.num_slots,
                 top_k=self.routing_method.experts_per_token,
-                num_local_experts=self.expert_size_per_partition,
-                local_expert_offset=self.slot_start,
+                num_local_experts=_expert_size_per_partition,
+                local_expert_offset=_slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
         else:
             x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
-                weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
+                weight=_w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
-                weight_scale=self.quant_scales.fc2_weight_block.view(
+                weight_scale=_fc2_weight_block.view(
                     torch.uint8),
-                alpha=self.quant_scales.fc2_global,
+                alpha=_fc2_global,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 num_experts=self.num_slots,
                 top_k=self.routing_method.experts_per_token,
-                num_local_experts=self.expert_size_per_partition,
-                local_expert_offset=self.slot_start,
+                num_local_experts=_expert_size_per_partition,
+                local_expert_offset=_slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
@@ -679,19 +688,39 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Returns:
             final_hidden_states tensor.
         """
-        # DWDP: Wait for prefetch to complete before using data
+        # DWDP: Wait for prefetch to complete and get buffer data
+        buffer_data = None
         if self.dwdp_manager is not None:
             buffer_data = self.dwdp_manager.wait_prefetch_and_get_buffer(self.layer_idx)
         
         # Execute MoE computation
         if self.has_nvfp4:
-            result = self.run_moe_nvfp4(
-                x=x,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                x_sf=x_sf,
-                moe_output=moe_output,
-                enable_alltoall=enable_alltoall)
+            if buffer_data is not None:
+                # Use prefetched data from DWDP buffer
+                result = self.run_moe_nvfp4(
+                    x=x,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    x_sf=x_sf,
+                    moe_output=moe_output,
+                    enable_alltoall=enable_alltoall,
+                    w3_w1_weight=buffer_data['w3_w1_weight'],
+                    fc1_weight_block=buffer_data['w3_w1_weight_scale'],
+                    fc1_global=buffer_data['fc31_alpha'],
+                    w2_weight=buffer_data['w2_weight'],
+                    fc2_weight_block=buffer_data['w2_weight_scale'],
+                    fc2_global=buffer_data['fc2_alpha'],
+                    expert_size_per_partition=self.num_slots,
+                    slot_start=0,
+                )
+            else:
+                result = self.run_moe_nvfp4(
+                    x=x,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    x_sf=x_sf,
+                    moe_output=moe_output,
+                    enable_alltoall=enable_alltoall)
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(
                 x=x,
