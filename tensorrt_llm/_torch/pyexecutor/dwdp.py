@@ -643,7 +643,6 @@ class DwdpManager:
         
         return src_offset, dst_global_id
 
-    @nvtx_range("dwdp_prefetch_weights")
     @nvtx_range("dwdp_prefetch_layer")
     def prefetch_layer(self, layer_idx: int, wait_compute_layer_idx: Optional[int] = None):
         """
