@@ -863,6 +863,7 @@ class PyExecutor:
             # Calculate draft overhead
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 draft_latency_ms) / float(iter_latency_ms)
+        logger.info(f"iter_stats: {stats.to_json_str()}")
         return stats
 
     def _append_iter_stats(self,

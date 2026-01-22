@@ -124,9 +124,9 @@ class OpenAIDisaggServer:
         @asynccontextmanager
         async def lifespan(app) -> None:
             # Prepare servers (sync server clock) when static ctx/gen server list is used
+            await self._service.setup()
             await self._ctx_router.prepare_servers()
             await self._gen_router.prepare_servers()
-            await self._service.setup()
             yield
             await self._service.teardown()
 

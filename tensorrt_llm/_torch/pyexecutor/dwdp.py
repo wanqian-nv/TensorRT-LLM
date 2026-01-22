@@ -84,7 +84,7 @@ class DwdpLayerHandleCollector:
         # Collect all parameter types
         # Debug: print all parameter names in this module
         all_param_names = [name for name, _ in module.named_parameters(recurse=False)]
-        logger.info(f"[DWDP Debug] Module {module.__class__.__name__} has parameters: {all_param_names}")
+        logger.debug(f"[DWDP Debug] Module {module.__class__.__name__} has parameters: {all_param_names}")
         
         params_to_register = []
         # Weights (check if present and not None)
@@ -98,7 +98,7 @@ class DwdpLayerHandleCollector:
         for param_name in QUANT_SCALE_PARAMS:
             if hasattr(module, param_name) and getattr(module, param_name, None) is not None:
                 params_to_register.append(param_name)
-        logger.info(f"Registering {len(params_to_register)} parameters: {params_to_register}")
+        logger.debug(f"Registering {len(params_to_register)} parameters: {params_to_register}")
 
         # Register each parameter
         for param_name in params_to_register:
@@ -110,7 +110,7 @@ class DwdpLayerHandleCollector:
             if not param.is_cuda or not param.is_contiguous():
                 raise ValueError(f"Parameter {param_name} is not on GPU or is not contiguous")
             self._register_param(param_name, param)
-            logger.info(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
+            logger.debug(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
 
     def _register_param(self, param_name: str, param: torch.Tensor):
         # Get IPC handle - note: handle points to the CUDA allocation base, not tensor's data_ptr
@@ -136,7 +136,7 @@ class DwdpLayerHandleCollector:
         self.param_dtypes[param_name] = param.dtype
         
         if offset != 0:
-            logger.info(f"[DWDP] Parameter {param_name} has non-zero offset: {offset} base: {hex(int(alloc_base))} bytes from allocation base (alloc_size={alloc_size})")
+            logger.debug(f"[DWDP] Parameter {param_name} has non-zero offset: {offset} base: {hex(int(alloc_base))} bytes from allocation base (alloc_size={alloc_size})")
             # Read data at alloc_base for debugging (need cudaMemcpy since we only have raw pointer)
             debug_tensor = torch.zeros(1, dtype=param.dtype, device='cuda')
             err, = cudart.cudaMemcpy(
@@ -145,9 +145,9 @@ class DwdpLayerHandleCollector:
                 debug_tensor.numel() * debug_tensor.element_size(),
                 cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
             )
-            logger.info(f"[DWDP] Data at alloc_base: {debug_tensor.cpu().tolist()}")
+            logger.debug(f"[DWDP] Data at alloc_base: {debug_tensor.cpu().tolist()}")
             # Directly read actual tensor data (no cudaMemcpy needed)
-            logger.info(f"[DWDP] Data at tensor_ptr: {param.flatten()[:10].cpu().tolist()}")
+            logger.debug(f"[DWDP] Data at tensor_ptr: {param.flatten()[:10].cpu().tolist()}")
         
         # Sample param for verification: sample at expert positions [0, 8, 16, ..., 56]
         # Each sample takes the first element of that expert's data
@@ -158,9 +158,9 @@ class DwdpLayerHandleCollector:
             sample_value = param[expert_idx].flatten()[0].item()
             samples.append(sample_value)
         self.local_samples[param_name] = samples
-        logger.info(f"[DWDP Sample] {param_name}: sampled {len(samples)} experts at positions {sample_positions}, values={samples[:4]}...")
+        logger.debug(f"[DWDP Sample] {param_name}: sampled {len(samples)} experts at positions {sample_positions}, values={samples[:4]}...")
         
-        logger.info(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
+        logger.debug(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
 
     def get_peer_ptr(self, peer_rank: int, param_name: str) -> int:
         """Get pointer to parameter on peer rank."""
@@ -250,19 +250,19 @@ class DwdpPrefetchBuffer:
             self.compute_events[buffer_idx][0].record(torch.cuda.current_stream())
     
     def record_prefetch_event(self, layer_idx: int):
-        logger.info(f"[DWDP] Record prefetch event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
+        logger.debug(f"[DWDP] Record prefetch event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(self.prefetch_stream)
     
     def record_compute_event(self, layer_idx: int):
-        logger.info(f"[DWDP] Record compute event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
+        logger.debug(f"[DWDP] Record compute event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(torch.cuda.current_stream())
         
     def wait_prefetch_event(self, layer_idx: int):
-        logger.info(f"[DWDP] Wait prefetch event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
+        logger.debug(f"[DWDP] Wait prefetch event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         torch.cuda.current_stream().wait_event(self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers])
     
     def wait_compute_event(self, layer_idx: int):
-        logger.info(f"[DWDP] Wait compute event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
+        logger.debug(f"[DWDP] Wait compute event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.prefetch_stream.wait_event(self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers])
 
 
@@ -383,7 +383,7 @@ class DwdpManager:
                 collector = self.ipc_collectors[layer_idx]
                 peer_offsets = ipc_collector['offsets']
                 for param_name, handle_bytes in ipc_collector['handles'].items():
-                    logger.info(f"Opening handle for param {param_name} from rank {peer_rank} layer {layer_idx}")
+                    logger.debug(f"Opening handle for param {param_name} from rank {peer_rank} layer {layer_idx}")
                     # Reconstruct and open handle
                     handle = cudart.cudaIpcMemHandle_t()
                     handle.reserved = list(handle_bytes)
@@ -399,7 +399,7 @@ class DwdpManager:
                     offset = peer_offsets[param_name]
                     actual_ptr = base_ptr + offset
                     if offset != 0:
-                        logger.info(f"[DWDP] Applying offset {offset} base: {hex(base_ptr)} for {param_name} from rank {peer_rank}")
+                        logger.debug(f"[DWDP] Applying offset {offset} base: {hex(base_ptr)} for {param_name} from rank {peer_rank}")
                     collector.peer_ptrs[(peer_rank, param_name)] = actual_ptr
 
     def verify_ipc_communication(self, num_elements: int = 10):
@@ -538,14 +538,14 @@ class DwdpManager:
         for layer_idx in range(3, 3 + self.prefetch_buffer.num_buffers):
             self.prefetch_layer(layer_idx)
             self.prefetch_buffer.record_prefetch_event(layer_idx)
-            logger.info(f"[DWDP] Warmup prefetch completed for layer {layer_idx}")
+            logger.debug(f"[DWDP] Warmup prefetch completed for layer {layer_idx}")
 
     def wait_prefetch_and_get_buffer(self, layer_idx: int) -> Optional[Dict[str, torch.Tensor]]:
         """Wait for prefetch to complete and return the buffer for this layer."""
         assert self.prefetch_buffer is not None, "Prefetch buffer is not initialized"
         self.prefetch_buffer.wait_prefetch_event(layer_idx)
         buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
-        logger.info(f"[DWDP] Wait prefetch and get buffer for layer {layer_idx} buffer_idx: {buffer_idx}")
+        logger.debug(f"[DWDP] Wait prefetch and get buffer for layer {layer_idx} buffer_idx: {buffer_idx}")
         return self.prefetch_buffer.buffers[buffer_idx]
 
     def record_compute_and_prefetch_next(self, layer_idx: int):
@@ -560,7 +560,7 @@ class DwdpManager:
         # prefetch_layer handles stream internally: local copy on default stream, peer copy on prefetch stream
         self.prefetch_layer(next_layer_idx, wait_compute_layer_idx=layer_idx)
         self.prefetch_buffer.record_prefetch_event(next_layer_idx)
-        logger.info(f"[DWDP] Record compute and prefetch next for layer {layer_idx} next_layer_idx: {next_layer_idx}")
+        logger.debug(f"[DWDP] Record compute and prefetch next for layer {layer_idx} next_layer_idx: {next_layer_idx}")
 
     def verify_prefetch_buffer(self, layer_idx: int):
         """
@@ -608,7 +608,7 @@ class DwdpManager:
                                f"expected {gt}, got {buf}")
             
             if match:
-                logger.info(f"[DWDP Verify] ✅ Layer {layer_idx} param {param_name}: "
+                logger.debug(f"[DWDP Verify] ✅ Layer {layer_idx} param {param_name}: "
                           f"all {len(ground_truth)} samples match! first_4={ground_truth[:4]}")
             
 
@@ -684,7 +684,7 @@ class DwdpManager:
                 torch.cuda.current_stream().cuda_stream,
             )
             check_cuda_error(err, f"prefetch layer {layer_idx} local copy {param_name}")
-        logger.info(f"prefetch layer {layer_idx} local copy to [{self.start_expert_id}, {self.end_expert_id})")
+        logger.debug(f"prefetch layer {layer_idx} local copy to [{self.start_expert_id}, {self.end_expert_id})")
 
         # Step 2: Peer copy on prefetch stream
         with torch.cuda.stream(self.prefetch_buffer.prefetch_stream):
@@ -697,7 +697,7 @@ class DwdpManager:
                     continue  # Skip local rank, already handled above
                 
                 src_expert_offset, dst_global_id = self._get_prefetch_range_from_peer(peer_rank)
-                logger.info(f"prefetch layer {layer_idx} rank {peer_rank} src_expert_offset: {src_expert_offset} dst_global_id: {dst_global_id}")
+                logger.debug(f"prefetch layer {layer_idx} rank {peer_rank} src_expert_offset: {src_expert_offset} dst_global_id: {dst_global_id}")
                 
                 for param_name in param_names:
                     param_shape = collector.param_shapes[param_name]
