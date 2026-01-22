@@ -642,12 +642,12 @@ def create_py_executor(
     if dwdp_manager is not None:
         dwdp_manager.exchange_all_handles()
         dwdp_manager.initialize_prefetch_buffer()
-        logger.info(f'[DWDP] rank {dwdp_manager.rank} local_ipc_handles:')
-        for layer_idx, ipc_collector in enumerate(dwdp_manager.ipc_collectors):
-            logger.info(f'    layer_idx: {layer_idx}, local_ipc_handles: {ipc_collector.local_ipc_handles}')
-            for key, peer_ptr in ipc_collector.peer_ptrs.items():
-                logger.info(f'    rank: {key[0]}, param_name: {key[1]}, ptr: {peer_ptr}')
-        dwdp_manager.verify_ipc_communication(num_elements=10)
+        # logger.info(f'[DWDP] rank {dwdp_manager.rank} local_ipc_handles:')
+        # for layer_idx, ipc_collector in enumerate(dwdp_manager.ipc_collectors):
+        #     logger.info(f'    layer_idx: {layer_idx}, local_ipc_handles: {ipc_collector.local_ipc_handles}')
+        #     for key, peer_ptr in ipc_collector.peer_ptrs.items():
+        #         logger.info(f'    rank: {key[0]}, param_name: {key[1]}, ptr: {peer_ptr}')
+        # dwdp_manager.verify_ipc_communication(num_elements=10)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config

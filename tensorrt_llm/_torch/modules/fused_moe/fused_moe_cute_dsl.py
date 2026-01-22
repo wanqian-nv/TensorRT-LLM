@@ -310,12 +310,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         _expert_size_per_partition = expert_size_per_partition if expert_size_per_partition is not None else self.expert_size_per_partition
         _slot_start = slot_start if slot_start is not None else self.slot_start
 
-        logger.info(f'slot_start: {_slot_start}, expert_size_per_partition: {_expert_size_per_partition} num_slots: {self.num_slots}')
-        logger.info(f'weight shapes: {_w3_w1_weight.shape}, {_w2_weight.shape}')
-        logger.info(f'quant_scales: {_fc1_weight_block.shape}, {_fc2_weight_block.shape}')
-        logger.info(f'alpha: {_fc1_global.shape}, {_fc2_global.shape}')
-        logger.info(f'x: {x.shape}, x_sf: {x_sf.shape} global_sf: {self.fc2_input_scale.shape}')
-        logger.info(f'moe_ep_size: {self.mapping.moe_ep_size} enable_alltoall: {enable_alltoall}')
+        # logger.info(f'slot_start: {_slot_start}, expert_size_per_partition: {_expert_size_per_partition} num_slots: {self.num_slots}')
+        # logger.info(f'weight shapes: {_w3_w1_weight.shape}, {_w2_weight.shape}')
+        # logger.info(f'quant_scales: {_fc1_weight_block.shape}, {_fc2_weight_block.shape}')
+        # logger.info(f'alpha: {_fc1_global.shape}, {_fc2_global.shape}')
+        # logger.info(f'x: {x.shape}, x_sf: {x_sf.shape} global_sf: {self.fc2_input_scale.shape}')
+        # logger.info(f'moe_ep_size: {self.mapping.moe_ep_size} enable_alltoall: {enable_alltoall}')
 
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
