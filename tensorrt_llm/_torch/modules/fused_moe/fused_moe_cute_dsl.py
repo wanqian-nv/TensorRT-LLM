@@ -353,8 +353,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             self.dwdp_handle_collector = self.dwdp_manager.add_layer(
                 layer_idx=layer_idx,
             )
+            self.dwdp_rank = self.dwdp_manager.dwdp_rank
         else:
             self.dwdp_handle_collector = None
+            self.dwdp_rank = None
 
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
@@ -432,13 +434,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         x_sf: Optional[torch.Tensor] = None,
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
-        # DWDP: optional override parameters from prefetch buffer
-        w3_w1_weight: Optional[torch.Tensor] = None,
-        fc1_weight_block: Optional[torch.Tensor] = None,
-        fc1_global: Optional[torch.Tensor] = None,
-        w2_weight: Optional[torch.Tensor] = None,
-        fc2_weight_block: Optional[torch.Tensor] = None,
-        fc2_global: Optional[torch.Tensor] = None,
+        # DWDP: weight parameters as list[tensor] (one per dwdp rank)
+        # list[dwdp_rank] = local weight, list[other_rank] = prefetched weight
+        w3_w1_weight_list: Optional[List[torch.Tensor]] = None,
+        fc1_weight_block_list: Optional[List[torch.Tensor]] = None,
+        fc1_global_list: Optional[List[torch.Tensor]] = None,
+        w2_weight_list: Optional[List[torch.Tensor]] = None,
+        fc2_weight_block_list: Optional[List[torch.Tensor]] = None,
+        fc2_global_list: Optional[List[torch.Tensor]] = None,
         expert_size_per_partition: Optional[int] = None,
         slot_start: Optional[int] = None,
     ) -> torch.Tensor:
@@ -467,7 +470,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
         inputs = [
-            x, token_selected_experts, token_final_scales, x_sf, moe_output
+            x, token_selected_experts, token_final_scales, x_sf, moe_output,
+            w3_w1_weight_list, fc1_weight_block_list, fc1_global_list,
+            w2_weight_list, fc2_weight_block_list, fc2_global_list,
+            expert_size_per_partition, slot_start,
         ]
         _, best_tactic = tuner.choose_one(
             "CuteDslFusedMoE::run_moe_nvfp4",
@@ -484,6 +490,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_final_scales: Optional[torch.Tensor],
         x_sf: torch.Tensor,
         moe_output: torch.Tensor,
+        w3_w1_weight_list: List[torch.Tensor],
+        fc1_weight_block_list: List[torch.Tensor],
+        fc1_global_list: List[torch.Tensor],
+        w2_weight_list: List[torch.Tensor],
+        fc2_weight_block_list: List[torch.Tensor],
+        fc2_global_list: List[torch.Tensor],
+        expert_size_per_partition: int,
+        slot_start: int,
         enable_alltoall: bool = False,
         tile_size: int = 128,
     ) -> torch.Tensor:
@@ -494,8 +508,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             token_final_scales=token_final_scales,
             num_experts=self.num_slots,
             top_k=self.routing_method.experts_per_token,
-            local_expert_offset=_slot_start,
-            local_num_experts=_expert_size_per_partition,
+            local_expert_offset=slot_start,
+            local_num_experts=expert_size_per_partition,
             tile_tokens_dim=tile_size,
         )
 
@@ -506,10 +520,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
-            weight=[self.w3_w1_weight.view(torch.float4_e2m1fn_x2)],
+            weight=[w.view(torch.float4_e2m1fn_x2) for w in w3_w1_weight_list],
             input_scale=x_sf.view(torch.uint8),
-            weight_scale=[self.quant_scales.fc1_weight_block.view(torch.uint8)],
-            alpha=[self.quant_scales.fc1_global],
+            weight_scale=[ws.view(torch.uint8) for ws in fc1_weight_block_list],
+            alpha=fc1_global_list,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -517,8 +531,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             global_sf=self.fc2_input_scale,
             num_experts=self.num_slots,
             top_k=self.routing_method.experts_per_token,
-            num_local_experts=_expert_size_per_partition,
-            local_expert_offset=_slot_start,
+            num_local_experts=expert_size_per_partition,
+            local_expert_offset=slot_start,
             tile_size=tile_size,
         )
 
@@ -542,12 +556,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
             torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
-                weight=[self.w2_weight.view(torch.float4_e2m1fn_x2)],
+                weight=[w.view(torch.float4_e2m1fn_x2) for w in w2_weight_list],
                 input_scale=x_sf.view(torch.uint8),
-                weight_scale=[
-                    self.quant_scales.fc2_weight_block.view(torch.uint8)
-                ],
-                alpha=[self.quant_scales.fc2_global],
+                weight_scale=[ws.view(torch.uint8) for ws in fc2_weight_block_list],
+                alpha=fc2_global_list,
                 output=moe_output,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -556,25 +568,24 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 token_final_scales=token_final_scales,
                 num_experts=self.num_slots,
                 top_k=self.routing_method.experts_per_token,
-                num_local_experts=_expert_size_per_partition,
-                local_expert_offset=_slot_start,
+                num_local_experts=expert_size_per_partition,
+                local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
         else:
             x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
-                weight=_w2_weight.view(torch.float4_e2m1fn_x2),
+                weight=[w.view(torch.float4_e2m1fn_x2) for w in w2_weight_list],
                 input_scale=x_sf.view(torch.uint8),
-                weight_scale=_fc2_weight_block.view(
-                    torch.uint8),
-                alpha=_fc2_global,
+                weight_scale=[ws.view(torch.uint8) for ws in fc2_weight_block_list],
+                alpha=fc2_global_list,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 num_experts=self.num_slots,
                 top_k=self.routing_method.experts_per_token,
-                num_local_experts=_expert_size_per_partition,
-                local_expert_offset=_slot_start,
+                num_local_experts=expert_size_per_partition,
+                local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
@@ -697,7 +708,29 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # Execute MoE computation
         if self.has_nvfp4:
             if buffer_data is not None:
-                # Use prefetched data from DWDP buffer
+                # DWDP mode: construct weight lists from prefetch buffer
+                # buffer_data[param_name] = List[Optional[Tensor]]
+                # buffer_data[param_name][dwdp_rank] = None, fill with local weight
+                # buffer_data[param_name][peer_rank] = prefetched weight from peer
+                # Note: directly modify buffer list (idempotent - always set same local weight)
+                w3_w1_weight_list = buffer_data['w3_w1_weight']
+                w3_w1_weight_list[self.dwdp_rank] = self.w3_w1_weight
+                
+                fc1_weight_block_list = buffer_data['w3_w1_weight_scale']
+                fc1_weight_block_list[self.dwdp_rank] = self.quant_scales.fc1_weight_block
+                
+                fc1_global_list = buffer_data['fc31_alpha']
+                fc1_global_list[self.dwdp_rank] = self.quant_scales.fc1_global
+                
+                w2_weight_list = buffer_data['w2_weight']
+                w2_weight_list[self.dwdp_rank] = self.w2_weight
+                
+                fc2_weight_block_list = buffer_data['w2_weight_scale']
+                fc2_weight_block_list[self.dwdp_rank] = self.quant_scales.fc2_weight_block
+                
+                fc2_global_list = buffer_data['fc2_alpha']
+                fc2_global_list[self.dwdp_rank] = self.quant_scales.fc2_global
+                
                 result = self.run_moe_nvfp4(
                     x=x,
                     token_selected_experts=token_selected_experts,
@@ -705,23 +738,33 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     x_sf=x_sf,
                     moe_output=moe_output,
                     enable_alltoall=enable_alltoall,
-                    w3_w1_weight=buffer_data['w3_w1_weight'],
-                    fc1_weight_block=buffer_data['w3_w1_weight_scale'],
-                    fc1_global=buffer_data['fc31_alpha'],
-                    w2_weight=buffer_data['w2_weight'],
-                    fc2_weight_block=buffer_data['w2_weight_scale'],
-                    fc2_global=buffer_data['fc2_alpha'],
+                    w3_w1_weight_list=w3_w1_weight_list,
+                    fc1_weight_block_list=fc1_weight_block_list,
+                    fc1_global_list=fc1_global_list,
+                    w2_weight_list=w2_weight_list,
+                    fc2_weight_block_list=fc2_weight_block_list,
+                    fc2_global_list=fc2_global_list,
                     expert_size_per_partition=self.num_slots,
                     slot_start=0,
                 )
             else:
+                # Non-DWDP mode: use local weights directly as single-element list
                 result = self.run_moe_nvfp4(
                     x=x,
                     token_selected_experts=token_selected_experts,
                     token_final_scales=token_final_scales,
                     x_sf=x_sf,
                     moe_output=moe_output,
-                    enable_alltoall=enable_alltoall)
+                    enable_alltoall=enable_alltoall,
+                    w3_w1_weight_list=[self.w3_w1_weight],
+                    fc1_weight_block_list=[self.quant_scales.fc1_weight_block],
+                    fc1_global_list=[self.quant_scales.fc1_global],
+                    w2_weight_list=[self.w2_weight],
+                    fc2_weight_block_list=[self.quant_scales.fc2_weight_block],
+                    fc2_global_list=[self.quant_scales.fc2_global],
+                    expert_size_per_partition=self.expert_size_per_partition,
+                    slot_start=self.slot_start,
+                )
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(
                 x=x,
