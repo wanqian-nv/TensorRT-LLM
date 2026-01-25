@@ -299,6 +299,7 @@ class DwdpManager:
         self.dist = dist
         self.dwdp_size = config.dwdp_size
         self.experts_per_worker = config.experts_per_worker
+        self.num_group = config.num_group
 
         self._init_dwdp_group()
         
@@ -328,10 +329,18 @@ class DwdpManager:
         assert isinstance(self.dist, MPIDist), "Dwdp Communicator requires MPI backend"
 
         self.rank = global_mpi_rank()
-        ranks = list(range(self.dwdp_size))
+        
+        # Calculate which group this rank belongs to
+        # With num_group=2, dwdp_size=4:
+        #   Group 0: ranks [0, 1, 2, 3]
+        #   Group 1: ranks [4, 5, 6, 7]
+        self.group_id = self.rank // self.dwdp_size
+        group_start_rank = self.group_id * self.dwdp_size
+        ranks = list(range(group_start_rank, group_start_rank + self.dwdp_size))
+        
         new_group = COMM_WORLD.group.Incl(ranks)
         self.dwdp_group = COMM_WORLD.Create_group(new_group)
-        logger.info(f"Rank {self.rank} initialized Dwdp Group with ranks: {ranks} from MPI_COMM_WORLD")
+        logger.info(f"Rank {self.rank} initialized Dwdp Group {self.group_id} with ranks: {ranks} from MPI_COMM_WORLD")
 
     def is_enabled(self) -> bool:
         return self.config.enabled and self.dwdp_size > 1
