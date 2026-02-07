@@ -2915,6 +2915,13 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    disagg_server_type: Optional[str] = Field(
+        default=None,
+        description=
+        "Disaggregated server type: 'ctx' for context server or 'gen' for generation server. "
+        "When set to 'ctx', certain model optimizations (e.g., bypassing MoE in MTP layers) are applied.",
+        status="prototype")
+
     allreduce_strategy: Optional[Literal[
         'AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
         'LOWPRECISION', 'MNNVL',

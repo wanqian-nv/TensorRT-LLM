@@ -1450,6 +1450,15 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         super().__init__(model_config, layer_idx, aux_stream_dict,
                          is_separate_draft_engine)
         config = model_config.pretrained_config
+
+        # Bypass MoE in MTP layer for disaggregated context servers
+        self.bypass_mtp_moe = getattr(model_config, 'is_context_server', False)
+        if self.bypass_mtp_moe:
+            # Remove the MoE module created by parent class to save memory
+            # and avoid loading its weights
+            del self.mlp
+            self.mlp = None
+
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
         self.num_experts = config.n_routed_experts
@@ -1556,14 +1565,15 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # MoE
-        hidden_states = self.mlp(
-            hidden_states,
-            all_rank_num_tokens=all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                      or self.mapping.tp_size == 1)),
-        )
+        # MoE - skip for disaggregated context servers
+        if not self.bypass_mtp_moe:
+            hidden_states = self.mlp(
+                hidden_states,
+                all_rank_num_tokens=all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
+                                          or self.mapping.tp_size == 1)),
+            )
 
         if self.fusion_config.POST_MOE_FUSION:
             hidden_states, residual = self.allreduce(

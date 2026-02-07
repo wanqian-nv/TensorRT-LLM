@@ -361,7 +361,9 @@ class ModelLoader:
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
-            allowed_backends)
+            allowed_backends,
+            is_context_server=self.llm_args.disagg_server_type == "ctx"
+            if self.llm_args.disagg_server_type else False)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
