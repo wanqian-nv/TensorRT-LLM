@@ -131,6 +131,10 @@ class ModelConfig(Generic[TConfig]):
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
 
+    # Disaggregated serving: if True, this is a context server.
+    # Used to bypass certain modules (e.g., MoE in MTP layers) that are not needed for context phase.
+    is_context_server: bool = False
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.

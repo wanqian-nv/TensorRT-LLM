@@ -409,6 +409,8 @@ class ModelLoader:
             use_cute_dsl_blockscaling_mm,
             use_cute_dsl_blockscaling_bmm=self.llm_args.
             use_cute_dsl_blockscaling_bmm,
+            is_context_server=self.llm_args.disagg_server_type == "ctx"
+            if self.llm_args.disagg_server_type else False,
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)

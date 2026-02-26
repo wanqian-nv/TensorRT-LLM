@@ -68,6 +68,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
+from .dwdp import DwdpManager
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -282,7 +283,8 @@ class PyExecutor:
             virtual_memory_pools: Optional[dict] = None,
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+            dwdp_manager: Optional[DwdpManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -530,6 +532,8 @@ class PyExecutor:
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
+
+        self.dwdp_manager = dwdp_manager
 
         if start_worker:
             self.start_worker()
@@ -1083,6 +1087,7 @@ class PyExecutor:
             # Calculate draft overhead
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 draft_latency_ms) / float(iter_latency_ms)
+        logger.info(f"iter_stats: {stats.to_json_str()}")
         return stats
 
     def _append_iter_stats(self,
@@ -1781,12 +1786,14 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
-                    # GPU and CPU timing for perf metrics
+                    # GPU and CPU timing for perf metrics (includes DWDP prefetch when enabled)
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
+                        if self.dwdp_manager is not None:
+                            self.dwdp_manager.prefetch_first_layers()
                         batch_outputs = self._forward_step(scheduled_batch)
 
                     guided_decoder_failed_requests = None
