@@ -76,6 +76,7 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
+from tensorrt_llm.logger import logger
 
 
 @triton.jit
@@ -1553,6 +1554,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # Bypass MoE in MTP layer for disaggregated context servers
         self.bypass_mtp_moe = getattr(model_config, 'is_context_server', False)
         if self.bypass_mtp_moe:
+            logger.info(f"Bypassing MoE in MTP layer for disaggregated context servers")
             # Remove the MoE module created by parent class to save memory
             # and avoid loading its weights
             del self.mlp

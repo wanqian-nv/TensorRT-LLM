@@ -94,6 +94,7 @@ class OpenAIDisaggServer:
         self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
         self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock)
         self._gen_router = create_router(config.gen_router_config, self._gen_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock)
+        logger.info(f'ctx router config is {config.ctx_router_config} gen router config is {config.gen_router_config}')
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 

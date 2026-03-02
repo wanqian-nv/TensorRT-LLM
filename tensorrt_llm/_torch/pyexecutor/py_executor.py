@@ -862,16 +862,24 @@ class PyExecutor:
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
+                
+                # Get free KV blocks count
+                kv_cache_manager = self.resource_manager.resource_managers.get(
+                    ResourceManagerType.KV_CACHE_MANAGER)
+                num_free_kv_blocks = kv_cache_manager.get_num_free_blocks() if kv_cache_manager is not None else "N/A"
+                
                 logger.info(
                     f"iter = {self.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                     f"{self.num_fetch_requests}, "
+                    f"num_waiting_requests = {len(self.waiting_queue)}, "
                     f"host_step_time = {host_step_time}ms, "
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
+                    f"num_free_kv_blocks: {num_free_kv_blocks}, "
                     f"states = {self.model_engine.iter_states}")
 
             it += 1
