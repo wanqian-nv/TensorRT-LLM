@@ -234,6 +234,8 @@ def get_server_configs_dict(
     # check for duplicate server configs
     for cfg in server_configs:
         url = (cfg.hostname, cfg.port)
+        if cfg.hostname is None or cfg.port is None:
+            continue
         if url in server_dict:
             cfg_prev = server_dict[url]
             if cfg_prev.type == cfg.type:
@@ -247,6 +249,7 @@ def get_server_configs_dict(
         else:
             server_dict[url] = cfg
             num_workers += cfg.instance_num_ranks
+        logging.info(f"url: {url} config: {cfg} instance_num_ranks: {cfg.instance_num_ranks}")
 
     return num_workers, server_dict
 
@@ -304,6 +307,7 @@ def split_world_comm(
             if global_rank == offset:
                 is_leader = True
         offset += cfg.instance_num_ranks
+        logging.info(f'idx {idx} cfg {cfg} global_rank {global_rank} offset {offset} instance_idx {instance_idx} instance_sub_rank {instance_sub_rank}')
 
     # Split MPI_COMM_WORLD into sub-communicators based on rank_instance_idx
     sub_comm = COMM_WORLD.Split(color=instance_idx, key=instance_sub_rank)
