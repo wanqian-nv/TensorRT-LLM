@@ -1116,12 +1116,8 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     disagg_config = parse_disagg_config_file(disagg_config_file)
     server_cfg = disagg_config.server_configs[int(instance_idx)]
 
-    # Propagate disagg server type ('ctx' or 'gen') to model creation chain
-    llm_args["disagg_server_type"] = server_cfg.type
-
     logger.info(
-        f"rank {mpi_rank()} for index {instance_idx} launch the disagg server (type={server_cfg.type})"
-    )
+        f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
 
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
