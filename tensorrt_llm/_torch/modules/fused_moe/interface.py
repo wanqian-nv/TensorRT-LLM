@@ -311,6 +311,10 @@ class MoE(nn.Module):
         # Check if DWDP is enabled
         dwdp_manager = get_global_dwdp_manager()
         if dwdp_manager is not None:
+            assert self.layer_load_balancer is None, (
+                "DWDP and EPLB (MoE load balancer) cannot be used together. "
+                "Disable one of dwdp_config.enabled or moe_load_balancer."
+            )
             logger.info(f"DWDP is enabled, init_load_balancer: {init_load_balancer}, DWDP and load balancer cannot be used together")
             self.num_slots = self.num_experts
             self.expert_size_per_partition = dwdp_manager.experts_per_worker
