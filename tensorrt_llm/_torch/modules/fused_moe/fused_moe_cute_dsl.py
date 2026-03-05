@@ -599,7 +599,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             moe_output.record_stream(
                 self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
 
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=[w.view(torch.float4_e2m1fn_x2) for w in w3_w1_weight_list],
             input_scale=x_sf.view(torch.uint8),

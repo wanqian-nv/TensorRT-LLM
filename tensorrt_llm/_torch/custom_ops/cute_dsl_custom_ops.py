@@ -2204,10 +2204,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c, c_sf
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell",
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
         mutates_args=(),
         device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
         input: torch.Tensor,
         weight: List[torch.Tensor],
         input_scale: torch.Tensor,
@@ -2225,7 +2225,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         scaling_vector_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion.
+        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (multi-B list interface).
 
         Args:
             weight: List of B tensors. Single-B mode: [b], multi-B mode: [b0, b1, ...].
@@ -2248,7 +2248,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ]
 
         _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell",
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
             [runner],
             runner.get_tuning_config(),
             inputs,
@@ -2259,8 +2259,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output
 
     @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell")
-    def _(
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b")
+    def _fake_multi_b(
         input: torch.Tensor,
         weight: List[torch.Tensor],
         input_scale: torch.Tensor,
@@ -2280,6 +2280,73 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight[0].size(1)
+        interm_size = n // 2
+        output = torch.empty(m,
+                             interm_size // 2,
+                             dtype=input.dtype,
+                             device=input.device)
+        output_scale = torch.empty(m * interm_size // scaling_vector_size,
+                                   dtype=input_scale.dtype,
+                                   device=input_scale.device)
+        return output, output_scale
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell",
+        mutates_args=(),
+        device_types="cuda")
+    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (single-B tensor interface).
+
+        Thin wrapper: wraps single tensors into lists and calls
+        cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b.
+        """
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+            input, [weight], input_scale, [weight_scale], [alpha],
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf,
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, scaling_vector_size,
+        )
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell")
+    def _fake_single_b(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        scaling_vector_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        m = permuted_idx_to_expanded_idx.size(0)
+        n = weight.size(1)
         interm_size = n // 2
         output = torch.empty(m,
                              interm_size // 2,
