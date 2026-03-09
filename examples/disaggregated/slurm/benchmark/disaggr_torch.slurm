@@ -146,6 +146,10 @@ start_server_cmds_file=${full_logdir}/start_server_cmds.sh
 replace_placeholder ${start_server_cmds_file} ${all_nodes_str}
 server_config_file=${full_logdir}/server_config.yaml
 replace_placeholder ${server_config_file} ${all_nodes_str}
+mpi_worker_config_file=${full_logdir}/mpi_worker_config.yaml
+if [ -f ${mpi_worker_config_file} ]; then
+    replace_placeholder ${mpi_worker_config_file} ${all_nodes_str}
+fi
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder ${client_cmds_file} ${all_nodes_str}
 

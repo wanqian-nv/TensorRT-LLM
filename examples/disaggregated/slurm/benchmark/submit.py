@@ -49,6 +49,44 @@ def save_worker_config(worker_config, output_path):
         yaml.dump(worker_config, f, default_flow_style=False)
 
 
+def generate_mpi_worker_config(worker_config, allocations, env_config,
+                               disagg_hostname, disagg_port, output_path):
+    """Generate a config YAML compatible with ``trtllm-serve disaggregated_mpi_worker``.
+    """
+    def _build_urls(server_type):
+        urls = []
+        for server_id in sorted(allocations.get(server_type, {}).keys()):
+            inst = allocations[server_type][server_id]
+            host = list(inst["nodes"].keys())[0]
+            urls.append(f"{host}:{inst['port']}")
+        return urls
+
+    ctx_urls = _build_urls("CTX")
+    gen_urls = _build_urls("GEN")
+
+    ctx_section = dict(worker_config['ctx'])
+    ctx_section['num_instances'] = len(ctx_urls)
+    ctx_section['urls'] = ctx_urls
+
+    gen_section = dict(worker_config['gen'])
+    gen_section['num_instances'] = len(gen_urls)
+    gen_section['urls'] = gen_urls
+
+    config = {
+        'model': env_config['model_path'],
+        'hostname': disagg_hostname,
+        'port': disagg_port,
+        'backend': 'pytorch',
+        'max_retries': 100,
+        'context_servers': ctx_section,
+        'generation_servers': gen_section,
+    }
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+
 def calculate_nodes(world_size, num_servers, gpus_per_node):
     """Calculate required nodes based on world size and server count."""
     return math.ceil(world_size * num_servers / gpus_per_node)
@@ -101,9 +139,12 @@ def allocate_gpus(
             assign_server(server_allocation, world_size, gpus_per_node)
             server_allocations[server_type][i] = server_allocation
 
-    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
-                   gpus_per_node)
+    # Keep the allocation order aligned with disagg_utils, which builds
+    # server_configs as ctx_cfgs + gen_cfgs and assigns rank offsets in that
+    # same order during split_world_comm().
     assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size,
+                   gpus_per_node)
+    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
                    gpus_per_node)
 
     return allocations
@@ -166,7 +207,6 @@ def replace_env_in_file(log_dir, file_path, env_var):
 
     # Return temp directory
     return tmp_dir
-
 
 def save_env_file(env_file, server_env_var, worker_env_var, ctx_worker_env_var,
                   gen_worker_env_var):
@@ -264,6 +304,11 @@ def submit_job(config, log_dir, dry_run):
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
+    # Detect DWDP mode: when enabled, use a single srun with
+    # trtllm-serve disaggregated_mpi_worker instead of per-instance sruns
+    dwdp_enabled = worker_config.get('ctx', {}).get(
+        'dwdp_config', {}).get('enabled', False)
+
     # Generate log directory path based on configuration
     isl = benchmark_config['input_length']
     osl = benchmark_config['output_length']
@@ -353,45 +398,100 @@ def submit_job(config, log_dir, dry_run):
     start_server_cmds = []
     container_mount_str = env_config['container_mount']
     container_mount_str += f",{script_dir}:{script_dir}"
-    # Generate start worker commands with placeholder hostnames
-    for server_type in allocations.keys():
-        for server_id in allocations[server_type].keys():
-            allocation = allocations[server_type][server_id]
-            cuda_devices = ",".join([
-                str(device) for device in list(allocation["nodes"].values())[0]
-            ])
-            cur_worker_env_var = worker_env_var + \
-                f" CUDA_VISIBLE_DEVICES={cuda_devices}" + \
-                (f" {ctx_worker_env_var}" if server_type == "CTX" else "") + \
-                (f" {gen_worker_env_var}" if server_type == "GEN" else "")
-            # Use script_dir for start_worker.sh
-            cmd = [
-                "srun -l",
-                f"--nodelist {','.join(allocation['nodes'].keys())}",
-                f"-N {len(allocation['nodes'])}",
-                f"--ntasks {gen_world_size if server_type == 'GEN' else ctx_world_size}",
-                f"--ntasks-per-node {gpus_per_node}",
-                f"--container-image {env_config['container_image']}",
-                f"--container-name {container_name}",
-                f"--container-mounts {container_mount_str}",
-                "--no-container-mount-home --mpi=pmix --overlap",
-                f"bash {os.path.join(script_dir, 'start_worker.sh')}",
-                server_type,
-                str(server_id),
-                env_config['model_path'],
-                str(allocation["port"]),
-                benchmark_config['mode'],
-                f"'{benchmark_config['concurrency_list']}'",
-                str(slurm_config['numa_bind']).lower(),
-                log_dir,
-                str(profiling_config['nsys_on']).lower(),
-                f"'{profiling_config['gen_profile_range']}'" if server_type
-                == "GEN" else f"'{profiling_config['ctx_profile_range']}'",
-                gen_config_path if server_type == "GEN" else ctx_config_path,
-                f"'{cur_worker_env_var}'",
-                f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
-            ]
-            start_server_cmds.append(" ".join(cmd))
+
+    if dwdp_enabled:
+        # --- DWDP mode: single srun with disaggregated_mpi_worker ---
+        mpi_config_path = os.path.join(log_dir, 'mpi_worker_config.yaml')
+        generate_mpi_worker_config(worker_config, allocations, env_config,
+                                   disagg_server_hostname, disagg_server_port,
+                                   mpi_config_path)
+
+        # Nodelist: CTX nodes first, then GEN nodes (matches
+        # split_world_comm order: server_configs = ctx_cfgs + gen_cfgs)
+        ctx_node_list = []
+        for sid in sorted(allocations.get("CTX", {}).keys()):
+            for node in allocations["CTX"][sid]["nodes"]:
+                if node not in ctx_node_list:
+                    ctx_node_list.append(node)
+        gen_node_list = []
+        for sid in sorted(allocations.get("GEN", {}).keys()):
+            for node in allocations["GEN"][sid]["nodes"]:
+                if node not in gen_node_list:
+                    gen_node_list.append(node)
+        mpi_nodelist = ctx_node_list + gen_node_list
+        total_mpi_tasks = ctx_num * ctx_world_size + gen_num * gen_world_size
+        mpi_num_nodes = len(mpi_nodelist)
+        num_ctx_gpus = ctx_num * ctx_world_size
+        dwdp_ctx_worker_env_var = worker_env_var + \
+            (f" {ctx_worker_env_var}" if ctx_worker_env_var else "")
+        dwdp_gen_worker_env_var = worker_env_var + \
+            (f" {gen_worker_env_var}" if gen_worker_env_var else "")
+
+        cmd = [
+            "srun -l",
+            f"--nodelist {','.join(mpi_nodelist)}",
+            f"-N {mpi_num_nodes}",
+            f"--ntasks {total_mpi_tasks}",
+            f"--ntasks-per-node {gpus_per_node}",
+            f"--container-image {env_config['container_image']}",
+            f"--container-name {container_name}",
+            f"--container-mounts {container_mount_str}",
+            "--no-container-mount-home --mpi=pmix --overlap",
+            f"bash {os.path.join(script_dir, 'start_worker_dwdp.sh')}",
+            mpi_config_path,
+            str(slurm_config['numa_bind']).lower(),
+            log_dir,
+            str(profiling_config['nsys_on']).lower(),
+            f"'{profiling_config['ctx_profile_range']}'",
+            f"'{profiling_config['gen_profile_range']}'",
+            str(num_ctx_gpus),
+            f"'{dwdp_ctx_worker_env_var}'",
+            f"'{dwdp_gen_worker_env_var}'",
+            f"&> {log_dir}/3_output_workers.log &",
+        ]
+        start_server_cmds.append(" ".join(cmd))
+    else:
+        # --- Standard mode: per-instance srun with trtllm-llmapi-launch ---
+        for server_type in allocations.keys():
+            for server_id in allocations[server_type].keys():
+                allocation = allocations[server_type][server_id]
+                cuda_devices = ",".join([
+                    str(device)
+                    for device in list(allocation["nodes"].values())[0]
+                ])
+                cur_worker_env_var = worker_env_var + \
+                    f" CUDA_VISIBLE_DEVICES={cuda_devices}" + \
+                    (f" {ctx_worker_env_var}" if server_type == "CTX" else "") + \
+                    (f" {gen_worker_env_var}" if server_type == "GEN" else "")
+                cmd = [
+                    "srun -l",
+                    f"--nodelist {','.join(allocation['nodes'].keys())}",
+                    f"-N {len(allocation['nodes'])}",
+                    f"--ntasks {gen_world_size if server_type == 'GEN' else ctx_world_size}",
+                    f"--ntasks-per-node {gpus_per_node}",
+                    f"--container-image {env_config['container_image']}",
+                    f"--container-name {container_name}",
+                    f"--container-mounts {container_mount_str}",
+                    "--no-container-mount-home --mpi=pmix --overlap",
+                    f"bash {os.path.join(script_dir, 'start_worker.sh')}",
+                    server_type,
+                    str(server_id),
+                    env_config['model_path'],
+                    str(allocation["port"]),
+                    benchmark_config['mode'],
+                    f"'{benchmark_config['concurrency_list']}'",
+                    str(slurm_config['numa_bind']).lower(),
+                    log_dir,
+                    str(profiling_config['nsys_on']).lower(),
+                    f"'{profiling_config['gen_profile_range']}'"
+                    if server_type == "GEN" else
+                    f"'{profiling_config['ctx_profile_range']}'",
+                    gen_config_path
+                    if server_type == "GEN" else ctx_config_path,
+                    f"'{cur_worker_env_var}'",
+                    f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
+                ]
+                start_server_cmds.append(" ".join(cmd))
 
     # Generate start server commands (use script_dir for start_server.sh)
     cmd = [
