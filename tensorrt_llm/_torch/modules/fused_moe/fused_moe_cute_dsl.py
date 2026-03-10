@@ -40,7 +40,6 @@ from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 from tensorrt_llm.logger import logger
-from ...pyexecutor.dwdp import get_global_dwdp_manager
 
 
 @torch.compile(options={"max-autotune": True})
@@ -428,17 +427,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             without_comm=without_comm,
         )
 
-        # Store dwdp_manager reference for prefetch/compute synchronization
-        self.dwdp_manager = get_global_dwdp_manager()
-        if self.dwdp_manager is not None:
-            self.dwdp_handle_collector = self.dwdp_manager.add_layer(
-                layer_idx=layer_idx,
-            )
-            self.dwdp_rank = self.dwdp_manager.dwdp_rank
-        else:
-            self.dwdp_handle_collector = None
-            self.dwdp_rank = None
-
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
         if AuxStreamType.MoeOutputMemset not in self.aux_stream_dict:
@@ -761,6 +749,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         x_sf: Optional[torch.Tensor] = None,
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
         """
         Run MoE computation with CuteDSL backend.
@@ -781,71 +770,62 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Returns:
             final_hidden_states tensor.
         """
-        # DWDP: Wait for prefetch to complete and get buffer data
-        buffer_data = None
-        if self.dwdp_manager is not None:
-            buffer_data = self.dwdp_manager.wait_prefetch_and_get_buffer(self.layer_idx)
-        
         # Execute MoE computation
         if self.has_nvfp4:
-            if buffer_data is not None:
-                # DWDP mode: construct weight lists from prefetch buffer
-                # buffer_data[param_name] = List[Optional[Tensor]]
-                # buffer_data[param_name][dwdp_rank] = None, fill with local weight
-                # buffer_data[param_name][peer_rank] = prefetched weight from peer
-                # Note: directly modify buffer list (idempotent - always set same local weight)
-                w3_w1_weight_list = buffer_data['w3_w1_weight']
-                w3_w1_weight_list[self.dwdp_rank] = self.w3_w1_weight
-                
-                fc1_weight_block_list = buffer_data['w3_w1_weight_scale']
-                fc1_weight_block_list[self.dwdp_rank] = self.quant_scales.fc1_weight_block
-                
-                fc1_global_list = buffer_data['fc31_alpha']
-                fc1_global_list[self.dwdp_rank] = self.quant_scales.fc1_global
-                
-                w2_weight_list = buffer_data['w2_weight']
-                w2_weight_list[self.dwdp_rank] = self.w2_weight
-                
-                fc2_weight_block_list = buffer_data['w2_weight_scale']
-                fc2_weight_block_list[self.dwdp_rank] = self.quant_scales.fc2_weight_block
-                
-                fc2_global_list = buffer_data['fc2_alpha']
-                fc2_global_list[self.dwdp_rank] = self.quant_scales.fc2_global
-                
-                result = self.run_moe_nvfp4(
-                    x=x,
-                    token_selected_experts=token_selected_experts,
-                    token_final_scales=token_final_scales,
-                    x_sf=x_sf,
-                    moe_output=moe_output,
-                    enable_alltoall=enable_alltoall,
-                    w3_w1_weight_list=w3_w1_weight_list,
-                    fc1_weight_block_list=fc1_weight_block_list,
-                    fc1_global_list=fc1_global_list,
-                    w2_weight_list=w2_weight_list,
-                    fc2_weight_block_list=fc2_weight_block_list,
-                    fc2_global_list=fc2_global_list,
-                    expert_size_per_partition=self.num_slots,
-                    slot_start=0,
+            nvfp4_args = {
+                "w3_w1_weight_list": [self.w3_w1_weight],
+                "fc1_weight_block_list": [self.quant_scales.fc1_weight_block],
+                "fc1_global_list": [self.quant_scales.fc1_global],
+                "w2_weight_list": [self.w2_weight],
+                "fc2_weight_block_list": [self.quant_scales.fc2_weight_block],
+                "fc2_global_list": [self.quant_scales.fc2_global],
+                "expert_size_per_partition": self.expert_size_per_partition,
+                "slot_start": self.slot_start,
+            }
+
+            buffer_data = kwargs.get("dwdp_prefetch_buffer")
+            dwdp_rank = kwargs.get("dwdp_rank")
+            if buffer_data is not None and dwdp_rank is not None:
+                required_keys = (
+                    "w3_w1_weight",
+                    "w3_w1_weight_scale",
+                    "fc31_alpha",
+                    "w2_weight",
+                    "w2_weight_scale",
+                    "fc2_alpha",
                 )
-            else:
-                # Non-DWDP mode: use local weights directly as single-element list
-                result = self.run_moe_nvfp4(
-                    x=x,
-                    token_selected_experts=token_selected_experts,
-                    token_final_scales=token_final_scales,
-                    x_sf=x_sf,
-                    moe_output=moe_output,
-                    enable_alltoall=enable_alltoall,
-                    w3_w1_weight_list=[self.w3_w1_weight],
-                    fc1_weight_block_list=[self.quant_scales.fc1_weight_block],
-                    fc1_global_list=[self.quant_scales.fc1_global],
-                    w2_weight_list=[self.w2_weight],
-                    fc2_weight_block_list=[self.quant_scales.fc2_weight_block],
-                    fc2_global_list=[self.quant_scales.fc2_global],
-                    expert_size_per_partition=self.expert_size_per_partition,
-                    slot_start=self.slot_start,
-                )
+                missing_keys = [key for key in required_keys if key not in buffer_data]
+                if missing_keys:
+                    raise ValueError(
+                        f"DWDP buffer missing required keys {missing_keys} for layer {self.layer_idx}."
+                    )
+                else:
+                    nvfp4_args.update(
+                        w3_w1_weight_list=buffer_data["w3_w1_weight"],
+                        fc1_weight_block_list=buffer_data["w3_w1_weight_scale"],
+                        fc1_global_list=buffer_data["fc31_alpha"],
+                        w2_weight_list=buffer_data["w2_weight"],
+                        fc2_weight_block_list=buffer_data["w2_weight_scale"],
+                        fc2_global_list=buffer_data["fc2_alpha"],
+                        expert_size_per_partition=self.num_slots,
+                        slot_start=0,
+                    )
+                    nvfp4_args["w3_w1_weight_list"][dwdp_rank] = self.w3_w1_weight
+                    nvfp4_args["fc1_weight_block_list"][dwdp_rank] = self.quant_scales.fc1_weight_block
+                    nvfp4_args["fc1_global_list"][dwdp_rank] = self.quant_scales.fc1_global
+                    nvfp4_args["w2_weight_list"][dwdp_rank] = self.w2_weight
+                    nvfp4_args["fc2_weight_block_list"][dwdp_rank] = self.quant_scales.fc2_weight_block
+                    nvfp4_args["fc2_global_list"][dwdp_rank] = self.quant_scales.fc2_global
+
+            result = self.run_moe_nvfp4(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                x_sf=x_sf,
+                moe_output=moe_output,
+                enable_alltoall=enable_alltoall,
+                **nvfp4_args,
+            )
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(
                 x=x,
@@ -857,11 +837,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
             )
-        
-        # DWDP: Record compute completion and trigger next prefetch
-        if self.dwdp_manager is not None:
-            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
-        
         return result
 
     def forward_chunk(
@@ -903,5 +878,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
     def load_weights(self, weights: Dict[str, torch.Tensor]):
         super().load_weights(weights)
-        if self.dwdp_handle_collector is not None:
-            self.dwdp_handle_collector.register_weights(self)
+        dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
+        if dwdp_handle_collector is not None:
+            dwdp_handle_collector.register_weights(self)
