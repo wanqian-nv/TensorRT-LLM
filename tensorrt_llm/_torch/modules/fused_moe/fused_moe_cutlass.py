@@ -11,7 +11,6 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
-from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
@@ -30,7 +29,6 @@ from .quantization import (
     WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
-from tensorrt_llm.logger import logger
 
 
 class CutlassFusedMoE(MoE):

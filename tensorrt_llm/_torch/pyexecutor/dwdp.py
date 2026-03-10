@@ -20,7 +20,7 @@ BIAS_PARAMS = ['w3_w1_bias', 'w2_bias']
 # Quant scale params vary by quantization method
 QUANT_SCALE_PARAMS = [
     'w3_w1_weight_scale', 'w2_weight_scale',  # NVFP4/MXFP4
-     'fc31_alpha', 'fc2_alpha',  # NVFP4 alpha
+    'fc31_alpha', 'fc2_alpha',  # NVFP4 alpha
 ]
 
 
@@ -430,11 +430,11 @@ class DwdpManager:
         x = torch.empty(1024 * 1024, device='cuda', dtype=torch.uint8)
         real_base = x.data_ptr()
 
-        # 2. 取中间的一个切片
+        # 2) Take a middle slice to create a non-zero offset pointer
         y = x[512:]
         offset_ptr = y.data_ptr()
 
-        # 3. 查询 offset_ptr 的属性
+        # 3) Query attributes of the offset pointer
         err, attr = cudart.cudaPointerGetAttributes(offset_ptr)
         err, base_ptr, size = cuda_driver.cuMemGetAddressRange(offset_ptr)
 
