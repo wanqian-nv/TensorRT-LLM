@@ -523,7 +523,13 @@ class ConfigurableMoE(MoE):
             # When using communication, dispatch will create tensors with shape:
             # [ep_size * max_tokens_per_rank, ...] due to padding for balanced distribution
             # So we need to allocate workspace based on this size
-            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
+            if isinstance(self.comm, DeepEPLowLatency):
+                # deeptplowlatency dispatch outputs shape is
+                # [#local_experts * moe_ep_size * max_tokens_per_rank, hidden size]
+                # local_experts = self.num_slots / moe_ep_size
+                num_rows = self.num_slots * max(all_rank_num_tokens)
+            else:
+                num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
 
         workspaces = self.backend.get_workspaces([num_rows])
         return workspaces[0]
@@ -755,7 +761,7 @@ class ConfigurableMoE(MoE):
                 )
 
                 # Step 4b: Quantization AFTER dispatch
-                x, x_sf = self.backend.quantize_input(x)
+                x, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No communication, just quantize
             # (use non-post-quant-comm path for TRTLLMGenFusedMoE)
