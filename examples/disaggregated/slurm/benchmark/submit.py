@@ -308,6 +308,7 @@ def submit_job(config, log_dir, dry_run):
     # trtllm-serve disaggregated_mpi_worker instead of per-instance sruns
     dwdp_enabled = worker_config.get('ctx', {}).get(
         'dwdp_config', {}).get('enabled', False)
+    dwdp_size = worker_config.get('ctx', {}).get('dwdp_config', {}).get('dwdp_size', 1)
 
     # Generate log directory path based on configuration
     isl = benchmark_config['input_length']
@@ -337,10 +338,13 @@ def submit_job(config, log_dir, dry_run):
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
 
         # Determine directory suffix based on attention_dp
-        if gen_enable_attention_dp:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+        if dwdp_enabled:
+            dir_suffix = f"disagg_ctx{ctx_num}_dwdp{dwdp_size}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
         else:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            if gen_enable_attention_dp:
+                dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            else:
+                dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
 
         # Create full log directory path
         log_dir = os.path.join(log_base, dir_suffix)
