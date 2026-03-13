@@ -774,9 +774,9 @@ class ConfigurableMoE(MoE):
         # Otherwise, token_selected_experts represents expert IDs
         dwdp_kwargs = {}
         if self.enable_dwdp:
-            dwdp_buffer = self.dwdp_manager.wait_prefetch_and_get_buffer(self.layer_idx)
-            dwdp_kwargs["dwdp_prefetch_buffer"] = dwdp_buffer
-            dwdp_kwargs["dwdp_rank"] = self.dwdp_rank
+            dwdp_kwargs["dwdp_weight_view"] = self.dwdp_manager.build_weight_view(
+                self.layer_idx, self.backend
+            )
 
         final_hidden_states = self.backend.run_moe(
             x=x,

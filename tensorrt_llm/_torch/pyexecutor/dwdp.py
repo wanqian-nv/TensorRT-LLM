@@ -563,6 +563,58 @@ class DwdpManager:
             self.prefetch_buffer.record_prefetch_event(layer_idx)
             logger.debug(f"[DWDP] Warmup prefetch completed for layer {layer_idx}")
 
+    def build_weight_view(self, layer_idx: int, backend):
+        """Build NvFp4WeightView from prefetch buffer and local weights.
+
+        Assembles weight tensors from all DWDP ranks:
+        - Peer ranks: uses prefetched buffer tensors
+        - Local rank: uses backend's actual model weights
+
+        Args:
+            layer_idx: The MoE layer index.
+            backend: The CuteDslFusedMoE backend holding local model weights.
+
+        Returns:
+            NvFp4WeightView with all weights assembled.
+        """
+        from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import NvFp4WeightView
+
+        buffer_data = self.wait_prefetch_and_get_buffer(layer_idx)
+        required_keys = (
+            "w3_w1_weight", "w3_w1_weight_scale", "fc31_alpha",
+            "w2_weight", "w2_weight_scale", "fc2_alpha",
+        )
+        missing_keys = [key for key in required_keys if key not in buffer_data]
+        if missing_keys:
+            raise ValueError(
+                f"DWDP buffer missing required keys {missing_keys} for layer {layer_idx}."
+            )
+
+        w3_w1_weight_list = buffer_data["w3_w1_weight"]
+        fc1_weight_scale_list = buffer_data["w3_w1_weight_scale"]
+        fc1_global_scale_list = buffer_data["fc31_alpha"]
+        w2_weight_list = buffer_data["w2_weight"]
+        fc2_weight_scale_list = buffer_data["w2_weight_scale"]
+        fc2_global_scale_list = buffer_data["fc2_alpha"]
+
+        w3_w1_weight_list[self.dwdp_rank] = backend.w3_w1_weight
+        fc1_weight_scale_list[self.dwdp_rank] = backend.quant_scales.fc1_weight_block
+        fc1_global_scale_list[self.dwdp_rank] = backend.quant_scales.fc1_global
+        w2_weight_list[self.dwdp_rank] = backend.w2_weight
+        fc2_weight_scale_list[self.dwdp_rank] = backend.quant_scales.fc2_weight_block
+        fc2_global_scale_list[self.dwdp_rank] = backend.quant_scales.fc2_global
+
+        return NvFp4WeightView(
+            w3_w1_weight=w3_w1_weight_list,
+            fc1_weight_scale=fc1_weight_scale_list,
+            fc1_global_scale=fc1_global_scale_list,
+            w2_weight=w2_weight_list,
+            fc2_weight_scale=fc2_weight_scale_list,
+            fc2_global_scale=fc2_global_scale_list,
+            expert_size_per_partition=backend.num_slots,
+            slot_start=0,
+        )
+
     def wait_prefetch_and_get_buffer(self, layer_idx: int) -> Optional[Dict[str, List[Optional[torch.Tensor]]]]:
         """Wait for prefetch to complete and return the buffer for this layer.
         
