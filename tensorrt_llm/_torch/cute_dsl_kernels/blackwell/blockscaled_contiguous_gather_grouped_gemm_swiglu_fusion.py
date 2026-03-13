@@ -3730,90 +3730,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     def wrapper(
         self,
         a_ptr: cute.Pointer,
-        b_ptr: cute.Pointer,
-        a_sf_ptr: cute.Pointer,
-        b_sf_ptr: cute.Pointer,
-        c_ptr: cute.Pointer,
-        c_sf_ptr: cute.Pointer,
-        alpha_ptr: cute.Pointer,
-        tile_idx_to_group_idx_ptr: cute.Pointer,
-        tile_idx_to_mn_limit_ptr: cute.Pointer,
-        token_id_mapping_ptr: cute.Pointer,
-        num_non_exiting_tiles_ptr: cute.Pointer,
-        global_sf_ptr: cute.Pointer,
-        orig_m: cutlass.Int64,
-        m: cutlass.Int64,
-        n: cutlass.Int64,
-        k: cutlass.Int64,
-        l: cutlass.Int64,  # noqa: E741
-        tile_size: cutlass.Constexpr,
-        scaling_vector_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
-    ):
-        scale_k = k // scaling_vector_size
-        interm_size = n // 2
-        num_tiles = m // tile_size
-        a = cute.make_tensor(
-            a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
-        )
-        b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
-        a_sf = cute.make_tensor(
-            a_sf_ptr, layout=cute.make_ordered_layout((orig_m, scale_k, 1), order=(1, 0, 2))
-        )
-        b_sf = cute.make_tensor(
-            b_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
-            ),
-        )
-        c = cute.make_tensor(
-            c_ptr, layout=cute.make_ordered_layout((m, interm_size, 1), order=(1, 0, 2))
-        )
-        c_sf = cute.make_tensor(
-            c_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
-                order=(2, 1, 4, 0, 3, 5),
-            ),
-        )
-        alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
-
-        tile_idx_to_group_idx = cute.make_tensor(
-            tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
-        )
-        tile_idx_to_mn_limit = cute.make_tensor(
-            tile_idx_to_mn_limit_ptr, layout=cute.make_layout((num_tiles,))
-        )
-        token_id_mapping = cute.make_tensor(token_id_mapping_ptr, layout=cute.make_layout((m,)))
-        num_non_exiting_tiles = cute.make_tensor(
-            num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
-        )
-        global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
-
-        return self(
-            a,
-            b,
-            c,
-            a_sf,
-            b_sf,
-            c_sf,
-            global_sf,
-            tile_idx_to_group_idx,
-            tile_idx_to_mn_limit,
-            token_id_mapping,
-            num_non_exiting_tiles,
-            alpha,
-            max_active_clusters=max_active_clusters,
-            stream=stream,
-            epilogue_op=epilogue_op,
-        )
-
-    @cute.jit
-    def wrapper_multi_b(
-        self,
-        a_ptr: cute.Pointer,
         b_ptr_tuple: Tuple[cute.Pointer, ...],
         a_sf_ptr: cute.Pointer,
         b_sf_ptr_tuple: Tuple[cute.Pointer, ...],
@@ -3835,9 +3751,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        """Wrapper for multi-B tensor support.
+        """Unified wrapper supporting both single-B and multi-B tensors.
 
-        b_ptr_tuple, b_sf_ptr_tuple, and alpha_ptr_tuple contain pointers for each B tensor.
+        B tensors are always passed as tuples (length 1 for single-B).
         L sizes are configured via b_tensor_l_sizes in __init__.
         """
         scale_k = k // scaling_vector_size

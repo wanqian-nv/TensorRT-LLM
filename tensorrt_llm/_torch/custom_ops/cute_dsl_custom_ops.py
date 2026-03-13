@@ -1251,10 +1251,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if not isinstance(alpha_list, (list, tuple)):
                 raise TypeError("alpha must be a list of tensors")
             assert len(b_list) == len(b_sf_list) == len(alpha_list)
-            num_b = len(b_list)
-            is_multi_b = num_b > 1
-            b_tensor_l_sizes = tuple(bi.size(0)
-                                     for bi in b_list) if is_multi_b else None
+            b_tensor_l_sizes = tuple(bi.size(0) for bi in b_list)
 
             b0 = b_list[0]
             b_sf0 = b_sf_list[0]
@@ -1337,25 +1334,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          bi.data_ptr(),
                          cute.AddressSpace.gmem,
                          assumed_align=32)
-                for bi in b_list) if is_multi_b else make_ptr(
-                    cutlass.Float4E2M1FN,
-                    b0.data_ptr(),
-                    cute.AddressSpace.gmem,
-                    assumed_align=32)
+                for bi in b_list)
             b_sf_ptr = tuple(
                 make_ptr(cutlass.Float8E4M3FN,
                          bsfi.data_ptr(),
                          cute.AddressSpace.gmem,
                          assumed_align=16)
-                for bsfi in b_sf_list) if is_multi_b else make_ptr(
-                    cutlass.Float8E4M3FN,
-                    b_sf0.data_ptr(),
-                    cute.AddressSpace.gmem,
-                    assumed_align=16)
+                for bsfi in b_sf_list)
             alpha_ptr = tuple(
-                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
-                for ai in alpha_list) if is_multi_b else make_ptr(
-                    cutlass.Float32, alpha0.data_ptr(), cute.AddressSpace.gmem)
+                make_ptr(cutlass.Float32, ai.data_ptr(),
+                         cute.AddressSpace.gmem)
+                for ai in alpha_list)
 
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -1385,7 +1374,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                wrapper_fn = gemm.wrapper_multi_b if is_multi_b else gemm.wrapper
                 compile_args = [
                     a_ptr,
                     b_ptr,
@@ -1401,13 +1389,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m,
                     n,
                     k,
+                    num_tokens, self.top_k,
                 ]
-                if not is_multi_b:
-                    compile_args.append(l)
-                compile_args.extend([num_tokens, self.top_k])
 
                 compiled_gemm = cute.compile(
-                    wrapper_fn,
+                    gemm.wrapper,
                     *compile_args,
                     tile_size=self.tile_size,
                     scaling_vector_size=self.scaling_vector_size,
@@ -1433,10 +1419,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m,
                 n,
                 k,
+                num_tokens, self.top_k,
             ]
-            if not is_multi_b:
-                exec_args.append(l)
-            exec_args.extend([num_tokens, self.top_k])
             compiled_gemm(*exec_args, stream=stream)
             return c
 
@@ -2040,10 +2024,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, \
                 num_non_exiting_tiles, global_sf = inputs
 
-            num_b = len(b_list)
-            is_multi_b = num_b > 1
-            b_tensor_l_sizes = tuple(bi.size(0)
-                                     for bi in b_list) if is_multi_b else None
+            b_tensor_l_sizes = tuple(bi.size(0) for bi in b_list)
 
             b0 = b_list[0]  # Use first B for shape inference
 
@@ -2125,32 +2106,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             global_sf_ptr = make_ptr(cutlass.Float32, global_sf.data_ptr(),
                                      cute.AddressSpace.gmem)
 
-            # Create B tensor pointers (tuple for multi-B, single for single-B)
             b_ptr = tuple(
                 make_ptr(cutlass.Float4E2M1FN,
                          bi.data_ptr(),
                          cute.AddressSpace.gmem,
                          assumed_align=32)
-                for bi in b_list) if is_multi_b else make_ptr(
-                    cutlass.Float4E2M1FN,
-                    b0.data_ptr(),
-                    cute.AddressSpace.gmem,
-                    assumed_align=32)
+                for bi in b_list)
             b_sf_ptr = tuple(
                 make_ptr(cutlass.Float8E4M3FN,
                          bsfi.data_ptr(),
                          cute.AddressSpace.gmem,
                          assumed_align=16)
-                for bsfi in b_sf_list) if is_multi_b else make_ptr(
-                    cutlass.Float8E4M3FN,
-                    b_sf_list[0].data_ptr(),
-                    cute.AddressSpace.gmem,
-                    assumed_align=16)
+                for bsfi in b_sf_list)
             alpha_ptr = tuple(
-                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
-                for ai in alpha_list) if is_multi_b else make_ptr(
-                    cutlass.Float32, alpha_list[0].data_ptr(),
-                    cute.AddressSpace.gmem)
+                make_ptr(cutlass.Float32, ai.data_ptr(),
+                         cute.AddressSpace.gmem)
+                for ai in alpha_list)
 
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -2164,12 +2135,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
-            # Cache key includes b_tensor_l_sizes (None for single-B, tuple for multi-B)
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
                          b_tensor_l_sizes)
 
-            # Compile kernel if not cached
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -2184,21 +2153,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                # Choose wrapper function based on mode
-                wrapper_fn = gemm.wrapper_multi_b if is_multi_b else gemm.wrapper
-
-                # Build compile arguments - differs only in B tensor args and l parameter
                 compile_args = [
                     a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr,
                     alpha_ptr, tile_idx_to_group_idx_ptr,
                     tile_idx_to_mn_limit_ptr, permuted_idx_to_expanded_idx_ptr,
-                    num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k
+                    num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k,
                 ]
-                if not is_multi_b:
-                    compile_args.append(l)  # Single-B needs l parameter
 
                 compiled_gemm = cute.compile(
-                    wrapper_fn,
+                    gemm.wrapper,
                     *compile_args,
                     tile_size=self.tile_size,
                     scaling_vector_size=self.scaling_vector_size,
@@ -2209,15 +2172,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-            # Execute kernel - same args as compile (without constexpr params)
             exec_args = [
                 a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
                 tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
                 permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
-                global_sf_ptr, orig_m, m, n, k
+                global_sf_ptr, orig_m, m, n, k,
             ]
-            if not is_multi_b:
-                exec_args.append(l)  # Single-B needs l parameter
 
             compiled_gemm(*exec_args, stream=stream)
 
@@ -2254,9 +2214,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """
         tuner = AutoTuner.get()
 
-        # Infer b_tensor_l_sizes from weight
-        b_tensor_l_sizes = tuple(w.size(0)
-                                 for w in weight) if len(weight) > 1 else None
+        b_tensor_l_sizes = tuple(w.size(0) for w in weight)
 
         runner = Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
