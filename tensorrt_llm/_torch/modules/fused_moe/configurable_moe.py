@@ -772,12 +772,6 @@ class ConfigurableMoE(MoE):
         # Call unified run_moe interface with common parameters
         # If EPLB is enabled, token_selected_slots represents expert slots
         # Otherwise, token_selected_experts represents expert IDs
-        dwdp_kwargs = {}
-        if self.enable_dwdp:
-            dwdp_kwargs["dwdp_weight_view"] = self.dwdp_manager.build_weight_view(
-                self.layer_idx, self.backend
-            )
-
         final_hidden_states = self.backend.run_moe(
             x=x,
             token_selected_experts=token_selected_slots,
@@ -786,7 +780,6 @@ class ConfigurableMoE(MoE):
             **self._get_backend_kwargs(
                 router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
             ),
-            **dwdp_kwargs,
         )
         if self.enable_dwdp:
             self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
@@ -1167,6 +1160,11 @@ class ConfigurableMoE(MoE):
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
+
+            if self.enable_dwdp:
+                kwargs["dwdp_weight_view"] = self.dwdp_manager.build_weight_view(
+                    self.layer_idx, self.backend
+                )
 
         # DeepGemm-specific parameters
         elif self.backend.__class__ == DeepGemmFusedMoE:
