@@ -198,6 +198,7 @@ class DwdpPrefetchBuffer:
         experts_per_worker: int,
         num_prefetch_experts: int,
         num_layers: int,
+        first_moe_layer_idx: int,
         param_shapes: Dict[str, torch.Size],
         param_dtypes: Dict[str, torch.dtype],
     ):
@@ -206,6 +207,7 @@ class DwdpPrefetchBuffer:
         self.num_prefetch_experts = num_prefetch_experts
         self.experts_per_worker = experts_per_worker
         self.num_layers = num_layers
+        self.first_moe_layer_idx = first_moe_layer_idx
         self.num_buffers = 2  # Ping-pong
         self.dwdp_rank = dwdp_rank
 
@@ -238,9 +240,7 @@ class DwdpPrefetchBuffer:
                 buffer[param_name] = tensor_list
             self.buffers.append(buffer)
             
-        # Use (num_layers + 3) to account for dense layers before MoE layers
-        # e.g., DeepSeek has 3 dense layers, so global layer_idx starts from 3
-        self.max_layer_idx = num_layers + 3
+        self.max_layer_idx = num_layers + first_moe_layer_idx
         self.prefetch_events: List[List[torch.cuda.Event]] = [
             [torch.cuda.Event() for _ in range(self.max_layer_idx//self.num_buffers + 1)]
             for _ in range(self.num_buffers)
@@ -302,6 +302,8 @@ class DwdpManager:
         
         # Prefetch buffer (initialized later in create_py_executor)
         self.prefetch_buffer: Optional[DwdpPrefetchBuffer] = None
+        # Auto-detected from first add_layer() call
+        self.first_moe_layer_idx: Optional[int] = None
 
         # Peer expert ranges: (peer_rank, (start_expert_id, end_expert_id))
         self.peer_expert_ranges: Dict[int, Tuple[int, int]] = {}
@@ -342,6 +344,8 @@ class DwdpManager:
         
         Called from CuteDslFusedMoE.__init__() during model construction.
         """
+        if self.first_moe_layer_idx is None:
+            self.first_moe_layer_idx = layer_idx
         collector = DwdpLayerHandleCollector(
             layer_idx=layer_idx
         )
@@ -412,6 +416,7 @@ class DwdpManager:
             experts_per_worker=self.experts_per_worker,
             num_prefetch_experts=self.num_prefetch_experts,
             num_layers=len(self.ipc_collectors),
+            first_moe_layer_idx=self.first_moe_layer_idx,
             param_shapes=self.ipc_collectors[0].param_shapes,
             param_dtypes=self.ipc_collectors[0].param_dtypes,
         )
@@ -419,8 +424,10 @@ class DwdpManager:
         
     def prefetch_first_layers(self):
         """Prefetch the first num_buffers layers as warmup."""
-        assert self.prefetch_buffer is not None, "Prefetch buffer is not initialized"
-        for layer_idx in range(3, 3 + self.prefetch_buffer.num_buffers):
+        if self.prefetch_buffer is None:
+            raise RuntimeError("Prefetch buffer is not initialized")
+        start = self.first_moe_layer_idx
+        for layer_idx in range(start, start + self.prefetch_buffer.num_buffers):
             self.prefetch_layer(layer_idx)
             self.prefetch_buffer.record_prefetch_event(layer_idx)
             logger.debug(f"[DWDP] Warmup prefetch completed for layer {layer_idx}")
@@ -485,14 +492,16 @@ class DwdpManager:
             - list[peer_rank] = Tensor for prefetched weights from that peer
             - list[dwdp_rank] = None (local weights used directly)
         """
-        assert self.prefetch_buffer is not None, "Prefetch buffer is not initialized"
+        if self.prefetch_buffer is None:
+            raise RuntimeError("Prefetch buffer is not initialized")
         self.prefetch_buffer.wait_prefetch_event(layer_idx)
         buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
         return self.prefetch_buffer.buffers[buffer_idx]
 
     def record_compute_and_prefetch_next(self, layer_idx: int):
         """Record compute completion and trigger prefetch for layer_idx + num_buffers."""
-        assert self.prefetch_buffer is not None, "Prefetch buffer is not initialized"
+        if self.prefetch_buffer is None:
+            raise RuntimeError("Prefetch buffer is not initialized")
         # Record compute event for current layer
         self.prefetch_buffer.record_compute_event(layer_idx)
 
@@ -544,8 +553,9 @@ class DwdpManager:
         Note: Local weights are used directly by the kernel, no copy needed.
         Peer copy runs on prefetch stream.
         """
-        param_names = self.ipc_collectors[layer_idx-3].param_shapes.keys()
-        collector = self.ipc_collectors[layer_idx-3]
+        moe_idx = layer_idx - self.first_moe_layer_idx
+        param_names = self.ipc_collectors[moe_idx].param_shapes.keys()
+        collector = self.ipc_collectors[moe_idx]
         buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
 
         # Peer copy on prefetch stream
