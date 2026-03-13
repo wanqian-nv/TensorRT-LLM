@@ -77,7 +77,6 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
-from tensorrt_llm.logger import logger
 
 
 @triton.jit

@@ -877,24 +877,14 @@ class PyExecutor:
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
-                
-                # Get free KV blocks count
-                kv_cache_manager = self.resource_manager.resource_managers.get(
-                    ResourceManagerType.KV_CACHE_MANAGER)
-                num_free_kv_blocks = kv_cache_manager.get_num_free_blocks() if kv_cache_manager is not None else "N/A"
-                
                 logger.info(
                     f"iter = {self.iter_counter}, "
-                    f"global_rank = {self.global_rank}, "
-                    f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                     f"{self.num_fetch_requests}, "
-                    f"num_waiting_requests = {len(self.waiting_queue)}, "
                     f"host_step_time = {host_step_time}ms, "
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
-                    f"num_free_kv_blocks: {num_free_kv_blocks}, "
                     f"states = {self.model_engine.iter_states}")
 
             it += 1
@@ -1106,7 +1096,6 @@ class PyExecutor:
             # Calculate draft overhead
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 draft_latency_ms) / float(iter_latency_ms)
-        logger.info(f"iter_stats: {stats.to_json_str()}")
         return stats
 
     def _append_iter_stats(self,
@@ -1856,7 +1845,7 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
-                    # GPU and CPU timing for perf metrics (includes DWDP prefetch when enabled)
+                    # GPU and CPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
 

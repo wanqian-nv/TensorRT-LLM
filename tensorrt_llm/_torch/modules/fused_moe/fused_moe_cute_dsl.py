@@ -458,7 +458,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
-        logger.info(f"CuteDslFusedMoE init: initial_local_expert_ids: {self.initial_local_expert_ids} experts per worker: {self.expert_size_per_partition}")
 
 
     def _build_local_weight_view(self) -> NvFp4WeightView:

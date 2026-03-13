@@ -320,9 +320,6 @@ class MoE(nn.Module):
             "DWDP and EPLB (MoE load balancer) cannot be used together. "
             "Disable one of dwdp_config.enabled or moe_load_balancer."
         )
-        logger.info(
-            f"DWDP is enabled, DWDP and load balancer cannot be used together"
-        )
         self.num_slots = self.num_experts
         self.expert_size_per_partition = dwdp_manager.experts_per_worker
         dwdp_size = dwdp_manager.dwdp_size

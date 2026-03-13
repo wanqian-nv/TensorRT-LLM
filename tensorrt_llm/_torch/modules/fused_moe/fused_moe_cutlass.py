@@ -259,6 +259,10 @@ class CutlassFusedMoE(MoE):
             self.intermediate_size_per_partition = (
                 (self.intermediate_size_per_partition + 127) // 128) * 128
 
+        # Note: num_slots, expert_size_per_partition, initial_global_assignments,
+        # slot_start, slot_end, initial_local_expert_ids are all initialized by
+        # base class's _init_load_balancer() method
+
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens

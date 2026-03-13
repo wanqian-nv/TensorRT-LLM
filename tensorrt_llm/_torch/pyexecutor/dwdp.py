@@ -158,9 +158,6 @@ class DwdpLayerHandleCollector:
             sample_value = param[expert_idx].flatten()[0].item()
             samples.append(sample_value)
         self.local_samples[param_name] = samples
-        logger.debug(f"[DWDP Sample] {param_name}: sampled {len(samples)} experts at positions {sample_positions}, values={samples[:4]}...")
-        
-        logger.debug(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
 
     def get_peer_ptr(self, peer_rank: int, param_name: str) -> int:
         """Get pointer to parameter on peer rank."""
@@ -222,9 +219,6 @@ class DwdpPrefetchBuffer:
         # list[dwdp_rank] = None (local weights used directly)
         self.buffers: List[Dict[str, List[Optional[torch.Tensor]]]] = []
 
-        logger.info(f"[DWDP] Initializing prefetch buffer: dwdp_size={dwdp_size}, "
-                   f"num_prefetch_experts={num_prefetch_experts}, dwdp_rank={dwdp_rank}")
-        
         for _ in range(self.num_buffers):
             buffer = {}
             for param_name, shape in param_shapes.items():
@@ -311,16 +305,11 @@ class DwdpManager:
 
         # Peer expert ranges: (peer_rank, (start_expert_id, end_expert_id))
         self.peer_expert_ranges: Dict[int, Tuple[int, int]] = {}
-        # All samples for verification: (layer_idx, param_name) -> {rank: samples}
-        # Samples are taken at expert positions [0, 8, 16, ..., 56]
-        self.all_samples: Dict[Tuple[int, str], Dict[int, List[float]]] = {}
 
         self.dwdp_rank = self.rank % self.dwdp_size
         self.num_prefetch_experts = config.num_prefetch_experts
         self.start_expert_id = self.num_prefetch_experts * self.dwdp_rank
         self.end_expert_id = self.start_expert_id + self.experts_per_worker
-        
-        logger.info(f"Rank {self.rank} expert range: [{self.start_expert_id}, {self.end_expert_id}), prefetch={self.num_prefetch_experts}")
 
         set_global_dwdp_manager(self)
 
@@ -340,7 +329,6 @@ class DwdpManager:
         
         new_group = COMM_WORLD.group.Incl(ranks)
         self.dwdp_group = COMM_WORLD.Create_group(new_group)
-        logger.info(f"Rank {self.rank} initialized Dwdp Group {self.group_id} with ranks: {ranks} from MPI_COMM_WORLD")
 
     def is_enabled(self) -> bool:
         return self.config.enabled and self.dwdp_size > 1
@@ -389,23 +377,13 @@ class DwdpManager:
         for peer_data in all_data:
             peer_rank = peer_data['dwdp_rank']
             self.peer_expert_ranges[peer_rank] = (peer_data['expert_start_id'], peer_data['expert_end_id'])
-            
-            # Save samples from all ranks (including self) for verification
-            for layer_idx, ipc_collector in enumerate(peer_data['ipc_collectors']):
-                peer_samples = ipc_collector.get('samples', {})
-                for param_name, samples in peer_samples.items():
-                    key = (layer_idx, param_name)
-                    if key not in self.all_samples:
-                        self.all_samples[key] = {}
-                    self.all_samples[key][peer_rank] = samples
-            
+
             if peer_rank == self.dwdp_rank:
                 continue
             for layer_idx, ipc_collector in enumerate(peer_data['ipc_collectors']):
                 collector = self.ipc_collectors[layer_idx]
                 peer_offsets = ipc_collector['offsets']
                 for param_name, handle_bytes in ipc_collector['handles'].items():
-                    logger.debug(f"Opening handle for param {param_name} from rank {peer_rank} layer {layer_idx}")
                     # Reconstruct and open handle
                     handle = cudart.cudaIpcMemHandle_t()
                     handle.reserved = list(handle_bytes)
@@ -420,123 +398,7 @@ class DwdpManager:
                     # IPC handle points to allocation base, offset gives us the tensor location
                     offset = peer_offsets[param_name]
                     actual_ptr = base_ptr + offset
-                    if offset != 0:
-                        logger.debug(f"[DWDP] Applying offset {offset} base: {hex(base_ptr)} for {param_name} from rank {peer_rank}")
                     collector.peer_ptrs[(peer_rank, param_name)] = actual_ptr
-
-    def verify_ipc_communication(self, num_elements: int = 10):
-
-
-        x = torch.empty(1024 * 1024, device='cuda', dtype=torch.uint8)
-        real_base = x.data_ptr()
-
-        # 2) Take a middle slice to create a non-zero offset pointer
-        y = x[512:]
-        offset_ptr = y.data_ptr()
-
-        # 3) Query attributes of the offset pointer
-        err, attr = cudart.cudaPointerGetAttributes(offset_ptr)
-        err, base_ptr, size = cuda_driver.cuMemGetAddressRange(offset_ptr)
-
-        logger.info(f"x: {hex(real_base)} y: {hex(offset_ptr)}")
-        logger.info(f"devicePointer: {hex(attr.devicePointer)}")
-        logger.info(f"cuMemGetAddressRange: {hex(int(base_ptr))}")
-        logger.info(f"Is same? {real_base == attr.devicePointer}")
-        logger.info(f"Is same? {real_base == base_ptr}")
-
-        logger.info(f"[DWDP] Rank {self.dwdp_rank}: Starting IPC communication verification with {num_elements} elements")
-            
-        collector = self.ipc_collectors[0]
-        layer_idx = 0
-        logger.info(f"[DWDP] Rank {self.dwdp_rank}: Verifying layer {layer_idx}")
-        
-        # Step 1: Read local weight samples for each parameter
-        local_samples = {}  # param_name -> tensor (on CPU)
-        for param_name, local_ptr in collector.local_ptrs.items():
-            param_shape = collector.param_shapes[param_name]
-            param_dtype = collector.param_dtypes[param_name]
-            
-            total_elements = param_shape.numel()
-            copy_elements = min(num_elements, total_elements)
-            
-            # Create buffer and read local data
-            local_tensor = torch.zeros(copy_elements, dtype=param_dtype, device='cuda')
-            bytes_to_copy = copy_elements * local_tensor.element_size()
-            err, = cudart.cudaMemcpy(
-                local_tensor.data_ptr(),
-                local_ptr,
-                bytes_to_copy,
-                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
-            )
-            check_cuda_error(err, f"rank {self.rank} read local data for {param_name}")
-            local_samples[param_name] = local_tensor.cpu().numpy().tolist()
-            logger.info(f"Local sample for {param_name}: dtype: {param_dtype} bytes: {bytes_to_copy} sample: {local_samples[param_name]}")
-        
-        # Synchronize before allgather
-        torch.cuda.synchronize()
-        self.dwdp_group.barrier()
-        
-        # Step 2: Exchange local samples via MPI allgather (ground truth)
-        local_data = {
-            'rank': self.rank,
-            'samples': local_samples,
-        }
-        all_samples = self.dwdp_group.allgather(local_data)
-        
-        # Build ground truth map: (peer_rank, param_name) -> expected_values
-        ground_truth = {}
-        for peer_data in all_samples:
-            peer_rank = peer_data['rank']
-            if peer_rank != self.rank:
-                for param_name, values in peer_data['samples'].items():
-                    ground_truth[(peer_rank, param_name)] = values
-        
-        logger.info(f"[DWDP] Rank {self.rank}: Collected ground truth from {len(all_samples)-1} peers")
-        
-        # Step 3 & 4: Read via IPC and compare with ground truth
-        for (peer_rank, param_name), peer_ptr in collector.peer_ptrs.items():
-            param_shape = collector.param_shapes[param_name]
-            param_dtype = collector.param_dtypes[param_name]
-            
-            total_elements = param_shape.numel()
-            copy_elements = min(num_elements, total_elements)
-            
-            # Read via IPC
-            recv_tensor = torch.zeros(copy_elements, dtype=param_dtype, device='cuda')
-            bytes_to_copy = copy_elements * recv_tensor.element_size()
-            err, = cudart.cudaMemcpy(
-                recv_tensor.data_ptr(),
-                peer_ptr,
-                bytes_to_copy,
-                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
-            )
-            check_cuda_error(err, f"rank {self.rank} IPC read from rank {peer_rank}")
-            
-            ipc_values = recv_tensor.cpu().numpy().tolist()
-            expected_values = ground_truth.get((peer_rank, param_name), None)
-            
-            if expected_values is None:
-                logger.error(
-                    f"[DWDP] ❌ Rank {self.rank}: No ground truth for rank {peer_rank}, param={param_name}"
-                )
-                continue
-            
-            # Compare IPC values with ground truth
-            if ipc_values == expected_values:
-                logger.info(
-                    f"[DWDP] ✅ Rank {self.rank}: IPC verified from rank {peer_rank}, "
-                    f"layer={layer_idx}, param={param_name}, "
-                    f"values match! sample={ipc_values[:3]}..."
-                )
-            else:
-                logger.error(
-                    f"[DWDP] ❌ Rank {self.rank}: IPC MISMATCH from rank {peer_rank}, "
-                    f"layer={layer_idx}, param={param_name}, "
-                    f"expected={expected_values[:3]}..., got={ipc_values[:3]}..."
-                )
-        
-        self.dwdp_group.barrier()
-        logger.info(f"[DWDP] Rank {self.rank}: IPC communication verification completed")
 
     def initialize_prefetch_buffer(self):
         """
@@ -626,7 +488,6 @@ class DwdpManager:
         assert self.prefetch_buffer is not None, "Prefetch buffer is not initialized"
         self.prefetch_buffer.wait_prefetch_event(layer_idx)
         buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
-        logger.debug(f"[DWDP] Wait prefetch and get buffer for layer {layer_idx} buffer_idx: {buffer_idx}")
         return self.prefetch_buffer.buffers[buffer_idx]
 
     def record_compute_and_prefetch_next(self, layer_idx: int):
@@ -641,68 +502,6 @@ class DwdpManager:
         # prefetch_layer handles stream internally: local copy on default stream, peer copy on prefetch stream
         self.prefetch_layer(next_layer_idx, wait_compute_layer_idx=layer_idx)
         self.prefetch_buffer.record_prefetch_event(next_layer_idx)
-        logger.debug(f"[DWDP] Record compute and prefetch next for layer {layer_idx} next_layer_idx: {next_layer_idx}")
-
-    def verify_prefetch_buffer(self, layer_idx: int):
-        """
-        Verify prefetch buffer contains correct data by comparing with original samples.
-        
-        Note: With the new list-based buffer structure, we only verify peer buffers.
-        Local weights are used directly and not stored in the prefetch buffer.
-        """
-        buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
-        collector = self.ipc_collectors[layer_idx]
-        
-        for param_name in collector.param_shapes.keys():
-            key = (layer_idx, param_name)
-            
-            # Verify each peer's buffer
-            for peer_rank in range(self.dwdp_size):
-                if peer_rank == self.dwdp_rank:
-                    continue  # Skip local rank - no buffer allocated
-                
-                # Get the buffer tensor for this peer
-                buffer_tensor = self.prefetch_buffer.buffers[buffer_idx][param_name][peer_rank]
-                if buffer_tensor is None:
-                    logger.error(f"[DWDP Verify] ❌ Layer {layer_idx} param {param_name} peer {peer_rank}: buffer is None")
-                    continue
-                
-                # Get ground truth samples from this peer
-                peer_samples = self.all_samples[key].get(peer_rank, [])
-                
-                # Calculate which experts we prefetch from this peer
-                src_offset = self._get_prefetch_src_offset_from_peer(peer_rank)
-                
-                # Sample positions within the prefetched range
-                sample_positions = list(range(0, min(64, self.num_prefetch_experts), 8))
-                
-                buffer_samples = []
-                for local_idx in sample_positions:
-                    if local_idx < buffer_tensor.shape[0]:
-                        sample_value = buffer_tensor[local_idx].flatten()[0].item()
-                        buffer_samples.append(sample_value)
-                
-                # Ground truth needs to account for src_offset
-                expected_samples = []
-                for local_idx in sample_positions:
-                    global_expert_idx_in_peer = src_offset + local_idx
-                    # Map to sample index (samples are at [0, 8, 16, ...])
-                    sample_idx = global_expert_idx_in_peer // 8
-                    if sample_idx < len(peer_samples):
-                        expected_samples.append(peer_samples[sample_idx])
-                
-                # Compare
-                match = True
-                for i, (expected, actual) in enumerate(zip(expected_samples, buffer_samples)):
-                    if expected != actual:
-                        match = False
-                        logger.error(f"[DWDP Verify] ❌ Layer {layer_idx} param {param_name} peer {peer_rank} idx {i}: "
-                                   f"expected {expected}, got {actual}")
-                
-                if match and expected_samples:
-                    logger.debug(f"[DWDP Verify] ✅ Layer {layer_idx} param {param_name} peer {peer_rank}: "
-                              f"{len(expected_samples)} samples match! first_2={expected_samples[:2]}")
-            
 
     def _get_prefetch_src_offset_from_peer(self, peer_rank: int) -> int:
         """
@@ -761,7 +560,6 @@ class DwdpManager:
                     continue  # Skip local rank - local weights used directly
                 
                 src_expert_offset = self._get_prefetch_src_offset_from_peer(peer_rank)
-                logger.debug(f"prefetch layer {layer_idx} peer_rank {peer_rank} src_expert_offset: {src_expert_offset}")
                 
                 for param_name in param_names:
                     param_shape = collector.param_shapes[param_name]
