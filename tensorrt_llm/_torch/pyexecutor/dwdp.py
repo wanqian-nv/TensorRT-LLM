@@ -3,7 +3,6 @@ import torch.nn as nn
 
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from typing import List, Optional, Dict, Tuple
-from tensorrt_llm.logger import logger
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._utils import global_mpi_rank
 from mpi4py.MPI import COMM_WORLD
@@ -68,9 +67,6 @@ class DwdpLayerHandleCollector:
         self.param_dtypes: Dict[str, torch.dtype] = {}
         # Peer pointers: (peer_rank, param_name) -> ptr (already adjusted with offset)
         self.peer_ptrs: Dict[Tuple[int, str], int] = {}
-        # Local samples for verification: param_name -> list of sampled values
-        # Sample at positions [0, 8, 16, ..., 56] * expert_size
-        self.local_samples: Dict[str, List[float]] = {}
 
     def register_weights(self, module: nn.Module):
         """
@@ -81,11 +77,6 @@ class DwdpLayerHandleCollector:
         Args:
             module: The MoE module with loaded weights
         """
-        # Collect all parameter types
-        # Debug: print all parameter names in this module
-        all_param_names = [name for name, _ in module.named_parameters(recurse=False)]
-        logger.debug(f"[DWDP Debug] Module {module.__class__.__name__} has parameters: {all_param_names}")
-        
         params_to_register = []
         # Weights (check if present and not None)
         for param_name in WEIGHT_PARAMS:
@@ -98,7 +89,6 @@ class DwdpLayerHandleCollector:
         for param_name in QUANT_SCALE_PARAMS:
             if hasattr(module, param_name) and getattr(module, param_name, None) is not None:
                 params_to_register.append(param_name)
-        logger.debug(f"Registering {len(params_to_register)} parameters: {params_to_register}")
 
         # Register each parameter
         for param_name in params_to_register:
@@ -110,7 +100,6 @@ class DwdpLayerHandleCollector:
             if not param.is_cuda or not param.is_contiguous():
                 raise ValueError(f"Parameter {param_name} is not on GPU or is not contiguous")
             self._register_param(param_name, param)
-            logger.debug(f"Registered parameter {param_name} with shape {param.shape} and dtype {param.dtype}")
 
     def _register_param(self, param_name: str, param: torch.Tensor):
         # Get IPC handle - note: handle points to the CUDA allocation base, not tensor's data_ptr
@@ -134,30 +123,6 @@ class DwdpLayerHandleCollector:
         self.local_offsets[param_name] = offset
         self.param_shapes[param_name] = param.shape[1:]
         self.param_dtypes[param_name] = param.dtype
-        
-        if offset != 0:
-            logger.debug(f"[DWDP] Parameter {param_name} has non-zero offset: {offset} base: {hex(int(alloc_base))} bytes from allocation base (alloc_size={alloc_size})")
-            # Read data at alloc_base for debugging (need cudaMemcpy since we only have raw pointer)
-            debug_tensor = torch.zeros(1, dtype=param.dtype, device='cuda')
-            err, = cudart.cudaMemcpy(
-                debug_tensor.data_ptr(),
-                int(alloc_base),
-                debug_tensor.numel() * debug_tensor.element_size(),
-                cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice
-            )
-            logger.debug(f"[DWDP] Data at alloc_base: {debug_tensor.cpu().tolist()}")
-            # Directly read actual tensor data (no cudaMemcpy needed)
-            logger.debug(f"[DWDP] Data at tensor_ptr: {param.flatten()[:10].cpu().tolist()}")
-        
-        # Sample param for verification: sample at expert positions [0, 8, 16, ..., 56]
-        # Each sample takes the first element of that expert's data
-        num_experts = param.shape[0]
-        sample_positions = list(range(0, min(64, num_experts), 8))  # [0, 8, 16, 24, 32, 40, 48, 56]
-        samples = []
-        for expert_idx in sample_positions:
-            sample_value = param[expert_idx].flatten()[0].item()
-            samples.append(sample_value)
-        self.local_samples[param_name] = samples
 
     def get_peer_ptr(self, peer_rank: int, param_name: str) -> int:
         """Get pointer to parameter on peer rank."""
@@ -256,19 +221,15 @@ class DwdpPrefetchBuffer:
             self.compute_events[buffer_idx][0].record(torch.cuda.current_stream())
     
     def record_prefetch_event(self, layer_idx: int):
-        logger.debug(f"[DWDP] Record prefetch event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(self.prefetch_stream)
-    
+
     def record_compute_event(self, layer_idx: int):
-        logger.debug(f"[DWDP] Record compute event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers].record(torch.cuda.current_stream())
-        
+
     def wait_prefetch_event(self, layer_idx: int):
-        logger.debug(f"[DWDP] Wait prefetch event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         torch.cuda.current_stream().wait_event(self.prefetch_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers])
-    
+
     def wait_compute_event(self, layer_idx: int):
-        logger.debug(f"[DWDP] Wait compute event for layer {layer_idx} buffer_idx: {layer_idx % self.num_buffers} event_idx: {layer_idx // self.num_buffers}")
         self.prefetch_stream.wait_event(self.compute_events[layer_idx % self.num_buffers][layer_idx // self.num_buffers])
 
 
@@ -317,7 +278,8 @@ class DwdpManager:
 
     def _init_dwdp_group(self):
 
-        assert isinstance(self.dist, MPIDist), "Dwdp Communicator requires MPI backend"
+        if not isinstance(self.dist, MPIDist):
+            raise RuntimeError("DWDP requires MPI backend (MPIDist)")
 
         self.rank = global_mpi_rank()
         
@@ -370,8 +332,7 @@ class DwdpManager:
             local_data['ipc_collectors'].append({
                 'layer_idx': collector.layer_idx,
                 'handles': collector.local_ipc_handles,
-                'offsets': collector.local_offsets,  # Include offsets for IPC pointer adjustment
-                'samples': collector.local_samples,  # Include samples for verification
+                'offsets': collector.local_offsets,
             })
             
         # AllGather from all Context workers in DWDP group
@@ -430,7 +391,6 @@ class DwdpManager:
         for layer_idx in range(start, start + self.prefetch_buffer.num_buffers):
             self.prefetch_layer(layer_idx)
             self.prefetch_buffer.record_prefetch_event(layer_idx)
-            logger.debug(f"[DWDP] Warmup prefetch completed for layer {layer_idx}")
 
     def build_weight_view(self, layer_idx: int, backend):
         """Build NvFp4WeightView from prefetch buffer and local weights.

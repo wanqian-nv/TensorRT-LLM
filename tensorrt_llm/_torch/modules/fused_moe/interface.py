@@ -51,7 +51,6 @@ from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
 from .routing import BaseMoeRoutingMethod
-from tensorrt_llm.logger import logger
 from ...pyexecutor.dwdp import get_global_dwdp_manager
 
 

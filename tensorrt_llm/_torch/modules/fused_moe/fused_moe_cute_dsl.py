@@ -40,7 +40,6 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
-from tensorrt_llm.logger import logger
 
 
 @dataclass

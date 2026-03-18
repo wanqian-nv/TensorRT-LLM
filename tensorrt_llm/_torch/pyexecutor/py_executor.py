@@ -879,6 +879,8 @@ class PyExecutor:
                     "%Y-%m-%d %H:%M:%S")
                 logger.info(
                     f"iter = {self.iter_counter}, "
+                    f"global_rank = {self.global_rank}, "
+                    f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                     f"{self.num_fetch_requests}, "
                     f"host_step_time = {host_step_time}ms, "
