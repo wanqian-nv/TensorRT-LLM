@@ -817,6 +817,30 @@ class AttentionDpConfig(StrictBaseModel):
         return self
 
 
+class DkvConfig(StrictBaseModel):
+    """Configuration for DKV (layer-split distributed KV storage).
+
+    DKV stores KV per layer across the attention-DP / TP group with a
+    group-replicated KV lifecycle, for prefill. The DKV group is the
+    attention-DP / TP group; its size always equals tp_size and is not
+    separately configurable.
+    """
+    attention_mode: Literal["dp", "sp"] = Field(
+        default="dp",
+        description="How attention compute is parallelized inside the DKV "
+        "group. 'dp': one request is computed wholly on one rank (requires "
+        "enable_attention_dp=True). 'sp': 128-token sequence-split compute "
+        "(DKVSEP). Not implemented yet.")
+
+    @model_validator(mode='after')
+    def validate_dkv_config(self) -> 'DkvConfig':
+        if self.attention_mode == "sp":
+            raise NotImplementedError(
+                "dkv_config.attention_mode='sp' (DKVSEP) is not implemented yet"
+            )
+        return self
+
+
 class CpConfig(StrictBaseModel):
     """
     Configuration for context parallelism.
@@ -3965,6 +3989,13 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Optimized load-balancing for the DP Attention scheduler.",
         status="beta")
 
+    dkv_config: Optional[DkvConfig] = Field(
+        default=None,
+        description="Enable DKV: layer-split KV storage across the "
+        "attention-DP/TP group with a group-replicated KV lifecycle. "
+        "Prefill only. Disabled when unset.",
+        status="prototype")
+
     disable_overlap_scheduler: bool = Field(
         default=False,
         description="Disable the overlap scheduler.",
@@ -4302,6 +4333,36 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_dkv(self) -> 'TorchLlmArgs':
+        if self.dkv_config is None:
+            return self
+        if self.dkv_config.attention_mode == "dp" and not self.enable_attention_dp:
+            raise ValueError("dkv_config with attention_mode='dp' requires "
+                             "enable_attention_dp=True")
+        if not self.kv_cache_config.use_kv_cache_manager_v2:
+            raise ValueError(
+                "dkv_config requires kv_cache_config.use_kv_cache_manager_v2=True"
+            )
+        if self.attention_dp_config is not None and (
+                self.attention_dp_config.enable_kv_cache_aware_routing or
+                self.attention_dp_config.kv_cache_routing_conversation_affinity
+        ):
+            raise ValueError(
+                "dkv_config requires the default load-balancing ADP router: "
+                "disable enable_kv_cache_aware_routing and "
+                "kv_cache_routing_conversation_affinity")
+        if not self.disable_overlap_scheduler:
+            raise NotImplementedError(
+                "dkv_config: the overlap scheduler is not supported yet, "
+                "set disable_overlap_scheduler=True")
+        if self.cache_transceiver_config is not None and \
+                self.cache_transceiver_config.transceiver_runtime != "PYTHON":
+            raise ValueError(
+                "dkv_config only supports the V2 cache transceiver: set "
+                "cache_transceiver_config.transceiver_runtime='PYTHON'")
+        return self
+
+    @model_validator(mode="after")
     def validate_speculative_config(self):
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
@@ -4596,6 +4657,7 @@ def update_llm_args_with_extra_dict(
         "moe_config": MoeConfig,
         "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
+        "dkv_config": DkvConfig,
         "reorder_policy_config": ReorderRequestPolicyConfig,
         "kv_cache_config": KvCacheConfig,
         "dwdp_config": DwdpConfig,
