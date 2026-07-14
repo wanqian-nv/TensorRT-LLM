@@ -455,6 +455,7 @@ class PyExecutor:
             kv_cache_manager=self.kv_cache_manager,
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,
+            dkv_enabled=self.dkv_enabled,
         )
 
         self.previous_batch: Optional[BatchState] = None
@@ -3266,7 +3267,6 @@ class PyExecutor:
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
                     self.max_num_active_requests)
-            new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
                 req for reqs in all_ranks_new_requests.values() for req in reqs
@@ -3274,17 +3274,42 @@ class PyExecutor:
             self._update_adp_dummy_role(all_new_flat)
 
             # Update per-rank counter for DP
-            self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
+            self.num_fetch_requests_cur_rank += len(
+                all_ranks_new_requests[self.dist.tp_rank])
 
-            new_requests = new_requests_cur_rank
+            if self.dkv_enabled:
+                # DKV: tag each request with its compute rank and keep the WHOLE
+                # global set (every rank activates every request for the
+                # replicated KV lifecycle). Forward is filtered by is_local
+                # later. Iterate ranks in sorted order so the flattened list is
+                # identical on every rank (determinism).
+                for rank in sorted(all_ranks_new_requests):
+                    for item in all_ranks_new_requests[rank]:
+                        item.py_dkv_compute_rank = rank
+                new_requests = [
+                    item for rank in sorted(all_ranks_new_requests)
+                    for item in all_ranks_new_requests[rank]
+                ]
+            else:
+                # ADP: keep only this rank's requests (the narrowing point).
+                new_requests = all_ranks_new_requests[self.dist.tp_rank]
 
         # 7. Merge requests
-        return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+        merged = merge_requests(new_requests,
+                                cp_config=self.dist.cp_config,
+                                cp_rank=self.dist.cp_rank,
+                                cp_size=self.dist.cp_size,
+                                exclude_last_generation_logits=self.
+                                _should_exclude_last_generation_logits())
+
+        if self.dkv_enabled:
+            # merge propagated py_dkv_compute_rank; derive is_local here (we know
+            # tp_rank). Covers children too (they are in the merged list).
+            for req in merged:
+                req.py_dkv_is_local = (
+                    req.py_dkv_compute_rank == self.dist.tp_rank)
+
+        return merged
 
     def _handle_special_queue_items(
             self,

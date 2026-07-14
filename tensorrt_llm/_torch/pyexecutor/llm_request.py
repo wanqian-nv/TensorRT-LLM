@@ -660,6 +660,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.total_input_len_cp = self.prompt_len
         self.py_helix_is_inactive_rank = False
         self.py_batch_idx = None
+        # DKV: compute rank this request is assigned to (None when DKV is off).
+        # py_dkv_is_local caches (py_dkv_compute_rank == this rank). Default
+        # False is fail-safe: real requests and dummies both set it explicitly,
+        # so a request that reaches forward without being tagged is skipped
+        # (not computed) rather than forwarded on every rank.
+        self.py_dkv_compute_rank = None
+        self.py_dkv_is_local = False
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens

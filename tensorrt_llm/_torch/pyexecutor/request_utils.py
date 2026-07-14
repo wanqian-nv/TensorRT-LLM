@@ -334,6 +334,14 @@ def merge_requests_to_llm_requests(
         req = executor_request_to_llm_request(
             req_item.id, req_item.request, req_item.child_req_ids, exclude_last_generation_logits
         )
+        # DKV: carry the compute-rank tag from the queue item onto the request
+        # and its children. is_local is derived by the caller (which knows
+        # tp_rank). No-op when DKV is off (attribute absent -> None).
+        dkv_rank = getattr(req_item, "py_dkv_compute_rank", None)
+        if dkv_rank is not None:
+            req.py_dkv_compute_rank = dkv_rank
+            for child in req.child_requests:
+                child.py_dkv_compute_rank = dkv_rank
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)

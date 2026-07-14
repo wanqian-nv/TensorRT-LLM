@@ -4343,14 +4343,18 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "dkv_config requires kv_cache_config.use_kv_cache_manager_v2=True"
             )
-        if self.attention_dp_config is not None and (
-                self.attention_dp_config.enable_kv_cache_aware_routing or
-                self.attention_dp_config.kv_cache_routing_conversation_affinity
-        ):
+        if not self.kv_cache_config.enable_block_reuse:
             raise ValueError(
-                "dkv_config requires the default load-balancing ADP router: "
-                "disable enable_kv_cache_aware_routing and "
-                "kv_cache_routing_conversation_affinity")
+                "dkv_config requires kv_cache_config.enable_block_reuse=True "
+                "(DKV is designed to run with prefix reuse enabled)")
+        if self.attention_dp_config is not None and \
+                self.attention_dp_config.kv_cache_routing_account_for_in_transfer:
+            # In-transfer requests are not filtered per compute rank, so under
+            # DKV (where every rank holds owner-layer KV for a transferring
+            # request) they would be double-counted into per-rank load.
+            raise ValueError(
+                "dkv_config does not support "
+                "attention_dp_config.kv_cache_routing_account_for_in_transfer")
         if not self.disable_overlap_scheduler:
             raise NotImplementedError(
                 "dkv_config: the overlap scheduler is not supported yet, "

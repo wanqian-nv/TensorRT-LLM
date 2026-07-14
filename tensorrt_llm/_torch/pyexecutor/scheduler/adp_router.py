@@ -86,6 +86,10 @@ class ADPRouter(ABC):
 
     def __init__(self, dist: Distributed):
         self.dist = dist
+        # Set by create() when DKV is enabled. When True, gather_all_rank_states
+        # counts only this rank's own (tagged) requests out of the globally
+        # replicated active_requests.
+        self.dkv_enabled = False
 
     @classmethod
     def create(
@@ -94,6 +98,7 @@ class ADPRouter(ABC):
         kv_cache_manager=None,
         attention_dp_config=None,
         async_transfer_manager=None,
+        dkv_enabled: bool = False,
     ) -> "ADPRouter":
         """Factory method to create the appropriate ADP router.
 
@@ -118,19 +123,18 @@ class ADPRouter(ABC):
             # cache manager (works with or without block reuse, though it is
             # most beneficial with reuse on), so it is checked before the
             # KV-cache-aware path and takes precedence when both are enabled.
-            return ConversationAwareADPRouter(
+            router = ConversationAwareADPRouter(
                 dist=dist,
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
             )
-
-        if (
+        elif (
             attention_dp_config is not None
             and attention_dp_config.enable_kv_cache_aware_routing
             and kv_cache_manager is not None
             and kv_cache_manager.enable_block_reuse
         ):
-            return KVCacheAwareADPRouter(
+            router = KVCacheAwareADPRouter(
                 dist=dist,
                 kv_cache_manager=kv_cache_manager,
                 load_balance_weight=attention_dp_config.kv_cache_routing_load_balance_weight,
@@ -140,8 +144,11 @@ class ADPRouter(ABC):
                 async_transfer_manager=async_transfer_manager,
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
+        else:
+            router = DefaultADPRouter(dist=dist)
 
-        return DefaultADPRouter(dist=dist)
+        router.dkv_enabled = dkv_enabled
+        return router
 
     @abstractmethod
     def create_rank_state(
@@ -173,6 +180,14 @@ class ADPRouter(ABC):
                 Currently unused; reserved for future routers that need
                 new-request info (e.g. KV-cache-aware routing).
         """
+        if self.dkv_enabled:
+            # Under DKV active_requests is globally replicated (every rank holds
+            # every request); count only this rank's own requests so the
+            # RankState reports a correct per-rank load, not the global total.
+            # py_dkv_is_local is the single "belongs to this rank" predicate
+            # (already set on prior iterations; stable across iterations because
+            # a request's compute rank does not change).
+            active_requests = [r for r in active_requests if r.py_dkv_is_local]
         local_state = self.create_rank_state(active_requests, new_requests or [])
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
@@ -728,6 +743,13 @@ class ConversationAwareADPRouter(ADPRouter):
     ):
         super().__init__(dist)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
+        # DKV mode: conversation_id -> computed (prompt) length seen so far.
+        # Used to discount already-cached tokens from a request's load so that
+        # balancing is driven by NEW tokens only. Stickiness (pinning a
+        # conversation to a rank) is dropped under DKV since the cache is
+        # group-global. Separate from _conv_to_rank because the value semantics
+        # differ (length vs rank).
+        self._conv_to_computed_len: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._round_robin_cursor = 0
@@ -764,12 +786,27 @@ class ConversationAwareADPRouter(ADPRouter):
         while len(self._conv_to_rank) > self._max_sessions:
             self._conv_to_rank.popitem(last=False)
 
+    def _record_computed_len(self, conv_id: str, computed_len: int) -> None:
+        """Record/refresh a conversation's computed prompt length (LRU-touch)."""
+        self._conv_to_computed_len[conv_id] = computed_len
+        self._conv_to_computed_len.move_to_end(conv_id)
+        while len(self._conv_to_computed_len) > self._max_sessions:
+            self._conv_to_computed_len.popitem(last=False)
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        if self.dkv_enabled:
+            # DKV: the cache is group-global, so pinning a conversation to a
+            # rank is pointless. Balance by NEW tokens only (prompt minus the
+            # estimated already-cached prefix from the computed-length table).
+            # DKV requires reuse on, so the estimate is meaningful.
+            return self._route_requests_dkv(
+                all_rank_states, new_requests, max_num_active_requests
+            )
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
@@ -857,6 +894,95 @@ class ConversationAwareADPRouter(ADPRouter):
             f"[adp_router][conv] new_reqs_per_rank="
             f"{[len(all_ranks_new_requests[r]) for r in range(tp_size)]} "
             f"tracked_convs={len(self._conv_to_rank)}"
+        )
+
+        return all_ranks_new_requests, expected_num_active_requests
+
+    def _route_requests_dkv(
+        self,
+        all_rank_states: list[RankState],
+        new_requests: list[RequestQueueItem],
+        max_num_active_requests: int,
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        """DKV routing: balance by estimated NEW tokens, no stickiness.
+
+        Every rank runs this identically over the same globally-replicated
+        inputs (same request order, same table state), so the assignment is
+        reproducible without communication.
+        """
+        tp_size = len(all_rank_states)
+        all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
+            s.rank: [] for s in all_rank_states
+        }
+        all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+        # Per-rank NEW-token load accumulator, seeded from the current active
+        # load reported via RankState. Lower is preferred.
+        all_ranks_new_token_load = [float(s.num_active_tokens) for s in all_rank_states]
+
+        def get_relax_value(req_item):
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            if scheduling_params is None:
+                return True
+            return scheduling_params.attention_dp_relax
+
+        sorted_requests = sorted(new_requests, key=get_relax_value)
+
+        # Honour an explicit attention_dp_rank first (strict placement).
+        remaining_unscheduled = self._assign_explicit_dp_ranks(
+            sorted_requests,
+            all_ranks_new_requests,
+            all_ranks_num_active_requests,
+            max_num_active_requests,
+        )
+
+        # Soft per-rank request-count cap (same fair-share bound as the sticky
+        # path) to avoid piling all requests on one rank on ties.
+        expected_num_active_requests = self._expected_num_active_requests(
+            all_ranks_num_active_requests,
+            len(remaining_unscheduled),
+            tp_size,
+            multiplier=self._fair_share_multiplier,
+            hard_cap=max_num_active_requests,
+        )
+
+        for req_item in remaining_unscheduled:
+            conv_id = self._conversation_id(req_item)
+            req_tokens = _num_input_tokens(req_item.request)
+            est_cached = (
+                self._conv_to_computed_len.get(conv_id, 0) if conv_id is not None else 0
+            )
+            new_tokens = max(req_tokens - est_cached, 0)
+
+            # Pick the least NEW-token-loaded rank, preferring ranks under the
+            # soft request-count cap; tie-break on (load, rank) for determinism.
+            cands = [
+                r for r in range(tp_size)
+                if all_ranks_num_active_requests[r] < expected_num_active_requests
+            ]
+            if not cands:
+                cands = list(range(tp_size))
+            rank = min(cands, key=lambda r: (all_ranks_new_token_load[r], r))
+
+            all_ranks_new_requests[rank].append(req_item)
+            all_ranks_num_active_requests[rank] += 1
+            all_ranks_new_token_load[rank] += new_tokens
+
+            # Optimistic update: after this prefill the conversation will have
+            # req_tokens cached. Exact hit length is decided later by the radix
+            # tree; an over/under estimate only perturbs balance, not
+            # correctness.
+            if conv_id is not None:
+                self._record_computed_len(conv_id, req_tokens)
+
+        expected_num_active_requests = max(
+            expected_num_active_requests, max(all_ranks_num_active_requests)
+        )
+
+        logger.debug(
+            f"[adp_router][conv-dkv] new_reqs_per_rank="
+            f"{[len(all_ranks_new_requests[r]) for r in range(tp_size)]} "
+            f"new_token_load={[int(x) for x in all_ranks_new_token_load]} "
+            f"tracked_convs={len(self._conv_to_computed_len)}"
         )
 
         return all_ranks_new_requests, expected_num_active_requests
