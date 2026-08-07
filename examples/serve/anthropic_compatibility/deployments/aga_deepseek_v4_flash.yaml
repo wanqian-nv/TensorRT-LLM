@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Flash on one 4-GPU GB300 node of oci-aga-slurm-1 (nvl72* trays,
+# aarch64/Grace, 4x GB300 284 GiB, 144 cores and 920 GiB per node).
+#
+#   ./serve.sh gateway --yaml deployments/aga_deepseek_v4_flash.yaml --submit
+#   ./serve.sh submit  --yaml deployments/aga_deepseek_v4_flash.yaml --label bringup
+#
+# Derived from coreai_deepseek_v4_flash.yaml, which targets a different cluster:
+# its account (coreai_comparch_trtllm), its checkpoint and its container image
+# are all unreachable from here, so every path below was re-resolved.
+
+cluster_name: aga
+# /lustre is a top-level symlink to /scratch here, so this is the same tree as
+# /lustre/fsw/portfolios/coreai/users/serli/workspace/TensorRT-LLM. Spelled the
+# canonical way so run_metadata.txt records one path rather than two.
+repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/workspace/TensorRT-LLM
+
+model:
+  name: deepseek_v4_flash
+  # The 2026-07-31 Flash checkpoint, staged under this user: 48 safetensors
+  # shards, ~156 GiB. The basename also becomes the pkill pattern, since that is
+  # what shows up on the trtllm-serve command line.
+  path: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/models/DeepSeek-V4-Flash-0731
+  tool_parser: deepseek_v4
+
+slurm:
+  account: coreai_mlperf_inference
+  # `batch` caps at 4:00:00; `batch_long` has the same nvl72 nodes with a 7-day
+  # cap. Staying on batch leaves continuity to the gateway relay, which is the
+  # tested path -- change partition and time together if you would rather hold
+  # one long job.
+  partition: batch
+  # Not preemptible: a 4-hour serving job that gets requeued costs everyone
+  # holding the gateway URL a gap. `free` is the preemptible alternative and is
+  # what gpuprobe.sh used; the gateway would route to the successor rather than
+  # break, so it is a cost-vs-availability call.
+  qos: normal
+  time: "4:00:00"
+  nodes: 1
+  gpus_per_node: 4
+  extra_args: []
+
+container:
+  # sbsa build 16194 -- the same TRT-LLM image as the reference coreai
+  # deployment, imported here with
+  #   enroot import -o <this path> docker://urm.nvidia.com#sw-tensorrt-docker/\
+  #     tensorrt-llm:pytorch-26.05-py3-sbsa-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194
+  # It must be sbsa: the x86 computelab images will not run on these Grace nodes.
+  image: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/containers/trtllm-devel-sbsa-26.05-16194.sqsh
+  # Both namespaces, so either spelling of a path resolves inside the container:
+  # /lustre -> /scratch at the root, and
+  # /lustre/fsw/portfolios/coreai/users/serli -> ../projects/coreai_mlperf_inference/users/serli.
+  mounts:
+    - /scratch/fsw:/scratch/fsw
+    - /lustre/fsw:/lustre/fsw
+
+server:
+  # TP4 x PP1 x CP1 = 4 ranks, matching slurm.nodes 1 x gpus_per_node 4.
+  # serve.sh hard-fails at submit time if these ever disagree.
+  config: server_configs/deepseek_v4_flash_agg_tep4.yaml
+  port: 8333
+  install_repo: true
+  # These nodes have 2 Grace sockets. "0,1" is what the 2-socket computelab
+  # deployments use; left empty until NUMA placement actually shows up as
+  # jitter, since the reference GB deployment runs without it.
+  numactl: ""
+  # Records raw /v1/messages bodies under the attempt directory. Right while
+  # bringing the model up; set false before handing the gateway URL to anyone
+  # else, or their prompts land in this run directory.
+  capture: true
+  extra_args: []
+  env: {}
+
+trace:
+  root: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/claude-traces
+
+gateway:
+  # 8333, the default, with aga_glm5.2 moved to 8334. The checked-in
+  # deployments keep two gateways apart by pinning them to different nodes,
+  # which is not available here: cpu-long grants one node per user, so both
+  # gateways share whichever CPU node this user holds and have to differ by
+  # port instead. server.port above is unaffected -- that one lives on a GPU
+  # node, and each serving job has its own.
+  port: 8333
+  account: coreai_mlperf_inference
+  # CPU-only, 55 nodes, 7-day limit: the address outlives ~40 of the 4-hour
+  # serving jobs. cpu-long is the QoS that actually grants the 7 days.
+  partition: cpu
+  qos: cpu-long
+  time: "7-00:00:00"
+  users: gateway_users.txt
+  # 30 minutes, matching aga_glm5.2. That deployment measured 8-9 minutes from
+  # submit to healthy for 433 GiB of weights, and this checkpoint is 156 GiB,
+  # so the margin here is wider still. Kept low for the same reason: a
+  # reclaimed predecessor does not release its allocation, so lead time beyond
+  # the startup cost is time spent holding eight GPUs to serve four.
+  lead_time: 1800
+  # Whole node rather than a memory request: these CPU nodes are 90 cores and
+  # 350 GiB, and the gateway is the one process nobody wants sharing a machine
+  # with a noisy neighbour. Unpinned, so read
+  # <trace.root>/_fleet/aga_deepseek_v4_flash/gateway_url after each gateway
+  # submission rather than assuming a hostname; add "--nodelist=cpu-00NN" once
+  # the URL is worth putting in other people's ~/.bashrc.
+  extra_args: ["--exclusive"]

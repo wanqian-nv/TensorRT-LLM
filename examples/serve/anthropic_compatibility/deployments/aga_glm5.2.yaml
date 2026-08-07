@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.2-NVFP4 on one 4-GPU GB300 node of oci-aga-slurm-1, fronted by the
+# gateway so the address survives the 4-hour serving jobs rotating.
+#
+#   ./serve.sh gateway --yaml deployments/aga_glm5.2.yaml --submit
+#   cat <trace.root>/_fleet/aga_glm5.2/gateway_url
+#   ./serve.sh submit  --yaml deployments/aga_glm5.2.yaml --label bringup
+
+cluster_name: aga
+repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/workspace/TensorRT-LLM
+
+model:
+  name: glm5.2
+  # Read-only artifact owned by coreai_dlalgo_ci: 47 shards, ~433 GiB,
+  # model_type glm_moe_dsa. Covered by the /scratch/fsw mount below, so nothing
+  # has to be copied. The basename also becomes the pkill pattern.
+  path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/nvidia_glm-5.2-nvfp4/hf/hf-aec724e_orig
+  # tool_parser_factory maps glm_moe_dsa -> glm47, which is what this
+  # checkpoint's config.json declares.
+  tool_parser: glm47
+
+slurm:
+  account: coreai_mlperf_inference
+  # 4 hours is the `batch` cap, and rotating within it is the point of this
+  # deployment: it is what exercises the gateway relay.
+  partition: batch
+  qos: normal
+  time: "4:00:00"
+  nodes: 1
+  gpus_per_node: 4
+  extra_args: []
+
+container:
+  image: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/containers/trtllm-devel-sbsa-26.05-16194.sqsh
+  # One mount covers both the repo and the dlalgo_ci artifact tree; /lustre/fsw
+  # is the symlink namespace for the same filesystem.
+  mounts:
+    - /scratch/fsw:/scratch/fsw
+    - /lustre/fsw:/lustre/fsw
+
+server:
+  # TP4 x PP1 x CP1 = 4 ranks, matching slurm.nodes 1 x gpus_per_node 4.
+  config: server_configs/glm5.2_agg_tep4.yaml
+  port: 8333
+  install_repo: true
+  numactl: ""
+  capture: true
+  extra_args: []
+  env: {}
+
+trace:
+  root: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/claude-traces
+
+gateway:
+  # 8334, with aga_deepseek_v4_flash holding the default 8333. The checked-in
+  # deployments keep two gateways apart by pinning them to different nodes,
+  # which is not available here: cpu-long grants one node per user, so both
+  # gateways share whichever CPU node this user holds and differ by port.
+  # server.port above is unaffected -- that one lives on a GPU node.
+  port: 8334
+  account: coreai_mlperf_inference
+  partition: cpu
+  qos: cpu-long
+  time: "7-00:00:00"
+  users: gateway_users.txt
+  # 30 minutes before the 4-hour wall clock, from three measured handovers:
+  # `pip install -e .` plus 433 GiB of weights plus warmup took 8m10s-8m42s,
+  # and the queue gave the node back in 1-17s each time. That leaves ~21
+  # minutes of headroom against a queue whose p90 is under a minute for
+  # single-job submitters like this one.
+  #
+  # Not larger, because a reclaimed predecessor does not actually release its
+  # allocation -- stop_server blocks on a launcher that never runs its SIGTERM
+  # trap -- so it holds four GPUs until its own wall clock. Every minute of
+  # lead time beyond the startup cost is a minute of double allocation. If that
+  # is ever fixed, raising this back to 2700 becomes nearly free and would
+  # cover the p95 queue wait of ~35 minutes.
+  lead_time: 1800
+  # Whole node, so this gateway cannot land on the same machine as the
+  # DeepSeek one: they both listen on 8333, and --exclusive is what keeps them
+  # apart without pinning either. Read
+  # <trace.root>/_fleet/aga_glm5.2/gateway_url after each gateway submission.
+  extra_args: ["--exclusive"]

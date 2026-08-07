@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.2-NVFP4 on 4 GPUs as DEP4: attention data-parallel, experts
+# expert-parallel. The checkpoint is ~433 GiB, so TP4 puts ~109 GiB of weights
+# on each GB300 and leaves ~128 GiB per rank for KV cache. Attention heads (64)
+# and routed experts (256) both divide by 4, and the checkpoint routes with
+# n_group=1, so EP4 imposes no group constraint.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# Attention runs data-parallel: each rank owns its own requests and its own KV
+# cache instead of every rank holding a replica. For an MLA checkpoint that is
+# the difference between one shared 2.74M-token pool and four of them.
+#
+# Two consequences that shape everything below:
+#   - max_batch_size and cuda_graph_config.batch_sizes become PER RANK. The
+#     deployment guides put it as `concurrency = max_batch_size * num_gpus`.
+#   - CUDA graphs need every rank to be generation-only in the same step
+#     (cuda_graph_runner.py:302-309). One rank taking a prefill chunk drops the
+#     whole step to eager, so graph coverage falls as prefill traffic rises.
+enable_attention_dp: true
+attention_dp_config:
+  # Without balancing, ranks drift apart and the slowest one sets the step time
+  # for all four -- the same all-ranks-agree coupling that gates the graphs.
+  enable_balance: true
+  # Pin each conversation to the rank that served its first turn. Chosen over
+  # enable_kv_cache_aware_routing, which infers affinity from prefix-match
+  # length and therefore loses it the moment those blocks are evicted -- and
+  # eviction is exactly what a batch this size causes. The conversation map is
+  # explicit and survives eviction. It also takes precedence when both are set,
+  # so enabling both would only obscure which one is running.
+  #
+  # This works for the Messages API because openai_chat resolves the id from
+  # the request headers and the Anthropic path forwards the same raw request.
+  # Claude Code sends x-claude-code-session-id on every call: over 1207 audited
+  # requests the header was present 100% of the time and covered 2 distinct
+  # sessions, so nearly every turn lands on a rank that already holds its
+  # prefix.
+  kv_cache_routing_conversation_affinity: true
+
+cuda_graph_config:
+  # Per rank, fine where the traffic is and coarse where it is not. Padding is
+  # nearly free at the low end -- concurrency 3 padded to 4 measured 14.6ms
+  # against 14.9ms for a real 4 -- so the small sizes exist to keep the padding
+  # step short, not to avoid padding. Above 8 each padded slot is a phantom
+  # sequence in an expensive step, which is why the spacing only widens
+  # gradually.
+  #
+  # Reaching 128 matters because falling off the captured set is a cliff, not a
+  # slope: measured on this deployment, a step cost 17.1ms at 8 and 152ms at 9.
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+  enable_padding: true
+
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+  host_cache_size: 42949672960
+  tokens_per_block: 64
+
+# Per rank, so 512 in flight across the four. Worth reading with the KV
+# arithmetic: this checkpoint spends 50232 bytes per token, and 0.8 of the free
+# memory buys a 2.74M-token pool per rank. That is 86k tokens per sequence at
+# 32 per rank but only 21k at 128 -- less than one Claude Code session carries.
+# The ceiling is therefore KV, not this number: raising it lets short sessions
+# pack in, and long ones will still stall around 32-48 per rank.
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # NVFP4 weights satisfy the CUTEDSL entry condition in create_moe.py, which
+  # requires fp8 block scales or nvfp4. If the environment cannot serve the
+  # backend it silently falls back to CutlassFusedMoE with a warning, so the
+  # server log is the only place that confirms which one actually loaded.
+  backend: CUTEDSL
+moe_expert_parallel_size: 4
+
+# Raised with max_batch_size: detokenisation is per response, and four workers
+# that were comfortable at a dozen concurrent streams are not at hundreds.
+num_postprocess_workers: 8
+pipeline_parallel_size: 1
+print_iter_log: true
+reasoning_parser: deepseek-r1
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+sparse_attention_config:
+  algorithm: deepseek_v4
+  enable_heuristic_topk: true
+  index_topk: 2048
+stream_interval: 10
+tensor_parallel_size: 4
+trust_remote_code: true
