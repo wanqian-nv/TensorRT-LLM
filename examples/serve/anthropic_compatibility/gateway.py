@@ -900,6 +900,21 @@ async def supervise_pending(fleet, now):
         fleet.pending = None
         return
 
+    # Slurm reports RUNNING as soon as it hands the node over, which is before
+    # the prolog finishes and therefore before the batch script exists to
+    # register anything. Restart the grace clock instead of reading that as a
+    # launcher failure: node setup here regularly outlasts
+    # PENDING_VISIBILITY_GRACE, and cancelling mid-prolog throws away a
+    # successor that was about to come up -- repeatedly, since every retry
+    # meets the same prolog. A prolog cannot stall forever, because Slurm caps
+    # it with PrologEpilogTimeout and fails the job into a terminal state the
+    # branch above already handles.
+    if state == "RUNNING" and "prolog" in reason.lower():
+        LOG.info("successor %s is still in prolog; deferring its failure check",
+                 job_id)
+        fleet.pending = (job_id, now)
+        return
+
     # A RUNNING job reaches cmd_run and registers before it starts loading the
     # model. If it remains invisible here, the launcher failed before that
     # point. Held jobs cannot make progress either. Cancel before retrying so a
