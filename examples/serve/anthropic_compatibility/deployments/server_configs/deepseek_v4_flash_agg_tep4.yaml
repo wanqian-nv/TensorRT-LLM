@@ -1,19 +1,41 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# DeepSeek-V4-Flash on 4 GPUs. Flash is 284B total / 13B active against Pro's
-# 1.6T / 49B, and its FP4-expert + FP8-dense weights are ~155 GiB, so TP4/EP4
-# leaves roughly 39 GiB of weights per B200 and the rest of the 183 GiB for KV
-# cache. Attention heads (64) and routed experts (256) both divide by 4.
+# DeepSeek-V4-Flash on 4 GPUs as DEP4: attention data-parallel, experts
+# expert-parallel. Flash is 284B total / 13B active against Pro's 1.6T / 49B,
+# and its FP4-expert + FP8-dense weights are ~155 GiB, so TP4/EP4 leaves
+# roughly 39 GiB of weights per GB300 and the rest for KV cache. Attention
+# heads (64) and routed experts (256) both divide by 4.
 #
-# Differences from deepseek_v4_agg_tep8.yaml are limited to the parallel sizes,
-# the tokenizer alias, and the indexer top-k; everything else is carried over.
+# Differences from deepseek_v4_agg_tep8.yaml: the parallel sizes, the tokenizer
+# alias, and the indexer top-k. Everything else is carried over.
 
 allreduce_strategy: NCCL
 context_parallel_size: 1
+
+# Attention data-parallel: each rank owns its requests and its own KV cache
+# rather than every rank replicating one. max_batch_size and the graph batch
+# sizes below are therefore PER RANK -- the guides state it as
+# `concurrency = max_batch_size * num_gpus`. Note also that a step only uses
+# CUDA graphs when every rank is generation-only in that step
+# (cuda_graph_runner.py:302-309), so prefill traffic costs graph coverage.
+enable_attention_dp: true
+attention_dp_config:
+  enable_balance: true
+  # Explicit conversation -> rank pinning, for the reasons spelled out in
+  # glm5.2_agg_tep4.yaml: inferred prefix affinity is lost on eviction, this
+  # map is not, and it takes precedence over enable_kv_cache_aware_routing
+  # anyway. Claude Code supplies x-claude-code-session-id on every request.
+  kv_cache_routing_conversation_affinity: true
+
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8]
+  # Same shape as glm5.2_agg_tep4.yaml: dense at the low end, widening as the
+  # batch grows, reaching max_batch_size so a busy step never falls off the
+  # captured set. Measured on the GLM deployment, leaving the set cost 17.1ms
+  # -> 152ms in a single step; the mechanism is not model-specific.
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
   enable_padding: true
+
 # The 2026-07-31 Flash release renumbered the reasoning-effort ladder: the
 # prefix the earlier release reached through `max` is now `high`, and `max`
 # selects a stronger one. The plain `deepseek_v4` alias encodes the earlier
@@ -21,9 +43,9 @@ cuda_graph_config:
 # rung below what the client asked for.
 custom_tokenizer: deepseek_v4_20260731
 disable_overlap_scheduler: true
-enable_attention_dp: false
 enable_autotuner: false
 enable_chunked_prefill: true
+
 kv_cache_config:
   avg_seq_len: 262144
   dtype: fp8
@@ -32,15 +54,27 @@ kv_cache_config:
   host_cache_size: 42949672960
   # DeepseekV4CacheManager only accepts 128 or 256.
   tokens_per_block: 128
-max_batch_size: 64
+
+# Per rank, so 512 in flight across the four. Flash carries this far more
+# comfortably than GLM does: MLA compression plus fp8 puts a token at 3125
+# bytes against GLM's 50232, and 0.8 of free memory buys roughly 62M tokens per
+# rank. Even at 128 per rank that leaves ~486k tokens per sequence, so the
+# batch limit binds long before the cache does.
+max_batch_size: 128
 max_beam_width: 1
 max_input_len: 1048575
 max_num_tokens: 8192
 max_seq_len: 1048576
+
 moe_config:
-  backend: TRTLLM
+  # create_moe.py admits CUTEDSL for fp8 block scales or nvfp4; the FP4 experts
+  # here qualify. A backend the environment cannot serve falls back to
+  # CutlassFusedMoE with a warning rather than failing, so confirm in the
+  # server log which one actually loaded.
+  backend: CUTEDSL
 moe_expert_parallel_size: 4
-num_postprocess_workers: 4
+
+num_postprocess_workers: 8
 pipeline_parallel_size: 1
 print_iter_log: true
 reasoning_parser: deepseek_v4
