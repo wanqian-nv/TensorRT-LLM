@@ -356,6 +356,37 @@ write_fleet() {
     return 0
 }
 
+# Nothing ties this process to the allocation it serves: `run` is startable from
+# outside the job by passing SLURM_JOB_ID and SLURM_JOB_NODELIST by hand, and
+# Slurm reclaiming the nodes does not signal it. Such a controller keeps
+# heartbeating a record that still carries the end time captured at startup, so
+# a preempted 7-day allocation goes on advertising a week of remaining life. The
+# gateway elects on end time, so that record outranks every live 4-hour backend,
+# takes routing to a URL nobody serves, and reclaims the backend that was
+# actually working. It also keeps `fleet.backends` non-empty, which is the
+# condition the gateway's own recovery path waits on -- so nothing repairs it.
+#
+# Only a positive answer is acted on. A failing squeue means a busy or
+# restarting slurmctld, which must never tear down a healthy server, so anything
+# short of Slurm plainly saying this job is not running counts as alive.
+job_is_gone() {
+    local out rc=0
+    out="$(squeue -h -j "${SLURM_JOB_ID}" -o '%T' 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+        # An id Slurm no longer recognises is exactly what this guards against;
+        # any other failure is an outage on Slurm's side, not on ours.
+        [[ "${out,,}" == *"invalid job id"* ]]
+        return
+    fi
+    # Empty output means the job left the queue. A state that is not one of
+    # these is not serving either -- a requeued job runs its batch script
+    # afresh, which starts a controller of its own.
+    case "${out}" in
+        *RUNNING*|*COMPLETING*|*CONFIGURING*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 # Deregistration is best effort by design: a job killed with SIGKILL never gets
 # here, so the gateway ages entries out by heartbeat rather than trusting this.
 clear_fleet() {
@@ -510,6 +541,18 @@ cmd_run() {
         # first turn.
         tick=$(( (tick + 1) % 5 ))
         if [[ "${tick}" -eq 0 ]]; then
+            # Checked before the heartbeat, never after: a controller that has
+            # outlived its allocation must stop advertising rather than publish
+            # one more record. clear_fleet runs here as well as in the EXIT
+            # trap, so a stop_server that blocks cannot leave the registration
+            # behind.
+            if job_is_gone; then
+                printf '%s\n' "allocation gone; controller exiting" \
+                    > "${CONTROL_DIR}/state"
+                clear_fleet
+                echo "Slurm job ${SLURM_JOB_ID} is no longer running; exiting"
+                exit 0
+            fi
             write_fleet
         fi
 
