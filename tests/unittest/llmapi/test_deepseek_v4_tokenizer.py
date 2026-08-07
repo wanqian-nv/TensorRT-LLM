@@ -170,16 +170,26 @@ def test_deepseek_v4_chat_template_preserves_reference_max_reasoning_effort():
     "tokenizer_cls, reasoning_effort, expected_prefix",
     [
         (DeepseekV4Tokenizer, "low", None),
+        (DeepseekV4Tokenizer, "medium", None),
         (DeepseekV4Tokenizer, "high", None),
         (DeepseekV4Tokenizer, "max", "Reasoning Effort: Absolute maximum"),
         (DeepseekV4Tokenizer20260731, "low", None),
+        (DeepseekV4Tokenizer20260731, "medium", None),
         (DeepseekV4Tokenizer20260731, "high",
          "Reasoning Effort: Absolute maximum"),
         (DeepseekV4Tokenizer20260731, "max", "Reasoning Effort: Beyond maximum"),
-        # Unknown levels fall back to the no-prefix default instead of raising,
-        # so a stray value cannot fail an inference request.
-        (DeepseekV4Tokenizer, "medium", None),
-        (DeepseekV4Tokenizer20260731, "medium", None),
+        # `xhigh` sits between `high` and `max` on the client ladder. Neither
+        # checkpoint's reference encoder names it, but it has to select at
+        # least as strong a prefix as `high` -- falling back to the no-prefix
+        # default would turn more reasoning into none. The April checkpoint has
+        # no rung above `Absolute maximum`, so it saturates there.
+        (DeepseekV4Tokenizer, "xhigh", "Reasoning Effort: Absolute maximum"),
+        (DeepseekV4Tokenizer20260731, "xhigh",
+         "Reasoning Effort: Beyond maximum"),
+        # Levels outside the ladder entirely fall back to the no-prefix default
+        # instead of raising, so a stray value cannot fail an inference request.
+        (DeepseekV4Tokenizer, "nonsense", None),
+        (DeepseekV4Tokenizer20260731, "nonsense", None),
         (DeepseekV4Tokenizer, None, None),
         (DeepseekV4Tokenizer20260731, None, None),
     ],

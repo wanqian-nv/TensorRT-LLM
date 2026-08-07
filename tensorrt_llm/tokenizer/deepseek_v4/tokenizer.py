@@ -75,16 +75,29 @@ DEFAULT_REASONING_EFFORT = "low"
 # release calls `high`, and the newer release adds a rung above it. Only the
 # level -> text mapping differs, so the encoder takes the table as an argument
 # and each tokenizer class picks the one matching its checkpoint.
+#
+# Both tables cover the full five-level client ladder (low, medium, high,
+# xhigh, max). Clients send every one of these -- Claude Code, for one, sends
+# `xhigh` -- and an unlisted level silently falls back to
+# DEFAULT_REASONING_EFFORT, which is the weakest rung, so a level missing here
+# turns a request for more reasoning into a request for less. Levels above a
+# checkpoint's strongest prefix saturate at that prefix rather than dropping.
 _EFFORT_PROMPTS_LEGACY = {
     "low": "",
+    "medium": "",
     # Accepted by the April reference encoder but deliberately empty there.
     "high": "",
+    # This checkpoint has no rung above _EFFORT_TEXT_ABSOLUTE, so xhigh and max
+    # both saturate there.
+    "xhigh": _EFFORT_TEXT_ABSOLUTE,
     "max": _EFFORT_TEXT_ABSOLUTE,
 }
 
 _EFFORT_PROMPTS_20260731 = {
     "low": "",
+    "medium": "",
     "high": _EFFORT_TEXT_ABSOLUTE,
+    "xhigh": _EFFORT_TEXT_BEYOND,
     "max": _EFFORT_TEXT_BEYOND,
 }
 
