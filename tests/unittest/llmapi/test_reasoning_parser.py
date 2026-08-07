@@ -60,6 +60,63 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         assert result.reasoning_content == reasoning_context[i]
 
 
+# Keys registered with reasoning_at_start=True. Their chat templates normally
+# pre-open a `<think>` block, but when the client disables thinking the
+# template closes it in the generation prompt instead, so the model output
+# carries no reasoning tags at all and belongs entirely in `content`.
+REASONING_AT_START_PARSERS = ["deepseek-r1", "qwen3_5", "minimax_m2"]
+
+
+@pytest.mark.parametrize("parser_name", REASONING_AT_START_PARSERS)
+@pytest.mark.parametrize("text", [
+    "a b",
+    "<severity>0</severity>",
+])
+def test_reasoning_at_start_parser_thinking_disabled(parser_name: str,
+                                                     text: str):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_name, {"enable_thinking": False})
+    result = reasoning_parser.parse(text)
+    assert result.content == text
+    assert result.reasoning_content == ""
+
+
+@pytest.mark.parametrize("parser_name", REASONING_AT_START_PARSERS)
+def test_reasoning_at_start_parser_thinking_disabled_stream(parser_name: str):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_name, {"enable_thinking": False})
+    results = [reasoning_parser.parse_delta(delta) for delta in ["a", "b"]]
+    assert [result.content for result in results] == ["a", "b"]
+    assert [result.reasoning_content for result in results] == ["", ""]
+
+
+@pytest.mark.parametrize("chat_template_kwargs", [
+    None,
+    {},
+    {
+        "enable_thinking": True
+    },
+])
+def test_deepseek_r1_reasoning_parser_thinking_not_disabled(
+        chat_template_kwargs):
+    """Anything other than an explicit False leaves reasoning_at_start alone."""
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek-r1", chat_template_kwargs)
+    result = reasoning_parser.parse("a b")
+    assert result.content == ""
+    assert result.reasoning_content == "a b"
+
+
+def test_qwen3_reasoning_parser_thinking_enabled_is_not_flipped():
+    """`qwen3` keeps reasoning_at_start=False for back-compat: an
+    `enable_thinking` of True must not silently turn it into `qwen3_5`."""
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "qwen3", {"enable_thinking": True})
+    result = reasoning_parser.parse("a b")
+    assert result.content == "a b"
+    assert result.reasoning_content == ""
+
+
 @pytest.mark.parametrize("chat_template_kwargs", [{
     "thinking": True
 }, {

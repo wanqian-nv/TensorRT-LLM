@@ -135,6 +135,18 @@ class DeepSeekR1Parser(BaseReasoningParser):
                  reasoning_at_start: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
         super().__init__(chat_template_kwargs=chat_template_kwargs)
+        # A client that explicitly disables thinking gets a chat template that
+        # closes the reasoning block in the generation prompt itself (GLM emits
+        # `<think></think>`), so the output carries no reasoning tags at all.
+        # Without this, `parse()` partitions on a `</think>` that can never
+        # arrive and files the whole response as `reasoning_content`, leaving
+        # `content` empty. Only the True -> False direction is honored: the
+        # `qwen3` key deliberately keeps `reasoning_at_start=False` for
+        # back-compat (see the note above this class), so an `enable_thinking`
+        # of True must not silently flip it.
+        if (isinstance(chat_template_kwargs, dict)
+                and chat_template_kwargs.get("enable_thinking") is False):
+            reasoning_at_start = False
         self.reasoning_start = "<think>"
         self.reasoning_end = "</think>"
         self.reasoning_at_start = reasoning_at_start
