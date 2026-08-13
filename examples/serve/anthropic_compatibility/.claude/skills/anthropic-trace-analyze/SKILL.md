@@ -17,9 +17,23 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Step 0 — Resolve the run directory
 
-If the user named a run (e.g. "repairbot", "model bringup", a SLURM job ID, or
-a substring), find the matching directory under `runs/`. If ambiguous, list
-candidates and ask. You need:
+A run directory is any directory that directly contains
+`anthropic_audit.jsonl`. It does not have to live under the skill base — the
+analysis scripts take absolute paths.
+
+Search these trace roots, in order, for a directory matching what the user named
+(e.g. "repairbot", "model bringup", a SLURM job ID, or any substring):
+
+1. `/lustre/fsw/portfolios/coreai/users/serli/claude-traces/` — current default.
+   Layout is `<root>/<run_name>/attempt-NNN/`, and the audit files live in the
+   **attempt** directory, not the run directory. Skip the `_fleet` and
+   `_sbatch_logs` bookkeeping directories. If several attempts carry an
+   `anthropic_audit.jsonl`, use the highest-numbered one unless the user asks
+   for a specific attempt.
+2. `<SKILL_BASE>/runs/` — legacy layout, audit files directly in `<run_name>/`.
+
+If the user gives an explicit path, use it as-is. If the match is ambiguous,
+list candidates and ask. You need:
 
 - `<run_dir>/anthropic_audit.jsonl`   — required; abort if missing
 - `<run_dir>/anthropic_message_capture/requests/`  — required for anomaly drill-down
@@ -27,8 +41,15 @@ candidates and ask. You need:
 Set:
 ```
 SKILL_BASE = TensorRT-LLM/examples/serve/anthropic_compatibility
-RUN_DIR    = <run_dir>           # e.g. runs/deepseek_v4_pro_manual_3291398-repairbot-6507081
+RUN_DIR    = <absolute path to the directory holding anthropic_audit.jsonl>
+             # e.g. /lustre/.../claude-traces/serli_080423_365887_..._repairbot/attempt-002
 ANALYSIS   = <RUN_DIR>/analysis
+```
+
+Locate candidates with:
+```bash
+find /lustre/fsw/portfolios/coreai/users/serli/claude-traces -maxdepth 3 \
+     -name anthropic_audit.jsonl -printf '%h\n' | sort
 ```
 
 ---
