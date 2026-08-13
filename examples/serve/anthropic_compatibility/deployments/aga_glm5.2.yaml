@@ -48,7 +48,12 @@ server:
   numactl: ""
   capture: true
   extra_args: []
-  env: {}
+  # print_iter_log only emits from rank 0 by default, which is blind exactly
+  # where attention DP needs sight: with conversation affinity a session pins
+  # to one rank, and rank 0's own line cannot tell whether the rest of the
+  # traffic sits on one peer or is spread across three.
+  env:
+    TLLM_PROFILE_LOG_RANKS: all
 
 trace:
   root: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/claude-traces

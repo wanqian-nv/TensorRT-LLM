@@ -79,7 +79,10 @@ server:
   # else, or their prompts land in this run directory.
   capture: true
   extra_args: []
-  env: {}
+  # Per-rank iteration logs; rank 0 alone cannot show how attention-DP traffic
+  # is distributed across the other three.
+  env:
+    TLLM_PROFILE_LOG_RANKS: all
 
 trace:
   root: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/claude-traces
