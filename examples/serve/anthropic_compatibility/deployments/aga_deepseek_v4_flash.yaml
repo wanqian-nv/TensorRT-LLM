@@ -59,6 +59,14 @@ container:
 server:
   # TP4 x PP1 x CP1 = 4 ranks, matching slurm.nodes 1 x gpus_per_node 4.
   # serve.sh hard-fails at submit time if these ever disagree.
+  #
+  # Back on the DEP4 config now that it carries attention_dp_config.enable_balance
+  # false. Dropping attention DP altogether was the first response to the
+  # SWA-scratch abort, but it costs the per-rank KV pool for no reason: the
+  # confirmed trigger is _balance_adp_requests, which only runs when
+  # enable_balance is set, and the ADP router is untouched by that flag
+  # (adp_router.py never reads it). The no-ADP variant is kept at
+  # server_configs/deepseek_v4_flash_agg_tep4_noadp.yaml as a fallback.
   config: server_configs/deepseek_v4_flash_agg_tep4.yaml
   port: 8333
   install_repo: true

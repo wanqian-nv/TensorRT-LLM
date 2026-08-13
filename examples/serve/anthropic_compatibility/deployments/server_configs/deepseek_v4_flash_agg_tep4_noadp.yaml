@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Flash on 4 GPUs as TEP4: tensor-parallel attention, expert-parallel
+# MoE, and NO attention data parallelism. Identical to
+# deepseek_v4_flash_agg_tep4.yaml except for the attention-DP block.
+#
+# WHY THIS FILE EXISTS
+#   The DEP4 config aborts a rank roughly once per few hours with
+#     AssertionError: SWA scratch requires
+#       old_capacity - max_rewind_len (N) <= history_length (M) <= old_capacity (N)
+#   at kv_cache_manager_v2/_core/_kv_cache.py:687, which kills the whole MPI group
+#   (rank thread dies -> peers block in tp_allgather -> HangDetector fires
+#   MPI_Abort after 300 s -> exit 137). Observed three times: 08-09 05:37 (job
+#   404771), 08-10 08:26 (413294), 08-10 09:17 (413934, the replay instance).
+#
+#   The trigger is attention DP, via py_executor._can_queue:
+#       if self.enable_attention_dp:
+#           tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
+#           can_queue = 0 not in tp_batch_sizes      # ANY empty rank skips ALL
+#       else:
+#           can_queue = scheduled_batch.batch_size > 0
+#   With attention DP a rank can hold a context request whose KV capacity the V2
+#   scheduler already grew (scheduler_v2.py:639 -> resize_context) and still skip
+#   the forward because a PEER's batch was empty. The skip path at
+#   py_executor.py:4025-4026 calls _revert_gen_alloc, which iterates only
+#   scheduled_batch.generation_requests -- context growth is never reverted.
+#   _revert_ctx_alloc exists (py_executor.py:3325) but its only caller is the
+#   disagg deferral path at :3439. So capacity ends up exactly one chunk
+#   (max_num_tokens 8192 minus one in-flight generation token, floored to
+#   tokens_per_block 128 = 8064) ahead of history_length, and because there is no
+#   speculative_config max_rewind_len is 0, which collapses the assert to
+#   "history_length == old_capacity". The next growth aborts the rank.
+#
+#   Without attention DP, can_queue is false only when THIS rank's batch is
+#   empty, which means nothing was scheduled and therefore nothing was resized --
+#   the desync cannot arise. (The other can_queue re-check, at py_executor.py
+#   :4022-4023, only fires when a KV connector is configured; this deployment has
+#   none.)
+#
+# WHAT IS GIVEN UP
+#   Attention DP gave each rank its own KV pool. Under TP the MLA cache is shared
+#   rather than per-rank, so aggregate KV capacity drops by roughly the TP factor.
+#   Flash can afford it: it spends 3125 bytes per token against GLM's 50232, and
+#   kv_cache_util on this deployment has been running at 0.002.
+#   max_batch_size below is therefore GLOBAL again, not per rank.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# The one deliberate difference from deepseek_v4_flash_agg_tep4.yaml.
+enable_attention_dp: false
+
+cuda_graph_config:
+  # Kept from the DEP4 config: leaving the captured set is a 9x cliff, measured
+  # 17.1ms at concurrency 8 against 152ms at 9 on the GLM sibling deployment.
+  # Dense at the low end, widening as the batch grows, ending at max_batch_size.
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+  enable_padding: true
+
+# The 2026-07-31 Flash release renumbered the reasoning-effort ladder: the
+# prefix the earlier release reached through `max` is now `high`, and `max`
+# selects a stronger one. The plain `deepseek_v4` alias encodes the earlier
+# layout, so it would answer `high` with no prefix at all and cap `max` one
+# rung below what the client asked for.
+custom_tokenizer: deepseek_v4_20260731
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+  host_cache_size: 42949672960
+  # DeepseekV4CacheManager only accepts 128 or 256.
+  tokens_per_block: 128
+
+# Global, not per rank, now that attention DP is off.
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # Unchanged from DEP4: expert parallelism does not depend on attention DP, and
+  # CuteDslFusedMoE was verified to load rather than fall back to CUTLASS.
+  backend: CUTEDSL
+moe_expert_parallel_size: 4
+
+num_postprocess_workers: 8
+pipeline_parallel_size: 1
+print_iter_log: true
+reasoning_parser: deepseek_v4
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+sparse_attention_config:
+  algorithm: deepseek_v4
+  # Left unset on purpose so it tracks the checkpoint (Flash 512, Pro 1024).
+  # ModelConfig consults `model_fields_set` for this field, so omitting the
+  # line falls back to the checkpoint rather than to the 512 field default.
+  # index_topk:
+  enable_heuristic_topk: true
+stream_interval: 10
+tensor_parallel_size: 4
+trust_remote_code: true
+
+# No speculative_config: the 2026-07-31 Flash checkpoint carries DSpark
+# prediction heads (mtp.0/1/2 with main_proj / confidence_head / markov_head),
+# not the enorm / hnorm / e_proj / h_proj layout DeepseekV4MTP loads. Enabling
+# MTP passes the `ckpt_nextn > 0` assert and then fails on missing keys.
+# NOTE this is also why max_rewind_len is 0 and the SWA assert has zero slack.

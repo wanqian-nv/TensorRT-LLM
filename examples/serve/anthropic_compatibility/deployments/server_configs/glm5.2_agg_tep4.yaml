@@ -22,23 +22,45 @@ context_parallel_size: 1
 #     whole step to eager, so graph coverage falls as prefill traffic rises.
 enable_attention_dp: true
 attention_dp_config:
-  # Without balancing, ranks drift apart and the slowest one sets the step time
-  # for all four -- the same all-ranks-agree coupling that gates the graphs.
-  enable_balance: true
-  # Pin each conversation to the rank that served its first turn. Chosen over
-  # enable_kv_cache_aware_routing, which infers affinity from prefix-match
-  # length and therefore loses it the moment those blocks are evicted -- and
-  # eviction is exactly what a batch this size causes. The conversation map is
-  # explicit and survives eviction. It also takes precedence when both are set,
-  # so enabling both would only obscure which one is running.
+  # OFF, matching the Flash deployment. Balancing was enabled here on the theory
+  # that ranks drifting apart would let the slowest set the step time for all
+  # four; that is real but secondary to what enabling it costs.
   #
-  # This works for the Messages API because openai_chat resolves the id from
-  # the request headers and the Anthropic path forwards the same raw request.
-  # Claude Code sends x-claude-code-session-id on every call: over 1207 audited
-  # requests the header was present 100% of the time and covered 2 distinct
-  # sessions, so nearly every turn lands on a rank that already holds its
-  # prefix.
-  kv_cache_routing_conversation_affinity: true
+  # _balance_adp_requests (py_executor.py:5142-5160, guarded at :5232 by this
+  # flag) holds an already-scheduled context request by emptying the list, while
+  # the V2 scheduler has already grown that request's KV capacity and nothing
+  # reverts it. On the Flash deployment that desync aborts a rank through the
+  # SWA-scratch assertion. GLM-5.2 is not known to be exposed -- its checkpoint
+  # declares GlmMoeDsaForCausalLM, which resolves to a different cache-manager
+  # family than kv_cache_manager_v2, and _revert_gen_alloc's own docstring notes
+  # that only the V2 scheduler allocates before the can_queue check -- so this is
+  # precautionary rather than a fix for an observed failure here.
+  #
+  # false is also the library default (llm_args.py:1384).
+  enable_balance: false
+  # Score each request by prefix match minus a load penalty, rather than
+  # pinning whole conversations. Conversation affinity was tried first and is
+  # the wrong granularity here: this deployment sees very few distinct sessions
+  # (1207 audited requests covered 2), and affinity binds at session level, so
+  # at most two of the four ranks can ever be bound. Its stickiness check uses
+  # the hard cap (max_batch_size, 128) rather than any fair-share limit, so a
+  # session running 80 concurrent requests never spills and the remaining ranks
+  # serve only the ADP dummy.
+  #
+  # KV-cache-aware routing scores per request instead, so concurrent turns of
+  # one session spread across ranks while still preferring a rank that already
+  # holds the prefix. _score_rank measures both terms in tokens:
+  #   (req_tokens - match_len) + load_balance_weight * normalized_load
+  enable_kv_cache_aware_routing: true
+  # Round-robin the first tp_size requests so every rank caches the shared
+  # system prompt before scoring starts. Without it the first warm rank wins
+  # every subsequent score and the concentration returns by another route.
+  # Only worth enabling because these requests do share a long prefix.
+  kv_cache_routing_cold_start_warmup: true
+  # Tighter than the 2.0 default: a rank leaves the eligible set once it holds
+  # 1.5x the fair share within a batch. This is the cap conversation affinity
+  # lacked.
+  kv_cache_routing_fair_share_multiplier: 1.5
 
 cuda_graph_config:
   # Per rank, fine where the traffic is and coarse where it is not. Padding is

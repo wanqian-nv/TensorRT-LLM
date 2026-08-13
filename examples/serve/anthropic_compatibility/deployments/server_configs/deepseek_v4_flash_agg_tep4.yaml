@@ -21,12 +21,39 @@ context_parallel_size: 1
 # (cuda_graph_runner.py:302-309), so prefill traffic costs graph coverage.
 enable_attention_dp: true
 attention_dp_config:
-  enable_balance: true
-  # Explicit conversation -> rank pinning, for the reasons spelled out in
-  # glm5.2_agg_tep4.yaml: inferred prefix affinity is lost on eviction, this
-  # map is not, and it takes precedence over enable_kv_cache_aware_routing
-  # anyway. Claude Code supplies x-claude-code-session-id on every request.
-  kv_cache_routing_conversation_affinity: true
+  # OFF, and deliberately so — this is the confirmed trigger of the SWA-scratch
+  # abort that killed this deployment three times (08-09 05:37 job 404771,
+  # 08-10 08:26 job 413294, 08-10 09:17 job 413934).
+  #
+  # _balance_adp_requests (py_executor.py:5142-5160) is reached only when this
+  # flag is set (guard at :5232). Its ELSE branch — taken whenever some rank has
+  # no pending context request, i.e. `all_ranks_have_ctx_requests` is False —
+  # unconditionally sets `balanced_context_requests = []` at :5155 and holds the
+  # request until `timeout_reached or not all_ranks_have_gen_requests`.
+  #
+  # By then the V2 scheduler has ALREADY grown that request's KV capacity
+  # (scheduler_v2.py:639 -> resize_context), and nothing reverts it: the skip
+  # paths call _revert_gen_alloc, which iterates only generation_requests, and
+  # _revert_ctx_alloc (py_executor.py:3325) is wired solely to the disagg
+  # deferral at :3439. history_length is advanced only by
+  # update_context_resources, which sees the emptied list. So capacity sits one
+  # chunk (8064 = floor((max_num_tokens 8192 - 1 generation token)/128)*128)
+  # ahead of history for the whole hold. It stays silent because the re-computed
+  # target is identical each iteration, so `capacity == self._capacity` and the
+  # guard at _kv_cache.py:684 skips the check. The moment the rank's own
+  # generation request finishes, the hold releases AND the token budget rises to
+  # 8192, so the chunk rounds up by exactly one 128-token block, capacity must
+  # change, and the assert fires with max_rewind_len == 0 (no speculative_config).
+  #
+  # Note false is also the library default (llm_args.py:1384); it was turned on
+  # by hand when this deployment moved to DEP4.
+  enable_balance: false
+  # Per-request prefix scoring rather than per-conversation pinning, for the
+  # reasons spelled out in glm5.2_agg_tep4.yaml: this deployment has far fewer
+  # sessions than ranks, so session-level affinity cannot fill four of them.
+  enable_kv_cache_aware_routing: true
+  kv_cache_routing_cold_start_warmup: true
+  kv_cache_routing_fair_share_multiplier: 1.5
 
 cuda_graph_config:
   # Same shape as glm5.2_agg_tep4.yaml: dense at the low end, widening as the
