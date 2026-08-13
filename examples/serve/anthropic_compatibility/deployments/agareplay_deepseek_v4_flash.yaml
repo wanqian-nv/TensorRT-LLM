@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# A second DeepSeek-V4-Flash instance, identical to aga_deepseek_v4_flash.yaml
+# except for the two fields that have to differ, so replay traffic never lands
+# on the instance people are using interactively.
+#
+#   ./serve.sh gateway --yaml deployments/agareplay_deepseek_v4_flash.yaml
+#   ./serve.sh submit  --yaml deployments/agareplay_deepseek_v4_flash.yaml --label replay
+#
+# The two differences:
+#
+#   cluster_name  The fleet directory is <trace.root>/_fleet/<cluster>_<model>,
+#                 and model.name is fixed by the serve.sh whitelist. Reusing
+#                 `aga` would put both instances in the same directory, where
+#                 each gateway would discover the other's backends and elect
+#                 across them -- the exact failure the README calls out, and a
+#                 silent one, since election only compares end times.
+#   gateway.port  8333 and 8334 are taken by the aga Flash and GLM gateways on
+#                 the same CPU node.
+#
+# server.port stays 8333: that one lives on the GPU node this job allocates,
+# which no other job shares.
+
+cluster_name: agareplay
+repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/workspace/TensorRT-LLM
+
+model:
+  name: deepseek_v4_flash
+  path: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/models/DeepSeek-V4-Flash-0731
+  tool_parser: deepseek_v4
+
+slurm:
+  account: coreai_mlperf_inference
+  partition: batch
+  qos: normal
+  time: "4:00:00"
+  nodes: 1
+  gpus_per_node: 4
+  extra_args: []
+
+container:
+  image: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/containers/trtllm-devel-sbsa-26.05-16194.sqsh
+  mounts:
+    - /scratch/fsw:/scratch/fsw
+    - /lustre/fsw:/lustre/fsw
+
+server:
+  # Deliberately the same file as the aga deployment rather than a copy: a
+  # replay is only worth anything if it runs the configuration being replayed,
+  # so edits there must reach here too.
+  config: server_configs/deepseek_v4_flash_agg_tep4.yaml
+  port: 8333
+  install_repo: true
+  numactl: ""
+  capture: true
+  extra_args: []
+  env:
+    TLLM_PROFILE_LOG_RANKS: all
+
+trace:
+  root: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/claude-traces
+
+gateway:
+  port: 8335
+  account: coreai_mlperf_inference
+  partition: cpu
+  qos: cpu-long
+  time: "7-00:00:00"
+  users: gateway_users.txt
+  lead_time: 1800
+  extra_args: ["--exclusive"]
