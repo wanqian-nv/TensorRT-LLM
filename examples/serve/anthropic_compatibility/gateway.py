@@ -514,7 +514,7 @@ class Gateway:
             await self.serve_introspection(path, headers, writer)
             return
 
-        key = extract_key(headers)
+        key = extract_key(headers) or "kf-anonymous"
         if key not in self.fleet.users:
             LOG.info("401 %s %s user=%r", method, path, key)
             await respond(writer, error_response(401))

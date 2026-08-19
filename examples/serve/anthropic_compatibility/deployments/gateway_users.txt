@@ -8,3 +8,4 @@
 # who they say. Fine among colleagues on the internal network; do not treat the
 # log as an audit record.
 serli
+kf-anonymous
