@@ -117,9 +117,30 @@ scheduler_config:
   capacity_scheduler_policy: MAX_UTILIZATION
   context_chunking_policy: EQUAL_PROGRESS
 sparse_attention_config:
-  algorithm: deepseek_v4
+  # Only enable_heuristic_topk is load-bearing here.
+  #
+  # `algorithm` is deliberately absent: model_config.py replaces whatever this
+  # deployment passes with a freshly built DeepSeekSparseAttentionConfig for
+  # GlmMoeDsaForCausalLM (and DeepseekV32ForCausalLM), and that class pins
+  # `algorithm: Literal["dsa"]`. The value written here never reached the
+  # dispatch in get_sparse_attn_kv_cache_manager -- which is why this
+  # deployment logs "[KVCacheManager] blocks_per_window", the V1 manager, and
+  # why tokens_per_block 64 is accepted at all; the V2 DeepseekV4CacheManager
+  # only takes 128 or 256.
+  #
+  # `index_topk` is absent for the same reason index_topk is left unset on the
+  # DeepSeek-V4 configs: the field is honoured only when explicitly set, so
+  # omitting it takes the checkpoint's value. GLM-5.2 declares index_topk 2048
+  # in its own config.json, alongside layer_types full of
+  # deepseek_sparse_attention and an indexer_types map -- the checkpoint
+  # describes its own sparse attention completely. Restating 2048 here matched
+  # it exactly and so changed nothing, but it would pin the value across a
+  # checkpoint that chose differently.
+  #
+  # The reference GLM recipes (209 of them, fp8 and nvfp4) set no
+  # sparse_attention_config at all, which means they run with
+  # enable_heuristic_topk at its False default. This deployment keeps it on.
   enable_heuristic_topk: true
-  index_topk: 2048
 stream_interval: 10
 tensor_parallel_size: 4
 trust_remote_code: true
