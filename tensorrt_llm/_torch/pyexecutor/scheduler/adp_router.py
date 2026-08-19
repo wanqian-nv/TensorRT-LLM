@@ -532,6 +532,40 @@ class KVCacheAwareADPRouter(ADPRouter):
         # empty fetch cycles.
         self.account_for_in_transfer = account_for_in_transfer
         self.async_transfer_manager = async_transfer_manager
+        # Routing-decision trace. Off unless PyExecutor opened a sink (see
+        # TRTLLM_ADP_ROUTE_TRACE); the per-decision bookkeeping below is pure
+        # overhead when nobody drains it. route_requests fills
+        # ``_last_route_trace`` and the executor stamps the iteration onto it,
+        # so the router never needs to know the iteration number.
+        self.route_trace_enabled: bool = False
+        self._last_route_trace: "dict | None" = None
+
+    @staticmethod
+    def _trace_decision(req_item, phase, req_tokens, best_rank, effective_added,
+                        match_lens=None, scores=None,
+                        cache_affinity_active=None) -> dict:
+        """One routing decision, content-free.
+
+        ``client_id`` is the id the serve edge knows the request by
+        (GenerationRequest.id, which the Anthropic audit log records as
+        ``engine_request_id``); ``req_id`` is the engine-local queue id. They
+        are different namespaces, so both are needed to join a decision to the
+        audit record.
+        """
+        request = req_item.request
+        decision = {
+            "req_id": req_item.id,
+            "client_id": getattr(request, "client_id", None),
+            "phase": phase,
+            "req_tokens": req_tokens,
+            "best_rank": best_rank,
+            "effective_added": effective_added,
+        }
+        if match_lens is not None:
+            decision["match_lens"] = match_lens
+            decision["scores"] = scores
+            decision["cache_affinity_active"] = cache_affinity_active
+        return decision
 
     def create_rank_state(
         self,
@@ -655,6 +689,13 @@ class KVCacheAwareADPRouter(ADPRouter):
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [float(s.num_active_tokens) for s in all_rank_states]
 
+        # Snapshot before the strict/warmup phase below, which mutates both
+        # arrays in place just as the scoring phase does.
+        trace_decisions = [] if self.route_trace_enabled else None
+        load_before = ((list(all_ranks_num_active_requests),
+                        list(all_ranks_num_active_tokens))
+                       if self.route_trace_enabled else None)
+
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
             if scheduling_params is None or scheduling_params.attention_dp_rank is None:
@@ -675,6 +716,7 @@ class KVCacheAwareADPRouter(ADPRouter):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
             if scheduling_params is not None:
                 target_dp_rank = scheduling_params.attention_dp_rank
+            phase = "strict" if target_dp_rank is not None else "warmup"
             if target_dp_rank is None and self._pending_warmup_ranks:
                 # Smallest-first: deterministic across DP ranks.
                 target_dp_rank = min(self._pending_warmup_ranks)
@@ -692,6 +734,12 @@ class KVCacheAwareADPRouter(ADPRouter):
                 all_ranks_num_active_tokens[target_dp_rank] += effective
                 scheduled = True
                 all_ranks_new_requests[target_dp_rank].append(req_item)
+                if trace_decisions is not None:
+                    # No match_lens/scores: this phase never scores, so the
+                    # fields are omitted rather than filled with zeros.
+                    trace_decisions.append(self._trace_decision(
+                        req_item, phase, _num_input_tokens(req_item.request),
+                        target_dp_rank, effective))
                 # Only mark a rank as warmed once a request actually landed
                 # there; saturated picks stay pending for a later call.
                 self._pending_warmup_ranks.discard(target_dp_rank)
@@ -727,8 +775,13 @@ class KVCacheAwareADPRouter(ADPRouter):
             if all_ranks_num_active_requests[rank] < expected_num_active_requests
         ]
 
-        for req_item in remaining_unscheduled:
+        num_unrouted = 0
+        for req_index, req_item in enumerate(remaining_unscheduled):
             if not eligible_ranks:
+                # Every rank hit the fair-share cap; the rest of this batch is
+                # left for a later call. Counted so a trace consumer can tell a
+                # short batch from a truncated one.
+                num_unrouted = len(remaining_unscheduled) - req_index
                 break
 
             req_tokens = _num_input_tokens(req_item.request)
@@ -762,11 +815,14 @@ class KVCacheAwareADPRouter(ADPRouter):
                 max_match_for_req / max(req_tokens, 1)
             ) > self.match_rate_threshold
 
+            trace_scores = {} if trace_decisions is not None else None
             for rank in iter_ranks:
                 match_len = match_lens[rank] if cache_affinity_active else 0
                 score = self._score_rank(
                     req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
                 )
+                if trace_scores is not None:
+                    trace_scores[rank] = score
                 # Tie-break on active_tokens to spread traffic when scores
                 # collide; cache-affinity wins are unaffected (lower score).
                 if (score, all_ranks_num_active_tokens[rank]) < (
@@ -782,6 +838,15 @@ class KVCacheAwareADPRouter(ADPRouter):
             effective_added = max(req_tokens - match_lens[best_rank], 0)
             all_ranks_num_active_tokens[best_rank] += effective_added
 
+            if trace_decisions is not None:
+                # match_lens and scores are keyed on eligible_ranks only, so
+                # their key set doubles as the eligibility record for this
+                # decision -- no separate eligible_ranks field needed.
+                trace_decisions.append(self._trace_decision(
+                    req_item, "scored", req_tokens, best_rank, effective_added,
+                    match_lens=match_lens, scores=trace_scores,
+                    cache_affinity_active=cache_affinity_active))
+
             # Progressive eviction: rank leaves eligibility once it hits
             # the cap for the rest of this batch.
             if all_ranks_num_active_requests[best_rank] >= expected_num_active_requests:
@@ -791,6 +856,21 @@ class KVCacheAwareADPRouter(ADPRouter):
             f"[adp_router] new_reqs_per_rank="
             f"{[len(all_ranks_new_requests[r]) for r in range(tp_size)]}"
         )
+
+        # Nothing placed and nothing held back is an idle iteration, and
+        # route_requests runs on every one of them; emitting there would make
+        # the trace as large as the iteration log. load_after is likewise
+        # absent -- it is load_before plus the per-decision effective_added, so
+        # recording it would only restate what the decisions already determine.
+        if trace_decisions is not None and (trace_decisions or num_unrouted):
+            self._last_route_trace = {
+                "load_before": {
+                    "num_active_requests": load_before[0],
+                    "num_active_tokens": load_before[1],
+                },
+                "num_unrouted": num_unrouted,
+                "decisions": trace_decisions,
+            }
 
         return all_ranks_new_requests, expected_num_active_requests
 
