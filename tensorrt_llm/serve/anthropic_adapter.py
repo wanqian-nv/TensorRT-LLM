@@ -91,12 +91,20 @@ STOP_REASON_MAP: Dict[str, AnthropicStopReason] = {
 ANTHROPIC_AUDIT_LOG_ENV = "TRTLLM_ANTHROPIC_AUDIT_LOG"
 ANTHROPIC_LCP_TRACKING_ENV = "TRTLLM_ANTHROPIC_LCP_TRACKING"
 ANTHROPIC_BENCH_CAPTURE_DIR_ENV = "TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR"
+_ANTHROPIC_BILLING_MARKER = "x-anthropic-billing-header:"
+# Real blocks top out at 94 characters; this only bounds the worst case.
+_ANTHROPIC_BILLING_MAX_CHARS = 512
+# Claude Code's field set is not stable across client versions: cch= was
+# dropped, cc_is_subagent= was added, and cc_entrypoint gained sdk-py. Pinning
+# an exact field list silently disabled stripping once already, so match the
+# cc-prefixed key=value shape instead. What bounds the false-strip risk is the
+# marker plus the system[0]-only restriction in _system_text_parts, not a field
+# whitelist -- the marker never appears outside system[0] in practice.
 _ANTHROPIC_BILLING_SYSTEM_BLOCK = re.compile(
     r"x-anthropic-billing-header:\s*"
-    r"cc_version=[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*;\s*"
-    r"cc_entrypoint=(?:cli|sdk-cli);\s*"
-    r"cch=[0-9a-f]{5};\s*"
+    r"(?:cc[0-9a-z_]*=[0-9A-Za-z._-]*;\s*)+"
 )
+_billing_shape_warned = False
 _SESSION_ID_HEADERS = (
     "x-claude-session-id",
     "x-claude-code-session-id",
@@ -521,7 +529,27 @@ def anthropic_error_response(
 
 def _is_anthropic_billing_system_block(text: str) -> bool:
     """Recognize Claude Code's model-irrelevant per-request billing block."""
-    return _ANTHROPIC_BILLING_SYSTEM_BLOCK.fullmatch(text) is not None
+    if not text.startswith(_ANTHROPIC_BILLING_MARKER):
+        return False
+    if (
+        len(text) <= _ANTHROPIC_BILLING_MAX_CHARS
+        and _ANTHROPIC_BILLING_SYSTEM_BLOCK.fullmatch(text) is not None
+    ):
+        return True
+
+    # The marker is there but the shape is not one we know: the client changed
+    # format again. Warn once so the next drift fails loudly rather than
+    # quietly forwarding the block to the model.
+    global _billing_shape_warned
+    if not _billing_shape_warned:
+        _billing_shape_warned = True
+        logger.warning(
+            "Anthropic billing system block has an unrecognized shape and will "
+            "be sent to the model verbatim; the strip pattern needs updating. "
+            "Block starts with: %r",
+            text[:120],
+        )
+    return False
 
 
 def _system_text_parts(system: Optional[Union[str, List[Any]]]) -> List[str]:
