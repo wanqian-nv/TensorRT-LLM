@@ -291,8 +291,12 @@ class DeepSeekV32Parser(BaseToolParser):
             if invoke_match is not None:
                 prefix = self._buffer[:invoke_match.start()]
                 if prefix.strip():
-                    raise ValueError(
-                        "Malformed DeepSeek DSML content before invoke block")
+                    # Content the model emitted inside a tool-call section that
+                    # is not part of an invoke. Surfacing it as text loses no
+                    # tool call -- the invoke that follows is still parsed --
+                    # whereas raising here aborts the whole response.
+                    normal_parts.append(prefix)
+                    self._consume_normal_text(prefix)
                 self._append_tool_call(invoke_match, all_calls)
                 self._buffer = self._buffer[invoke_match.end():]
                 if not self._expects_tool_calls_end:
@@ -301,18 +305,37 @@ class DeepSeekV32Parser(BaseToolParser):
 
             eot_position = self._buffer.find(self.eot_token)
             if eot_position != -1:
-                if self._buffer[:eot_position].strip():
-                    raise ValueError(
-                        "Incomplete DeepSeek DSML invoke before end token")
+                leftover = self._buffer[:eot_position]
+                if leftover.strip():
+                    # The section is closing with content that never formed a
+                    # complete invoke. Two things produce this: genuinely
+                    # malformed generation, and a well-formed call whose
+                    # argument text quotes the end marker -- the latter only
+                    # while streaming, since the marker arrives before the
+                    # invoke it belongs to. Neither is worth killing the stream
+                    # for, so emit what we have as text and close the section.
+                    normal_parts.append(leftover)
+                    self._consume_normal_text(leftover)
                 self._buffer = self._buffer[eot_position +
                                             len(self.eot_token):]
                 self._inside_tool_calls = False
                 self._expects_tool_calls_end = False
                 continue
 
-            if self._eos_token in self._buffer:
-                raise ValueError(
-                    "Incomplete DeepSeek DSML tool call before EOS")
+            eos_position = self._buffer.find(self._eos_token)
+            if eos_position != -1:
+                # Generation ended inside a tool-call section. The call is lost
+                # either way; delivering the partial text beats failing the
+                # request, and finish() still reports a truncated control token.
+                leftover = self._buffer[:eos_position]
+                if leftover.strip():
+                    normal_parts.append(leftover)
+                    self._consume_normal_text(leftover)
+                self._buffer = self._buffer[eos_position +
+                                            len(self._eos_token):]
+                self._inside_tool_calls = False
+                self._expects_tool_calls_end = False
+                continue
             break
 
         return StreamingParseResult(normal_text="".join(normal_parts),

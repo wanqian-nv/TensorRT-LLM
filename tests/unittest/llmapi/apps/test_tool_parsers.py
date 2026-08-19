@@ -1694,6 +1694,69 @@ class TestDeepSeekV4MarkdownDsml:
         assert parser.finish(sample_tools) == StreamingParseResult()
 
 
+@pytest.mark.parametrize("parser_cls", [DeepSeekV32Parser, DeepSeekV4Parser])
+class TestDeepSeekDsmlStreamingDegradation:
+    """The streaming path must never raise; unparsable DSML degrades to text.
+
+    A raise here aborts the whole response: the caller at
+    postprocess_handlers.py:210 has no handler, so the error reaches the
+    postproc worker's blanket except, which drops the record and fails the
+    stream. Observed twice in production against DeepSeek-V4-Flash.
+    """
+
+    def test_unparsable_content_before_end_token_becomes_text(
+            self, parser_cls, sample_tools):
+        parser = parser_cls()
+
+        result = parser.parse_streaming_increment(
+            parser.bot_token + '<｜DSML｜invoke name="bash">truncated' +
+            parser.eot_token, sample_tools)
+
+        assert "truncated" in result.normal_text
+        assert result.calls == []
+
+    def test_end_token_quoted_in_argument_does_not_fail_stream(
+            self, parser_cls, sample_tools):
+        parser = parser_cls()
+        # A well-formed call whose argument quotes the section end marker. While
+        # streaming, that marker arrives before the invoke it belongs to.
+        payload = (parser.bot_token + '<｜DSML｜invoke name="bash">' +
+                   '{"command": "echo ' + parser.eot_token + '"}' +
+                   "</｜DSML｜invoke>" + parser.eot_token)
+
+        for size in (1, 7, 64):
+            parser = parser_cls()
+            for start in range(0, len(payload), size):
+                parser.parse_streaming_increment(payload[start:start + size],
+                                                 sample_tools)
+            parser.finish(sample_tools)
+
+    def test_prose_before_invoke_becomes_text(self, parser_cls, sample_tools):
+        parser = parser_cls()
+
+        result = parser.parse_streaming_increment(
+            parser.bot_token + "chatter" +
+            '<｜DSML｜invoke name="get_weather">'
+            '<｜DSML｜parameter name="location" string="true">NYC'
+            "</｜DSML｜parameter></｜DSML｜invoke>" + parser.eot_token,
+            sample_tools)
+
+        assert "chatter" in result.normal_text
+        assert result.calls[0].name == "get_weather"
+
+    def test_eos_inside_tool_section_does_not_fail_stream(
+            self, parser_cls, sample_tools):
+        parser = parser_cls()
+
+        result = parser.parse_streaming_increment(
+            parser.bot_token + '<｜DSML｜invoke name="bash">partial' +
+            "<｜end▁of▁sentence｜>", sample_tools)
+        parser.finish(sample_tools)
+
+        assert "partial" in result.normal_text
+
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================

@@ -103,6 +103,10 @@ class PostprocWorker:
         '''
 
         self._records: Dict[int, GenerationResult] = {}
+        # Clients whose record was dropped by an error. Kept until that
+        # request's final response passes through, so later chunks of a
+        # torn-down stream are ignored instead of rebuilding a record.
+        self._failed: set[int] = set()
         self._record_creator = record_creator
         self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
                                       is_async=True,
@@ -212,6 +216,17 @@ class PostprocWorker:
             if isinstance(inp.rsp, ErrorResponse):
                 batch.append(inp.rsp)
                 self._records.pop(client_id, None)
+                self._failed.add(client_id)
+                return
+            if client_id in self._failed:
+                # This stream already failed and its record -- which owns the
+                # detokenizer and the tool parser -- was dropped. Re-entering
+                # _handle_input would call the record creator again with an
+                # Input carrying no sampling_params, since only a request's
+                # first response carries them, and assert. The client has had
+                # its error already, so drop the remainder quietly.
+                if not is_llm_response(inp.rsp) or inp.rsp.result.is_final:
+                    self._failed.discard(client_id)
                 return
             try:
                 is_final = inp.rsp.result.is_final if is_llm_response(
@@ -244,6 +259,7 @@ class PostprocWorker:
                     ))
                 if is_final:
                     self._records.pop(client_id, None)
+                    self._failed.discard(client_id)
             except Exception as e:
                 logger.error(
                     f"Postprocessing error for client {client_id}: {e}\n"
@@ -255,6 +271,7 @@ class PostprocWorker:
                         request_id=getattr(inp.rsp, 'request_id', -1),
                     ))
                 self._records.pop(client_id, None)
+                self._failed.add(client_id)
 
         while not self._to_stop.is_set():
             batch = []
