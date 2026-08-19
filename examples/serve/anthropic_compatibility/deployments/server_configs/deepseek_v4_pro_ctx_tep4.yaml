@@ -1,0 +1,158 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Pro CONTEXT worker for 1P1D disaggregated serving: 4 GPUs as
+# TEP4 (tensor-parallel attention, expert-parallel MoE).
+#
+# Pro is 1.6T total / 49B active with 850.4 GiB of NVFP4 weights across 64
+# shards, so TP4 puts ~213 GiB on each GB300 and leaves ~71 GiB per rank. Its
+# 128 attention heads and 384 routed experts both divide by 4.
+#
+# This worker only ever runs prefill. The proxy sends it the request with
+# `request_type: context_only` and `stream: False`, then keeps nothing but
+# `choices[0].disaggregated_params` -- the generated text never reaches the
+# client (openai_disagg_service.py, _get_ctx_request). Everything that only
+# affects generation is therefore absent here on purpose: no cuda_graph_config
+# (graphs need generation-only steps), no reasoning_parser, no tool_parser, no
+# num_postprocess_workers.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# KV leaves this worker as soon as prefill finishes, so it holds far less than
+# the generation side. Attention DP is off for the same reason the reference
+# ctx config keeps it simple: with no decode steps there is no per-rank decode
+# batch to balance, and it removes a whole class of scheduler interaction --
+# including the _balance_adp_requests / SWA-scratch abort that killed the
+# aggregated Flash deployment three times.
+# ON, following every reference recipe. Each rank owning its own requests
+# and its own KV pool matters more than per-request prefill latency once
+# several prompts are in flight. attention_dp_config.enable_balance is left
+# unset (library default false) -- that flag, not attention DP itself, is
+# what drove the SWA-scratch aborts on the aggregated deployment.
+enable_attention_dp: true
+attention_dp_config:
+  # Route by prefix-match length alone. _score_rank is
+  #   (req_tokens - match_len) + load_balance_weight * normalized_load
+  # so weight 0 drops the load term entirely and the rank holding the longest
+  # matching prefix wins outright. Ties -- every rank at match_len 0 on a cold
+  # tree, for instance -- still fall to the least-loaded rank, which is a
+  # hard-coded tie-break in the scoring loop, not a knob.
+  enable_kv_cache_aware_routing: true
+  kv_cache_routing_load_balance_weight: 0.0
+  # Kept on. The first dp_size requests are round-robined by ascending rank
+  # index without scoring at all, so every rank caches the shared system prompt
+  # before scoring starts. Without it the first request seeds one rank, that
+  # rank is then the only one with a nonzero match_len, and with the load term
+  # gone nothing at all pulls traffic back to the others.
+  kv_cache_routing_cold_start_warmup: true
+  # match_rate_threshold (0.1) and fair_share_multiplier (2.0) are left at
+  # their defaults deliberately -- stated here because this file used to pin
+  # the multiplier to 1.5.
+
+# NIXL for the KV handoff. This MUST match the generation worker; a mismatch
+# fails at transfer time, not at startup.
+cache_transceiver_config:
+  backend: NIXL
+  # PYTHON, not the "auto" default. auto adopts the model's preferred runtime
+  # and otherwise falls back to the C++ transceiver, and DeepSeek-V4 declares
+  # no transceiver preference -- so auto lands on BindKvCacheTransceiver, whose
+  # binding signature takes bindings.internal.batch_manager.BaseKVCacheManager.
+  # This model family cannot supply one: sparse_attention_config.algorithm
+  # deepseek_v4 routes to DeepseekV4CacheManager, which subclasses
+  # KVCacheManagerV2, and that choice never consults is_disagg. The result is
+  #   TypeError: __init__(): incompatible function arguments
+  # at startup (observed 08-18, job 504831).
+  #
+  # KvCacheTransceiverV2 is pure Python and dispatches on the manager type --
+  # create_cache_reuse_adapter takes Union[KVCacheManager, KVCacheManagerV2] --
+  # so it accepts what this model produces. It supports only NIXL and DEFAULT
+  # backends, which is why NIXL above is load-bearing rather than incidental,
+  # and it requires cp_size == 1, which context_parallel_size satisfies.
+  transceiver_runtime: PYTHON
+  # 10 minutes, matching every reference recipe. The 60s default is a
+  # long-context hazard: a request whose KV does not finish moving in
+  # time is cancelled, and these deployments carry ~1M-token contexts.
+  kv_transfer_timeout_ms: 600000
+  # Sized to this deployment's prefill chunk (max_num_tokens below), following
+  # slurm/benchmark/config.yaml, which sets max_tokens_in_buffer equal to the
+  # context worker's max_num_tokens on BOTH sides. Both sides must agree.
+  max_tokens_in_buffer: 8192
+
+custom_tokenizer: deepseek_v4
+# Prefill is this worker's whole job, and the reference disagg ctx config
+# disables overlap for the same reason: there is nothing to overlap with.
+# false, following every reference recipe. The earlier reasoning -- "prefill
+# has nothing to overlap with" -- is wrong: overlap hides host-side request
+# preparation behind the previous chunk's forward, and chunked prefill makes
+# that a per-chunk win rather than a per-request one.
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  # Deliberately lower than the generation side. 0.8 of ~71 GiB would be spent
+  # holding cache this worker hands away immediately; the headroom is worth
+  # more as activation space for long prefills.
+  free_gpu_memory_fraction: 0.85
+  host_cache_size: 42949672960
+  # DeepseekV4CacheManager only accepts 128 or 256.
+  tokens_per_block: 128
+  # Split across the three pool groups DeepseekV4CacheManager builds -- SWA,
+  # COMPRESS, and COMPRESSOR -- in the ratio every reference recipe uses.
+  # Without it the manager falls back to its own split, which is not tuned
+  # for this checkpoint's compress ratios.
+  pool_ratio: [0.55, 0.22, 0.23]
+  event_buffer_max_size: 0
+
+# 128, not 16. Measured on the Pro deployment (job 514107): eight concurrent
+# 2026-token requests all finished within a 20.60-20.71s window with per-request
+# TTFT at 20.6s against 343ms when sent alone, and the ctx GPU forward time was
+# identical (9420.5ms) whether a request reused 19 KV blocks or 3 -- the prefill
+# the router had saved was being spent waiting instead. The reference dep4-tep4
+# recipe runs 128 here for the same reason.
+#
+# max_num_tokens stays at 8192: that is the chunked-prefill chunk, and it is
+# what actually bounds how much work lands in one step. Raising the batch size
+# only lets the scheduler interleave more requests across those chunks.
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # TRTLLM, not CUTEDSL. This checkpoint resolves to
+  # QuantAlgo.W4A8_MXFP4_MXFP8, and CuteDslFusedMoE accepts only
+  # fp8_block_scales or nvfp4 -- so CUTEDSL fell back silently, once per layer,
+  # with "CuteDslFusedMoE only supports fp8_block_scales and nvfp4" (job
+  # 513070). TRTLLM is also what the framework picks for itself: model_config.py
+  # routes DeepseekV4ForCausalLM on sm100-119 to TRTLLM when moe_backend is
+  # AUTO, and every reference recipe states it explicitly.
+  backend: TRTLLM
+moe_expert_parallel_size: 4
+
+# Per-request timing and KV block counts, surfaced on /perf_metrics and as the
+# per-response perf metrics the audit records carry. Matching what the
+# aggregated deployment collects, so disaggregated and aggregated runs can be
+# compared on the same numbers; the reference recipes use 100000, which retains
+# longer at the cost of a bigger in-process deque.
+perf_metrics_max_requests: 4096
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+# No sparse_attention_config here, on the decode worker only -- which is what
+# every reference recipe from 07-24 onward does, five batches in a row. The
+# earlier 07-04 and 07-14 batches had it on prefill instead; it is never on
+# both. Verified on this stack rather than taken on faith: the Flash
+# disaggregated bring-up (job 505096) ran ctx-without / gen-with end to end,
+# and a request returned correct content, so the KV handed across still matches
+# what the decode side expects.
+tensor_parallel_size: 4
+trust_remote_code: true

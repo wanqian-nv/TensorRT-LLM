@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Pro GENERATION worker for 1P1D disaggregated serving: 4 GPUs as
+# DEP4 (attention data-parallel, experts expert-parallel).
+#
+# Weights are the same 850.4 GiB as the context worker -- ~213 GiB per GB300,
+# leaving ~71 GiB per rank. Unlike the context worker this one holds KV for the
+# whole decode, so it gets the larger cache fraction and all of the
+# generation-side machinery: CUDA graphs, the reasoning parser, and the
+# postprocess pool that the tool parser runs in.
+#
+# `--tool_parser deepseek_v4` is passed on the command line by serve.sh, not
+# set here: it configures the OpenAI HTTP server rather than TorchLlmArgs.
+# It belongs on THIS worker only. The context worker is driven with
+# `stream: False` and its text is discarded, so a parser there would only ever
+# see deliberately truncated output.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# Attention data-parallel: each rank owns its requests and its own KV pool.
+# With ~71 GiB of headroom per rank after weights, four private pools are worth
+# considerably more than one shared one.
+enable_attention_dp: true
+
+# NIXL for the KV handoff. MUST match the context worker.
+cache_transceiver_config:
+  backend: NIXL
+  # PYTHON, not the "auto" default. auto adopts the model's preferred runtime
+  # and otherwise falls back to the C++ transceiver, and DeepSeek-V4 declares
+  # no transceiver preference -- so auto lands on BindKvCacheTransceiver, whose
+  # binding signature takes bindings.internal.batch_manager.BaseKVCacheManager.
+  # This model family cannot supply one: sparse_attention_config.algorithm
+  # deepseek_v4 routes to DeepseekV4CacheManager, which subclasses
+  # KVCacheManagerV2, and that choice never consults is_disagg. The result is
+  #   TypeError: __init__(): incompatible function arguments
+  # at startup (observed 08-18, job 504831).
+  #
+  # KvCacheTransceiverV2 is pure Python and dispatches on the manager type --
+  # create_cache_reuse_adapter takes Union[KVCacheManager, KVCacheManagerV2] --
+  # so it accepts what this model produces. It supports only NIXL and DEFAULT
+  # backends, which is why NIXL above is load-bearing rather than incidental,
+  # and it requires cp_size == 1, which context_parallel_size satisfies.
+  transceiver_runtime: PYTHON
+  # 10 minutes, matching every reference recipe. The 60s default is a
+  # long-context hazard: a request whose KV does not finish moving in
+  # time is cancelled, and these deployments carry ~1M-token contexts.
+  kv_transfer_timeout_ms: 600000
+  # Sized to this deployment's prefill chunk (max_num_tokens below), following
+  # slurm/benchmark/config.yaml, which sets max_tokens_in_buffer equal to the
+  # context worker's max_num_tokens on BOTH sides. Both sides must agree.
+  max_tokens_in_buffer: 8192
+
+cuda_graph_config:
+  # Per rank, so 128 here is 512 in flight across the four. Dense at the low
+  # end, widening as the batch grows, reaching max_batch_size so a busy step
+  # never falls off the captured set -- measured on the GLM sibling deployment,
+  # leaving the captured set cost 17.1ms -> 152ms in a single step.
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+  enable_padding: true
+
+custom_tokenizer: deepseek_v4
+enable_autotuner: false
+# No disable_overlap_scheduler here, unlike the context worker: overlap is what
+# hides host work behind decode steps, and decode is all this worker does. The
+# reference disagg configs make the same split.
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: false
+  # Higher than the context worker: this cache is held for the whole decode.
+  # 0.85 of ~71 GiB is roughly 60 GiB per rank; read the real token count out
+  # of the startup log rather than trusting this arithmetic.
+  free_gpu_memory_fraction: 0.85
+  # DeepseekV4CacheManager only accepts 128 or 256.
+  tokens_per_block: 128
+
+# Per rank, so 512 across the four.
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 128
+max_seq_len: 1048576
+
+moe_config:
+  # TRTLLM, not CUTEDSL. This checkpoint resolves to
+  # QuantAlgo.W4A8_MXFP4_MXFP8, and CuteDslFusedMoE accepts only
+  # fp8_block_scales or nvfp4 -- so CUTEDSL fell back silently, once per layer,
+  # with "CuteDslFusedMoE only supports fp8_block_scales and nvfp4" (job
+  # 513070). TRTLLM is also what the framework picks for itself: model_config.py
+  # routes DeepseekV4ForCausalLM on sm100-119 to TRTLLM when moe_backend is
+  # AUTO, and every reference recipe states it explicitly.
+  backend: TRTLLM
+  use_low_precision_moe_combine: true
+moe_expert_parallel_size: 4
+
+# Detokenisation is per response; four workers that were comfortable at a dozen
+# concurrent streams are not at hundreds.
+num_postprocess_workers: 8
+# Per-request timing and KV block counts, surfaced on /perf_metrics and as the
+# per-response perf metrics the audit records carry. Matching what the
+# aggregated deployment collects, so disaggregated and aggregated runs can be
+# compared on the same numbers; the reference recipes use 100000, which retains
+# longer at the cost of a bigger in-process deque.
+perf_metrics_max_requests: 4096
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+reasoning_parser: deepseek_v4
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+sparse_attention_config:
+  algorithm: deepseek_v4
+  # Left unset so it tracks the checkpoint (Pro declares index_topk 1024).
+  # index_topk:
+  enable_heuristic_topk: true
+stream_interval: 20
+tensor_parallel_size: 4
+trust_remote_code: true
+
+# No speculative_config. Pro declares num_nextn_predict_layers: 1, so an MTP
+# layer exists in the checkpoint, but the aggregated Flash bring-up showed the
+# DSpark head layout does not match what DeepseekV4MTP loads. Enable it only
+# after confirming the key names on this specific checkpoint.

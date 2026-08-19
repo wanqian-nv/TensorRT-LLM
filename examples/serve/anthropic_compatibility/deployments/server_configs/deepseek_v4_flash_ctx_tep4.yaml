@@ -1,0 +1,161 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Flash CONTEXT worker for 1P1D disaggregated serving: 4 GPUs as
+# TEP4. Derived from deepseek_v4_flash_agg_tep4.yaml, which serves the same
+# checkpoint aggregated; the differences are the cache transceiver, the
+# generation-only settings that are dropped here, and a smaller KV fraction.
+#
+# This deployment exists to validate the disaggregated path itself on a
+# checkpoint that is known to load. DeepSeek-V4-Pro was the intended first
+# target and cannot be used yet: all three of its NVFP4 variants declare
+# quant_algo MIXED_PRECISION in hf_quant_config.json, and
+# modeling_deepseekv4.py asserts that the per-layer quant config is not
+# MIXED_PRECISION -- it reads the global config rather than the per-layer table
+# that _set_deepseek_v4_routed_moe_quant_config builds, so the assert fires
+# before any weight is read. Flash carries its quantization inline in
+# config.json as plain fp8 and never reaches that path.
+#
+# This worker only runs prefill: the proxy sends it request_type=context_only
+# with stream=False and keeps nothing but choices[0].disaggregated_params. So
+# no cuda_graph_config, no reasoning_parser, no tool_parser, no
+# num_postprocess_workers.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# No attention DP on the context side. With no decode steps there is no
+# per-rank decode batch to balance, and TP prefill gives a single request the
+# whole node -- which is what time-to-first-token depends on. It also keeps
+# this worker away from _balance_adp_requests entirely.
+# ON, following every reference recipe. Each rank owning its own requests
+# and its own KV pool matters more than per-request prefill latency once
+# several prompts are in flight. attention_dp_config.enable_balance is left
+# unset (library default false) -- that flag, not attention DP itself, is
+# what drove the SWA-scratch aborts on the aggregated deployment.
+enable_attention_dp: true
+attention_dp_config:
+  # Route by prefix-match length alone. _score_rank is
+  #   (req_tokens - match_len) + load_balance_weight * normalized_load
+  # so weight 0 drops the load term entirely and the rank holding the longest
+  # matching prefix wins outright. Ties -- every rank at match_len 0 on a cold
+  # tree, for instance -- still fall to the least-loaded rank, which is a
+  # hard-coded tie-break in the scoring loop, not a knob.
+  enable_kv_cache_aware_routing: true
+  kv_cache_routing_load_balance_weight: 0.0
+  # Kept on. The first dp_size requests are round-robined by ascending rank
+  # index without scoring at all, so every rank caches the shared system prompt
+  # before scoring starts. Without it the first request seeds one rank, that
+  # rank is then the only one with a nonzero match_len, and with the load term
+  # gone nothing at all pulls traffic back to the others.
+  kv_cache_routing_cold_start_warmup: true
+  # match_rate_threshold (0.1) and fair_share_multiplier (2.0) are left at
+  # their defaults deliberately -- stated here because this file used to pin
+  # the multiplier to 1.5.
+
+# NIXL for the KV handoff, and a buffer sized to the prefill chunk
+# (max_num_tokens below), following slurm/benchmark/config.yaml. Both sides
+# must declare the same backend and the same buffer.
+cache_transceiver_config:
+  backend: NIXL
+  # PYTHON, not the "auto" default. auto adopts the model's preferred runtime
+  # and otherwise falls back to the C++ transceiver, and DeepSeek-V4 declares
+  # no transceiver preference -- so auto lands on BindKvCacheTransceiver, whose
+  # binding signature takes bindings.internal.batch_manager.BaseKVCacheManager.
+  # This model family cannot supply one: sparse_attention_config.algorithm
+  # deepseek_v4 routes to DeepseekV4CacheManager, which subclasses
+  # KVCacheManagerV2, and that choice never consults is_disagg. The result is
+  #   TypeError: __init__(): incompatible function arguments
+  # at startup (observed 08-18, job 504831).
+  #
+  # KvCacheTransceiverV2 is pure Python and dispatches on the manager type --
+  # create_cache_reuse_adapter takes Union[KVCacheManager, KVCacheManagerV2] --
+  # so it accepts what this model produces. It supports only NIXL and DEFAULT
+  # backends, which is why NIXL above is load-bearing rather than incidental,
+  # and it requires cp_size == 1, which context_parallel_size satisfies.
+  transceiver_runtime: PYTHON
+  # 10 minutes, matching every reference recipe. The 60s default is a
+  # long-context hazard: a request whose KV does not finish moving in
+  # time is cancelled, and these deployments carry ~1M-token contexts.
+  kv_transfer_timeout_ms: 600000
+  max_tokens_in_buffer: 8192
+
+# The 2026-07-31 Flash release renumbered the reasoning-effort ladder, so the
+# dated tokenizer alias is required; the plain deepseek_v4 alias encodes the
+# earlier layout.
+custom_tokenizer: deepseek_v4_20260731
+# false, following every reference recipe. The earlier reasoning -- "prefill
+# has nothing to overlap with" -- is wrong: overlap hides host-side request
+# preparation behind the previous chunk's forward, and chunked prefill makes
+# that a per-chunk win rather than a per-request one.
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  # Kept on. The aggregated deployment's traffic is Claude Code sessions whose
+  # prompts share very long prefixes -- 54k-token prompts with a common system
+  # block -- so prefix reuse on the context worker is worth more here than the
+  # clean measurements the benchmark config gets by disabling it.
+  enable_block_reuse: true
+  # 0.85, the same as the generation side and as the other two disaggregated
+  # deployments. This was 0.5 on the theory that a context worker hands its KV
+  # away immediately and should leave the headroom to activations, but the
+  # fraction does not multiply the card -- _cal_max_memory computes
+  #   (total_gpu_memory - peak_memory + allocated_bytes) * fraction
+  # so it only divides what is left *after* the profiled peak, which already
+  # includes those activations. Measured on the Pro deployment at 0.85 (job
+  # 513070): peak 243.05 GiB of 276.62, context KV quota 33.37 GiB, roughly 7.8M
+  # tokens at 4474 bytes each. The 15% held back is runtime slack, not waste.
+  free_gpu_memory_fraction: 0.85
+  host_cache_size: 42949672960
+  # DeepseekV4CacheManager only accepts 128 or 256.
+  tokens_per_block: 128
+  # Split across the three pool groups DeepseekV4CacheManager builds -- SWA,
+  # COMPRESS, and COMPRESSOR -- in the ratio every reference recipe uses.
+  # Without it the manager falls back to its own split, which is not tuned
+  # for this checkpoint's compress ratios.
+  pool_ratio: [0.55, 0.22, 0.23]
+  event_buffer_max_size: 0
+
+# 128, not 16. Measured on the Pro deployment (job 514107): eight concurrent
+# 2026-token requests all finished within a 20.60-20.71s window with per-request
+# TTFT at 20.6s against 343ms when sent alone, and the ctx GPU forward time was
+# identical (9420.5ms) whether a request reused 19 KV blocks or 3 -- the prefill
+# the router had saved was being spent waiting instead. The reference dep4-tep4
+# recipe runs 128 here for the same reason.
+#
+# max_num_tokens stays at 8192: that is the chunked-prefill chunk, and it is
+# what actually bounds how much work lands in one step. Raising the batch size
+# only lets the scheduler interleave more requests across those chunks.
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # TRTLLM, matching the framework's own AUTO choice for this
+  # architecture on Blackwell and every reference recipe.
+  backend: TRTLLM
+moe_expert_parallel_size: 4
+
+# Per-request timing and KV block counts, surfaced on /perf_metrics and as the
+# per-response perf metrics the audit records carry. Matching what the
+# aggregated deployment collects, so disaggregated and aggregated runs can be
+# compared on the same numbers; the reference recipes use 100000, which retains
+# longer at the cost of a bigger in-process deque.
+perf_metrics_max_requests: 4096
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+# No sparse_attention_config here. Every reference recipe declares it on the
+# decode worker only: the context worker is driven with request_type
+# context_only and its indexer state is rebuilt on the decode side anyway.
+tensor_parallel_size: 4
+trust_remote_code: true

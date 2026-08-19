@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# GLM-5.2-NVFP4 CONTEXT worker for 1P1D disaggregated serving: 4 GPUs as TEP4.
+#
+# This is glm5.2_agg_tep4.yaml with three kinds of change and nothing else:
+#   1. the cache transceiver, which only exists in disaggregated mode;
+#   2. the generation-only settings dropped, since this worker never decodes;
+#   3. the perf-metrics collection the aggregated deployment already carries.
+# Everything GLM-specific -- tokens_per_block 64, index_topk 2048, CUTEDSL,
+# the attention-DP block -- is carried over unchanged, because it is what the
+# aggregated deployment has been running.
+#
+# The checkpoint is ~433 GiB, so TP4 puts ~109 GiB of weights on each GB300 and
+# leaves ~176 GiB per rank.
+#
+# This worker only runs prefill: the proxy sends it request_type=context_only
+# with stream=False and keeps nothing but choices[0].disaggregated_params.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+# Carried over from the aggregated deployment. enable_balance stays false --
+# that flag, not attention DP itself, is what drove the SWA-scratch aborts on
+# the Flash deployment.
+enable_attention_dp: true
+attention_dp_config:
+  # Route by prefix-match length alone. _score_rank is
+  #   (req_tokens - match_len) + load_balance_weight * normalized_load
+  # so weight 0 drops the load term entirely and the rank holding the longest
+  # matching prefix wins outright. Ties -- every rank at match_len 0 on a cold
+  # tree, for instance -- still fall to the least-loaded rank, which is a
+  # hard-coded tie-break in the scoring loop, not a knob.
+  enable_kv_cache_aware_routing: true
+  kv_cache_routing_load_balance_weight: 0.0
+  # Kept on. The first dp_size requests are round-robined by ascending rank
+  # index without scoring at all, so every rank caches the shared system prompt
+  # before scoring starts. Without it the first request seeds one rank, that
+  # rank is then the only one with a nonzero match_len, and with the load term
+  # gone nothing at all pulls traffic back to the others.
+  kv_cache_routing_cold_start_warmup: true
+  # match_rate_threshold (0.1) and fair_share_multiplier (2.0) are left at
+  # their defaults deliberately -- stated here because this file used to pin
+  # the multiplier to 1.5.
+
+# Only present in disaggregated mode. NIXL because the Python transceiver
+# supports only NIXL and DEFAULT; PYTHON because "auto" falls back to the C++
+# transceiver, whose binding takes the V1 BaseKVCacheManager. GLM does run the
+# V1 manager -- its logs show "[KVCacheManager] blocks_per_window" -- so CPP
+# would also bind here, but PYTHON is what the Flash deployment validated end
+# to end and what the reference recipes use.
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  # 10 minutes. The 60s default cancels a request whose KV has not finished
+  # moving, and these contexts run to ~1M tokens.
+  kv_transfer_timeout_ms: 600000
+  # Sized to max_num_tokens below, as in the reference recipes. Must match the
+  # generation worker.
+  max_tokens_in_buffer: 8192
+
+# No cuda_graph_config: graphs need every rank generation-only in the same
+# step, which never happens on a context worker.
+disable_overlap_scheduler: true
+enable_autotuner: false
+enable_chunked_prefill: true
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  # Lower than the aggregated 0.8 and lower than the generation side: this
+  # cache is handed away as soon as prefill finishes.
+  free_gpu_memory_fraction: 0.85
+  host_cache_size: 42949672960
+  tokens_per_block: 64
+
+# 128, not 16. Measured on the Pro deployment (job 514107): eight concurrent
+# 2026-token requests all finished within a 20.60-20.71s window with per-request
+# TTFT at 20.6s against 343ms when sent alone, and the ctx GPU forward time was
+# identical (9420.5ms) whether a request reused 19 KV blocks or 3 -- the prefill
+# the router had saved was being spent waiting instead. The reference dep4-tep4
+# recipe runs 128 here for the same reason.
+#
+# max_num_tokens stays at 8192: that is the chunked-prefill chunk, and it is
+# what actually bounds how much work lands in one step. Raising the batch size
+# only lets the scheduler interleave more requests across those chunks.
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  backend: CUTEDSL
+moe_expert_parallel_size: 4
+
+# Per-request timing and KV block counts, matching what the aggregated
+# deployment collects so the two can be compared on the same numbers.
+perf_metrics_max_requests: 4096
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+
+# No reasoning_parser, no num_postprocess_workers and no stream_interval:
+# every reference recipe declares them on the decode worker only, and this
+# worker's output is discarded by the proxy.
+# No sparse_attention_config here, matching the reference layout. Across the
+# 107 DeepSeek-V4-Pro recipes it is never set on both sides: the 07-04 and
+# 07-14 batches put it on prefill, and every batch from 07-24 onward -- five in
+# a row, including the current 08-10 GB300 set and both r200 sets -- puts it on
+# decode instead. enable_heuristic_topk defaults to False, so the side that
+# omits it simply runs without the heuristic; see glm5.2_gen_tep4.yaml.
+tensor_parallel_size: 4
+trust_remote_code: true

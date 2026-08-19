@@ -63,7 +63,8 @@ scenario_dir = os.path.dirname(scenario_path)
 
 # model.name is constrained so a typo cannot silently produce a new container
 # name, job name and trace directory that look almost right.
-KNOWN_MODELS = ("glm5.2", "deepseek_v4", "deepseek_v4_flash")
+KNOWN_MODELS = ("glm5.2", "deepseek_v4", "deepseek_v4_flash",
+                "deepseek_v4_pro")
 
 # Always-on audit capture is layered on top of these in launch().
 ENV_DEFAULTS = {
@@ -120,14 +121,23 @@ name = "%s_%s" % (cluster, model_key)
 
 model_path = require(model.get("path"), "model.path").rstrip("/")
 
-server_config = require(server.get("config"), "server.config")
-if not os.path.isabs(server_config):
-    server_config = os.path.join(scenario_dir, server_config)
-if not os.path.isfile(server_config):
-    die("server config not found: %s (relative paths resolve against %s)"
-        % (server_config, scenario_dir))
-with open(server_config) as handle:
-    engine = yaml.safe_load(handle) or {}
+def resolve_config(value, what):
+    path = require(value, what)
+    if not os.path.isabs(path):
+        path = os.path.join(scenario_dir, path)
+    if not os.path.isfile(path):
+        die("server config not found: %s (relative paths resolve against %s)"
+            % (path, scenario_dir))
+    return path
+
+
+def ranks_of(path):
+    with open(path) as handle:
+        engine = yaml.safe_load(handle) or {}
+    return (int(engine.get("tensor_parallel_size", 1))
+            * int(engine.get("pipeline_parallel_size", 1))
+            * int(engine.get("context_parallel_size", 1)))
+
 
 # The layout is stated in the YAML; the server config's parallel sizes only
 # cross-check it, so a TP change without a node change fails loudly.
@@ -135,15 +145,51 @@ nodes = int(require(slurm.get("nodes"), "slurm.nodes"))
 tasks_per_node = int(require(slurm.get("gpus_per_node"), "slurm.gpus_per_node"))
 ntasks = nodes * tasks_per_node
 
-tp = int(engine.get("tensor_parallel_size", 1))
-pp = int(engine.get("pipeline_parallel_size", 1))
-cp = int(engine.get("context_parallel_size", 1))
-world_size = tp * pp * cp
-if ntasks != world_size:
-    die("slurm.nodes %d x slurm.gpus_per_node %d = %d ranks, but %s needs "
-        "TP%d x PP%d x CP%d = %d"
-        % (nodes, tasks_per_node, ntasks, os.path.basename(server_config),
-           tp, pp, cp, world_size))
+# server.disagg selects disaggregated serving: a proxy plus context and
+# generation workers, instead of one aggregated server. Its absence keeps the
+# aggregated path byte-for-byte, so existing deployments are unaffected.
+disagg = server.get("disagg") or {}
+if disagg:
+    ctx = disagg.get("ctx") or {}
+    gen = disagg.get("gen") or {}
+    ctx_config = resolve_config(ctx.get("config"), "server.disagg.ctx.config")
+    gen_config = resolve_config(gen.get("config"), "server.disagg.gen.config")
+    ctx_ranks = ranks_of(ctx_config)
+    gen_ranks = ranks_of(gen_config)
+    ctx_instances = int(ctx.get("instances", 1))
+    gen_instances = int(gen.get("instances", 1))
+    # Whole-node ownership. The reference launcher also supports packing two
+    # workers onto one node via a per-worker gpu_map, but that only matters
+    # when a worker's rank count does not divide the node, and it costs the
+    # simple CUDA_VISIBLE_DEVICES=$SLURM_LOCALID mapping used below.
+    for role, role_ranks in (("ctx", ctx_ranks), ("gen", gen_ranks)):
+        if role_ranks % tasks_per_node:
+            die("server.disagg.%s needs %d ranks, which does not divide "
+                "slurm.gpus_per_node %d; whole nodes per worker are required"
+                % (role, role_ranks, tasks_per_node))
+    world_size = ctx_ranks * ctx_instances + gen_ranks * gen_instances
+    if ntasks != world_size:
+        die("slurm.nodes %d x slurm.gpus_per_node %d = %d GPUs, but "
+            "%d ctx x %d + %d gen x %d = %d are needed"
+            % (nodes, tasks_per_node, ntasks, ctx_instances, ctx_ranks,
+               gen_instances, gen_ranks, world_size))
+    server_config = ""
+    tp = pp = 0
+else:
+    server_config = resolve_config(server.get("config"), "server.config")
+    ctx_config = gen_config = ""
+    ctx_ranks = gen_ranks = ctx_instances = gen_instances = 0
+    with open(server_config) as handle:
+        engine = yaml.safe_load(handle) or {}
+    tp = int(engine.get("tensor_parallel_size", 1))
+    pp = int(engine.get("pipeline_parallel_size", 1))
+    cp = int(engine.get("context_parallel_size", 1))
+    world_size = tp * pp * cp
+    if ntasks != world_size:
+        die("slurm.nodes %d x slurm.gpus_per_node %d = %d ranks, but %s needs "
+            "TP%d x PP%d x CP%d = %d"
+            % (nodes, tasks_per_node, ntasks, os.path.basename(server_config),
+               tp, pp, cp, world_size))
 
 env = dict(ENV_DEFAULTS)
 for key, value in (server.get("env") or {}).items():
@@ -172,6 +218,17 @@ emit("CFG_TOOL_PARSER", require(model.get("tool_parser"), "model.tool_parser"))
 # path -- not model.name, which never shows up in it.
 emit("CFG_PROC_PATTERN", os.path.basename(model_path))
 emit("CFG_SERVER_CONFIG", server_config)
+emit("CFG_DISAGG", "1" if disagg else "0")
+emit("CFG_CTX_CONFIG", ctx_config)
+emit("CFG_GEN_CONFIG", gen_config)
+emit("CFG_CTX_RANKS", ctx_ranks)
+emit("CFG_GEN_RANKS", gen_ranks)
+emit("CFG_CTX_INSTANCES", ctx_instances)
+emit("CFG_GEN_INSTANCES", gen_instances)
+# The proxy sits in _wait_for_all_servers_ready for the whole of the slowest
+# worker's model load, so this has to exceed it; the CLI default is 180s, and
+# slurm/benchmark/start_server.sh uses 7200 for both -t and -r.
+emit("CFG_DISAGG_TIMEOUT", int(disagg.get("start_timeout", 7200)) if disagg else 0)
 emit("CFG_REPO_DIR",
      cfg.get("repo_dir") or os.environ.get("SLURM_SUBMIT_DIR") or os.getcwd())
 
@@ -196,7 +253,16 @@ emit("CFG_PORT", server.get("port") or 8333)
 emit("CFG_INSTALL_REPO", "1" if server.get("install_repo", True) else "0")
 emit("CFG_NUMACTL", server.get("numactl") or "")
 emit_array("CFG_SERVE_EXTRA_ARGS", server.get("extra_args") or [])
-emit("CFG_ENV", ",".join("%s=%s" % kv for kv in sorted(env.items())))
+# srun --export is a comma-separated list, so a value containing a comma
+# (UCX_TLS is a transport list) would be split into one bogus entry per
+# element. Quoting does not help: srun does not strip quotes on this path --
+# it hands the task TLLM_LOG_LEVEL='INFO', quotes included. So the two kinds
+# are carried differently: comma-free values go in --export as before, and the
+# rest are set on the srun process itself, which --export=ALL then propagates.
+_plain = {k: v for k, v in env.items() if "," not in v}
+_multi = {k: v for k, v in env.items() if "," in v}
+emit("CFG_ENV", ",".join("%s=%s" % kv for kv in sorted(_plain.items())))
+emit_array("CFG_ENV_MULTI", ["%s=%s" % kv for kv in sorted(_multi.items())])
 
 emit("CFG_CAPTURE", "1" if server.get("capture", True) else "0")
 
@@ -252,6 +318,17 @@ load_config() {
     eval "${resolved}"
 }
 
+# TP/PP describe the single aggregated server and are meaningless once the
+# deployment is split into context and generation workers with their own
+# parallel sizes, so disaggregated runs report their instance layout instead.
+topology_summary() {
+    if [[ "${CFG_DISAGG}" == "1" ]]; then
+        echo "${CFG_CTX_INSTANCES}xctx${CFG_CTX_RANKS} + ${CFG_GEN_INSTANCES}xgen${CFG_GEN_RANKS}"
+    else
+        echo "TP${CFG_TP} x PP${CFG_PP}"
+    fi
+}
+
 parse_args() {
     ARG_YAML=""
     ARG_LABEL=""
@@ -305,7 +382,7 @@ cmd_submit() {
     fi
     sbatch_args+=(${CFG_EXTRA_ARGS[@]+"${CFG_EXTRA_ARGS[@]}"})
 
-    echo "${CFG_NAME}: TP${CFG_TP} x PP${CFG_PP} = ${CFG_WORLD_SIZE} ranks" \
+    echo "${CFG_NAME}: $(topology_summary) = ${CFG_WORLD_SIZE} ranks" \
          "-> ${CFG_NODES} node(s) x ${CFG_TASKS_PER_NODE} GPU(s)"
     echo "model: ${CFG_MODEL_PATH}"
     echo "trace root: ${CFG_TRACE_ROOT}"
@@ -337,6 +414,46 @@ FLEET_END_TIME=0
 # runs under `set -e`: if a stalled filesystem could fail this function, it
 # could take the server down with it. The subshell absorbs both the exit status
 # and any message.
+# /perf_metrics is drain-on-read: each GET returns everything accumulated since
+# the last one and leaves the deque empty. Nothing polls it by default, so the
+# records are simply overwritten as the deque wraps at
+# perf_metrics_max_requests. The reference benchmark suite solves this with a
+# standalone poller process; here the controller already ticks every 10s for the
+# fleet heartbeat, so it drains the endpoints on the same beat and appends to
+# the attempt directory -- which means the files follow a relay to the next
+# backend the way adp_route_trace and anthropic_audit already do.
+#
+# Silent by design: a worker that is still loading, or a proxy without
+# perf_metrics_max_requests set, answers 404/empty and is skipped. Failing here
+# must never take down a serving controller.
+drain_perf_metrics() {
+    local attempt_dir
+    attempt_dir="$(cat "${CONTROL_DIR}/current_attempt_dir" 2>/dev/null || true)"
+    [[ -n "${attempt_dir}" && -d "${attempt_dir}" ]] || return 0
+    local name url
+    for name in "${PERF_TARGET_NAMES[@]:-}"; do
+        [[ -n "${name}" ]] || continue
+        url="${PERF_TARGET_URLS[${name}]}"
+        # A single non-empty JSON array becomes one line per record, each
+        # stamped so a consumer can tell which server and when it was drained.
+        curl -sS --max-time 5 "${url}/perf_metrics" 2>/dev/null \
+            | python3 -c '
+import json, sys, time
+try:
+    records = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not records:
+    sys.exit(0)
+stamp = time.time()
+for record in records:
+    print(json.dumps({"source": sys.argv[1], "drained_at": stamp,
+                      "record": record}, default=str))
+' "${name}" >> "${attempt_dir}/perf_metrics-${name}.jsonl" 2>/dev/null || true
+    done
+    return 0
+}
+
 write_fleet() {
     [[ -n "${FLEET_FILE}" ]] || return 0
     local state
@@ -419,7 +536,15 @@ start_attempt() {
     attempt=$((attempt + 1))
     attempt_dir="${RUN_DIR}/attempt-$(printf '%03d' "${attempt}")"
     mkdir -p "${attempt_dir}"
-    cp "${CFG_SERVER_CONFIG}" "${attempt_dir}/server_config.yaml"
+    # Snapshot every engine config this attempt runs on, so the attempt stays
+    # replayable after the deployment YAML moves on. The generated
+    # disagg_config.yaml is written by launch, which knows the node names.
+    if [[ "${CFG_DISAGG}" == "1" ]]; then
+        cp "${CFG_CTX_CONFIG}" "${attempt_dir}/ctx_config.yaml"
+        cp "${CFG_GEN_CONFIG}" "${attempt_dir}/gen_config.yaml"
+    else
+        cp "${CFG_SERVER_CONFIG}" "${attempt_dir}/server_config.yaml"
+    fi
 
     printf '%s\n' "${attempt}" > "${CONTROL_DIR}/attempt"
     printf '%s\n' "${attempt_dir}" > "${CONTROL_DIR}/current_attempt_dir"
@@ -445,7 +570,7 @@ cmd_run() {
     mapfile -t nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
     if [[ "${#nodes[@]}" -ne "${CFG_NODES}" ]]; then
         die "allocation has ${#nodes[@]} node(s); ${CFG_NAME} needs ${CFG_NODES}" \
-            "(TP${CFG_TP} x PP${CFG_PP} over ${CFG_TASKS_PER_NODE} GPUs per node)"
+            "($(topology_summary) over ${CFG_TASKS_PER_NODE} GPUs per node)"
     fi
 
     # user_MMDDHH_slurmjob_jobname, shared across every attempt of this job.
@@ -464,7 +589,7 @@ cmd_run() {
         echo "model=${CFG_MODEL_KEY}"
         echo "model_path=${CFG_MODEL_PATH}"
         echo "container=${CFG_IMAGE}"
-        echo "topology=TP${CFG_TP}xPP${CFG_PP} on ${CFG_NODES}x${CFG_TASKS_PER_NODE}"
+        echo "topology=$(topology_summary) on ${CFG_NODES}x${CFG_TASKS_PER_NODE}"
         echo "nodes=$(IFS=,; echo "${nodes[*]}")"
         echo "origin=$(git -C "${CFG_REPO_DIR}" config --get remote.origin.url)"
         echo "branch=$(git -C "${CFG_REPO_DIR}" branch --show-current)"
@@ -489,6 +614,38 @@ cmd_run() {
     fi
     FLEET_URL="http://${nodes[0]}:${CFG_PORT}"
     FLEET_FILE="${CFG_FLEET_DIR}/${SLURM_JOB_ID}.json"
+
+    # Where drain_perf_metrics looks. The aggregated path has one server; the
+    # disaggregated path has the proxy plus one endpoint per worker instance,
+    # placed by the same node/port walk launch_disagg uses, so the two stay in
+    # step without the controller reading the generated disagg_config.yaml.
+    PERF_TARGET_NAMES=()
+    declare -gA PERF_TARGET_URLS=()
+    if [[ "${CFG_DISAGG}" == "1" ]]; then
+        PERF_TARGET_NAMES+=("proxy")
+        PERF_TARGET_URLS["proxy"]="http://${nodes[0]}:${CFG_PORT}"
+        local perf_cursor=0 perf_port=$((CFG_PORT + 1)) perf_i perf_role perf_step
+        for perf_role in ctx gen; do
+            if [[ "${perf_role}" == "ctx" ]]; then
+                perf_step=$((CFG_CTX_RANKS / CFG_TASKS_PER_NODE))
+                for ((perf_i = 0; perf_i < CFG_CTX_INSTANCES; perf_i++)); do
+                    PERF_TARGET_NAMES+=("ctx-${perf_i}")
+                    PERF_TARGET_URLS["ctx-${perf_i}"]="http://${nodes[perf_cursor]}:${perf_port}"
+                    perf_cursor=$((perf_cursor + perf_step)); perf_port=$((perf_port + 1))
+                done
+            else
+                perf_step=$((CFG_GEN_RANKS / CFG_TASKS_PER_NODE))
+                for ((perf_i = 0; perf_i < CFG_GEN_INSTANCES; perf_i++)); do
+                    PERF_TARGET_NAMES+=("gen-${perf_i}")
+                    PERF_TARGET_URLS["gen-${perf_i}"]="http://${nodes[perf_cursor]}:${perf_port}"
+                    perf_cursor=$((perf_cursor + perf_step)); perf_port=$((perf_port + 1))
+                done
+            fi
+        done
+    else
+        PERF_TARGET_NAMES+=("server")
+        PERF_TARGET_URLS["server"]="http://${nodes[0]}:${CFG_PORT}"
+    fi
     mkdir -p "${CFG_FLEET_DIR}" 2>/dev/null || true
 
     echo "run dir: ${RUN_DIR}"
@@ -554,6 +711,7 @@ cmd_run() {
                 exit 0
             fi
             write_fleet
+            drain_perf_metrics
         fi
 
         sleep 2
@@ -573,6 +731,7 @@ cleanup_workers() {
                 pkill -${signal} -f '[t]ensorrt_llm.llmapi.mgmn_' || true
                 pkill -${signal} -f '[t]rtllm-llmapi-launch.*${CFG_PROC_PATTERN}' || true
                 pkill -${signal} -f '[t]rtllm-serve.*${CFG_PROC_PATTERN}' || true
+                pkill -${signal} -f '[t]rtllm-serve disaggregated.*${CFG_NAME}' || true
             " || true
         done
         if [[ "${signal}" == "TERM" ]]; then
@@ -631,16 +790,22 @@ cmd_launch() {
         export_env+=",TRTLLM_ANTHROPIC_AUDIT_LOG=${attempt_dir}/anthropic_audit.jsonl"
         export_env+=",TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR=${attempt_dir}/anthropic_message_capture"
     fi
+    # Attention-DP routing decisions, one JSON line per batch that routed
+    # something. Content-free -- request ids, token counts and per-rank prefix
+    # match lengths, no prompt text -- so unlike the two above it is not gated
+    # on server.capture and stays on once the URL is shared. Rank 0 is the only
+    # writer; see PyExecutor._emit_route_trace.
+    export_env+=",TRTLLM_ADP_ROUTE_TRACE=${attempt_dir}/adp_route_trace.jsonl"
 
     trap cleanup_workers EXIT
     trap 'exit 0' INT TERM
     cleanup_workers
 
-    local common=(
+    # Split so the disaggregated path can place each worker itself: everything
+    # here is allocation-wide, and the node placement is appended per srun.
+    local common_base=(
         -l
         --jobid "${SLURM_JOB_ID}"
-        --nodelist "${nodelist}"
-        --nodes "${CFG_NODES}"
         --container-image "${CFG_IMAGE}"
         --container-name "${container_name}"
         --container-mounts "${CFG_MOUNTS}"
@@ -648,12 +813,21 @@ cmd_launch() {
         --mpi=pmix
         --overlap
     )
+    local common=(
+        "${common_base[@]}"
+        --nodelist "${nodelist}"
+        --nodes "${CFG_NODES}"
+    )
 
     # --export=ALL would carry the caller's GPU visibility into the allocation.
     # If the controller was started from another node, those UUIDs do not exist
     # here and enroot fails with "unknown device"; the ranks pick their own GPU
     # from SLURM_LOCALID anyway.
-    local clean_env=(env -u NVIDIA_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES)
+    # CFG_ENV_MULTI holds the env entries whose values contain commas and so
+    # cannot ride in --export; setting them here puts them in srun's own
+    # environment, which --export=ALL carries into every task.
+    local clean_env=(env -u NVIDIA_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES
+                     ${CFG_ENV_MULTI[@]+"${CFG_ENV_MULTI[@]}"})
 
     local install_cmd=(
         "${clean_env[@]}"
@@ -696,8 +870,15 @@ cmd_launch() {
             printf '\n# install:\n'
             format_cmd "${install_cmd[@]}"
         fi
-        printf '\n# serve:\n'
-        format_cmd "${serve_cmd[@]}"
+        if [[ "${CFG_DISAGG}" == "1" ]]; then
+            # serve_cmd describes the aggregated path and is not what runs
+            # here; launch_disagg appends its own sruns to this file as it
+            # starts them.
+            printf '\n# serve (disaggregated):\n'
+        else
+            printf '\n# serve:\n'
+            format_cmd "${serve_cmd[@]}"
+        fi
     } > "${attempt_dir}/launch_cmd.sh"
 
     if [[ "${CFG_INSTALL_REPO}" == "1" ]]; then
@@ -711,7 +892,191 @@ cmd_launch() {
     else
         echo "Anthropic request capture is disabled (server.capture: false)"
     fi
+    if [[ "${CFG_DISAGG}" == "1" ]]; then
+        launch_disagg "${attempt_dir}" "${export_env}" "${common_base[@]}"
+        return
+    fi
     "${serve_cmd[@]}" |& tee "${attempt_dir}/server.log"
+}
+
+# --------------------------------------------------------------------------
+# disaggregated launch: one proxy plus one srun per worker instance
+# --------------------------------------------------------------------------
+#
+# Unlike the aggregated path this is not a single srun. Every worker instance is
+# its own MPI world -- its own `trtllm-llmapi-launch` -- so instances cannot
+# share an srun, and the total is 1 + ctx_instances + gen_instances.
+#
+# Workers find the proxy through service discovery rather than a static url
+# list, which matters for more than convenience: with `disagg_cluster` set,
+# `/health` gates on ctx and gen worker counts (openai_disagg_service.is_ready
+# -> disagg_auto_scaling.is_ready). Without it `is_ready()` returns True
+# unconditionally, so the proxy would answer /health the moment it binds and
+# the gateway would elect a backend that has no workers behind it.
+launch_disagg() {
+    local attempt_dir="$1"; shift
+    local export_env="$1"; shift
+    local common=("$@")
+
+    # Node and port assignment happens up front, because the proxy's config has
+    # to name every worker before any of them starts. serve.sh already owns
+    # this information -- it placed the workers -- so the static url list costs
+    # nothing here, and it buys the readiness semantics the gateway needs:
+    # OpenAIDisaggregatedService.setup() blocks in the FastAPI lifespan on
+    # _wait_for_all_servers_ready(), polling every worker's /health, so the
+    # proxy does not answer at all until the whole deployment is up.
+    #
+    # Service discovery was the other option and is the wrong one here. The
+    # built-in HTTP registry is rejected unless the cluster uri host and the
+    # server host are both loopback (cluster_storage.py:33-43), which no
+    # multi-node job can satisfy, and the etcd alternative adds a process, two
+    # ports, a data directory that must not live on Lustre, and a component
+    # whose death makes the deployment unhealthy -- to buy dynamic membership
+    # that a fixed 1P1D topology never uses. Three of the four reference
+    # launchers under examples/disaggregated use static urls; this follows
+    # slurm/benchmark/submit.py.
+    local proxy_node="${LAUNCH_NODES[0]}"
+    local nodes_per_ctx=$((CFG_CTX_RANKS / CFG_TASKS_PER_NODE))
+    local nodes_per_gen=$((CFG_GEN_RANKS / CFG_TASKS_PER_NODE))
+
+    local ctx_urls=() gen_urls=() ctx_nodes=() gen_nodes=()
+    local i port node_cursor=0 next_port=$((CFG_PORT + 1))
+    for ((i = 0; i < CFG_CTX_INSTANCES; i++)); do
+        ctx_nodes+=("$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_ctx}")")
+        ctx_urls+=("${LAUNCH_NODES[node_cursor]}:${next_port}")
+        node_cursor=$((node_cursor + nodes_per_ctx)); next_port=$((next_port + 1))
+    done
+    for ((i = 0; i < CFG_GEN_INSTANCES; i++)); do
+        gen_nodes+=("$(IFS=,; echo "${LAUNCH_NODES[*]:node_cursor:nodes_per_gen}")")
+        gen_urls+=("${LAUNCH_NODES[node_cursor]}:${next_port}")
+        node_cursor=$((node_cursor + nodes_per_gen)); next_port=$((next_port + 1))
+    done
+
+    {
+        echo "backend: pytorch"
+        echo "hostname: ${proxy_node}"
+        echo "port: ${CFG_PORT}"
+        # DisaggServerConfig.perf_metrics_max_requests defaults to 0, which
+        # leaves the proxy's collector off entirely -- separate from the
+        # per-worker setting in the engine configs. The proxy is the only place
+        # a request's ctx and gen records are joined (on ctx_request_id), so
+        # without this there is no end-to-end view.
+        echo "perf_metrics_max_requests: 4096"
+        echo "context_servers:"
+        echo "  num_instances: ${CFG_CTX_INSTANCES}"
+        echo "  urls:"
+        printf '    - "%s"\n' "${ctx_urls[@]}"
+        echo "generation_servers:"
+        echo "  num_instances: ${CFG_GEN_INSTANCES}"
+        echo "  urls:"
+        printf '    - "%s"\n' "${gen_urls[@]}"
+    } > "${attempt_dir}/disagg_config.yaml"
+
+    local pids=() names=()
+    {
+        printf '# proxy   %s:%s  start/request timeout %ss\n' \
+            "${proxy_node}" "${CFG_PORT}" "${CFG_DISAGG_TIMEOUT}"
+        printf '#   trtllm-serve disaggregated -c %s -t %s -r %s\n' \
+            "${attempt_dir}/disagg_config.yaml" \
+            "${CFG_DISAGG_TIMEOUT}" "${CFG_DISAGG_TIMEOUT}"
+    } >> "${attempt_dir}/launch_cmd.sh"
+
+    # -t must cover the slowest worker's model load, because the proxy spends
+    # that whole time in _wait_for_all_servers_ready; the 180s default would
+    # abort long before a large checkpoint finishes. -r matches it, following
+    # slurm/benchmark/start_server.sh, which uses 7200 for both.
+    "${clean_env[@]}" srun "${common[@]}" \
+        --nodelist "${proxy_node}" --nodes 1 --ntasks 1 \
+        --export="${export_env}" \
+        bash -lc "exec trtllm-serve disaggregated \
+            -c '${attempt_dir}/disagg_config.yaml' \
+            -t '${CFG_DISAGG_TIMEOUT}' -r '${CFG_DISAGG_TIMEOUT}'" \
+        |& tee "${attempt_dir}/server.log" &
+    pids+=($!); names+=("proxy")
+
+    local role config ranks instances url worker_nodes
+    for role in ctx gen; do
+        if [[ "${role}" == "ctx" ]]; then
+            config="${attempt_dir}/ctx_config.yaml"
+            ranks="${CFG_CTX_RANKS}"; instances="${CFG_CTX_INSTANCES}"
+        else
+            config="${attempt_dir}/gen_config.yaml"
+            ranks="${CFG_GEN_RANKS}"; instances="${CFG_GEN_INSTANCES}"
+        fi
+        for ((i = 0; i < instances; i++)); do
+            if [[ "${role}" == "ctx" ]]; then
+                url="${ctx_urls[i]}"; worker_nodes="${ctx_nodes[i]}"
+            else
+                url="${gen_urls[i]}"; worker_nodes="${gen_nodes[i]}"
+            fi
+            port="${url##*:}"
+            # No --server_role and no --disagg_cluster_uri: with a static url
+            # list the proxy already knows which workers are context and which
+            # are generation, and the reference simple_example passes neither.
+            #
+            # --tool_parser is generation-only. It configures the OpenAI HTTP
+            # server rather than TorchLlmArgs, and the proxy drives context
+            # workers with stream=False while keeping nothing but their
+            # disaggregated_params, so a parser there would only ever see
+            # deliberately truncated output -- the exact shape that used to
+            # raise "Incomplete DSML invoke".
+            local parser_args=()
+            if [[ "${role}" == "gen" && -n "${CFG_TOOL_PARSER}" ]]; then
+                parser_args=(--tool_parser "${CFG_TOOL_PARSER}")
+            fi
+            # Each worker is its own engine with its own rank 0, so both would
+            # otherwise append to the one adp_route_trace.jsonl that cmd_launch
+            # put in export_env and the two streams would interleave. Give each
+            # its own file; the aggregated path keeps the undecorated name.
+            local worker_env="${export_env//adp_route_trace.jsonl/adp_route_trace-${role}-${i}.jsonl}"
+            "${clean_env[@]}" srun "${common[@]}" \
+                --nodelist "${worker_nodes}" \
+                --nodes "$([[ ${role} == ctx ]] && echo "${nodes_per_ctx}" || echo "${nodes_per_gen}")" \
+                --ntasks "${ranks}" --ntasks-per-node "${CFG_TASKS_PER_NODE}" \
+                --export="${worker_env}" \
+                bash -lc '
+                    export CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"
+                    # Unset, exactly as the aggregated path does. Pinning the
+                    # reference recipes transport list here instead cost NIXL its
+                    # CUDA support on this container -- UCX registered VRAM as host
+                    # memory and registerMemory aborted (job 513029). Leaving UCX to
+                    # pick is what the Flash bring-up validated (job 505096).
+                    unset UCX_TLS
+                    model="$1"; port="$2"; config="$3"; numa_node="$4"
+                    shift 4
+                    numa=()
+                    if [[ -n "${numa_node}" ]]; then
+                        numa=(numactl -m "${numa_node}")
+                    fi
+                    exec trtllm-llmapi-launch "${numa[@]}" \
+                        trtllm-serve "${model}" \
+                        --host "$(hostname)" \
+                        --port "${port}" \
+                        --config "${config}" \
+                        "$@"
+                ' _ "${CFG_MODEL_PATH}" "${port}" "${config}" "${CFG_NUMACTL}" \
+                ${parser_args[@]+"${parser_args[@]}"} \
+                ${CFG_SERVE_EXTRA_ARGS[@]+"${CFG_SERVE_EXTRA_ARGS[@]}"} \
+                |& tee "${attempt_dir}/${role}-${i}.log" &
+            pids+=($!); names+=("${role}-${i}")
+            echo "  ${role}-${i}: ${ranks} ranks on ${worker_nodes} -> ${url}"
+            {
+                printf '# %-7s %s  %s ranks  config=%s\n' \
+                    "${role}-${i}" "${url}" "${ranks}" "$(basename "${config}")"
+                printf '#   trtllm-llmapi-launch trtllm-serve %s --port %s --config %s %s\n' \
+                    "${CFG_MODEL_PATH}" "${port}" "${config}" "${parser_args[*]}"
+            } >> "${attempt_dir}/launch_cmd.sh"
+        done
+    done
+
+    echo "disagg: proxy on ${proxy_node}:${CFG_PORT}, ${#pids[@]} sruns total"
+    # Any component exiting makes the deployment incomplete, so surface it the
+    # same way the aggregated path surfaces its single server dying: return,
+    # let the trap tear the rest down, and let the controller decide.
+    wait -n "${pids[@]}"
+    local rc=$?
+    echo "a disagg component exited (rc=${rc}); tearing down the rest"
+    return "${rc}"
 }
 
 # --------------------------------------------------------------------------

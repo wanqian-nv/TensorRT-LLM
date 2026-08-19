@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Flash GENERATION worker for 1P1D disaggregated serving: 4 GPUs as
+# DEP4 (attention data-parallel, experts expert-parallel). Paired with
+# deepseek_v4_flash_ctx_tep4.yaml; see that file for why this deployment exists.
+#
+# This side holds KV for the whole decode, so it gets the larger cache fraction
+# and everything on the generation path: CUDA graphs, the reasoning parser, and
+# the postprocess pool the tool parser runs in. `--tool_parser deepseek_v4` is
+# passed on the command line by serve.sh and belongs on THIS worker only.
+
+allreduce_strategy: NCCL
+context_parallel_size: 1
+
+enable_attention_dp: true
+# No attention_dp_config. Across the 400 reference recipes the decode side
+# never sets one -- attention DP itself is on, but the routing knobs belong to
+# the context worker, which is where a prefix is worth matching. Falling back to
+# the defaults also leaves enable_balance at False, which is the setting that
+# matters: _balance_adp_requests is what aborted ranks through the SWA-scratch
+# assertion on the aggregated deployment.
+
+# NIXL, matching the context worker exactly.
+cache_transceiver_config:
+  backend: NIXL
+  # PYTHON, not the "auto" default. auto adopts the model's preferred runtime
+  # and otherwise falls back to the C++ transceiver, and DeepSeek-V4 declares
+  # no transceiver preference -- so auto lands on BindKvCacheTransceiver, whose
+  # binding signature takes bindings.internal.batch_manager.BaseKVCacheManager.
+  # This model family cannot supply one: sparse_attention_config.algorithm
+  # deepseek_v4 routes to DeepseekV4CacheManager, which subclasses
+  # KVCacheManagerV2, and that choice never consults is_disagg. The result is
+  #   TypeError: __init__(): incompatible function arguments
+  # at startup (observed 08-18, job 504831).
+  #
+  # KvCacheTransceiverV2 is pure Python and dispatches on the manager type --
+  # create_cache_reuse_adapter takes Union[KVCacheManager, KVCacheManagerV2] --
+  # so it accepts what this model produces. It supports only NIXL and DEFAULT
+  # backends, which is why NIXL above is load-bearing rather than incidental,
+  # and it requires cp_size == 1, which context_parallel_size satisfies.
+  transceiver_runtime: PYTHON
+  # 10 minutes, matching every reference recipe. The 60s default is a
+  # long-context hazard: a request whose KV does not finish moving in
+  # time is cancelled, and these deployments carry ~1M-token contexts.
+  kv_transfer_timeout_ms: 600000
+  max_tokens_in_buffer: 8192
+
+cuda_graph_config:
+  # Per rank, so 128 here is 512 in flight across the four. Dense at the low end,
+  # widening as the batch grows, reaching max_batch_size: leaving the captured
+  # set was measured at 17.1ms -> 152ms in a single step on the GLM sibling.
+  batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+  enable_padding: true
+
+custom_tokenizer: deepseek_v4_20260731
+enable_autotuner: false
+# No disable_overlap_scheduler here, unlike the context worker: overlap hides
+# host work behind decode steps, and decode is all this worker does.
+
+kv_cache_config:
+  avg_seq_len: 262144
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.85
+  host_cache_size: 42949672960
+  tokens_per_block: 128
+
+max_batch_size: 128
+max_beam_width: 1
+max_input_len: 1048575
+max_num_tokens: 8192
+max_seq_len: 1048576
+
+moe_config:
+  # TRTLLM, not CUTEDSL. This is also what the framework picks for itself:
+  # model_config.py routes DeepseekV4ForCausalLM on sm100-119 to TRTLLM when
+  # moe_backend is AUTO, and every reference recipe states it explicitly.
+  backend: TRTLLM
+  use_low_precision_moe_combine: true
+moe_expert_parallel_size: 4
+
+num_postprocess_workers: 8
+# Per-request timing and KV block counts, surfaced on /perf_metrics and as the
+# per-response perf metrics the audit records carry. Matching what the
+# aggregated deployment collects, so disaggregated and aggregated runs can be
+# compared on the same numbers; the reference recipes use 100000, which retains
+# longer at the cost of a bigger in-process deque.
+perf_metrics_max_requests: 4096
+return_perf_metrics: true
+pipeline_parallel_size: 1
+print_iter_log: true
+reasoning_parser: deepseek_v4
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+  context_chunking_policy: EQUAL_PROGRESS
+sparse_attention_config:
+  algorithm: deepseek_v4
+  # index_topk:
+  enable_heuristic_topk: true
+stream_interval: 20
+tensor_parallel_size: 4
+trust_remote_code: true
+
+# No speculative_config: the 2026-07-31 Flash checkpoint carries DSpark
+# prediction heads, not the layout DeepseekV4MTP loads.

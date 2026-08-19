@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepSeek-V4-Pro on two 4-GPU GB300 nodes of oci-aga-slurm-1, served
+# DISAGGREGATED as 1P1D: one context worker and one generation worker, each
+# TEP4, behind a proxy that speaks the same Anthropic surface as the
+# aggregated deployments.
+#
+#   ./serve.sh gateway --yaml deployments/aga_deepseek_v4_pro.yaml
+#   ./serve.sh submit  --yaml deployments/aga_deepseek_v4_pro.yaml --label bringup
+#
+# Why disaggregated rather than aggregated like the Flash deployment: Pro is
+# 805.3 GiB of weights against Flash's 155, so TP4/EP4 puts ~201 GiB on each
+# GB300 and leaves only ~83 GiB per rank. A single server would have to serve
+# both long prefills and the whole decode working set out of that; splitting
+# the phases lets each side size its KV cache for the job it actually does.
+
+# NOT "aga": every disaggregated deployment here uses the agadisagg prefix, so
+# the fleet directory (cluster_name + model.name) says at a glance which mode a
+# run was. There is no aggregated Pro deployment to collide with today, but the
+# naming should not be the thing that decides that.
+cluster_name: agadisagg
+repo_dir: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/workspace/TensorRT-LLM
+
+model:
+  name: deepseek_v4_pro
+  # The MXFP4 Pro checkpoint, not the NVFP4 one. 64 safetensors shards,
+  # 805.3 GiB, 61 layers, 384 routed experts (top-6), 128 attention heads,
+  # index_topk 1024. Staged in the JET artifacts store, owned by svc-jet and
+  # world-readable, so no copy into this user's tree is needed.
+  #
+  # WHY NOT nvidia_deepseek-v4-pro-nvfp4
+  #   All three NVFP4 variants declare `quant_algo: MIXED_PRECISION` in
+  #   hf_quant_config.json plus a 61- or 62-entry quantized_layers table.
+  #   _build_modelopt_quant_config consumes that table into quant_config_dict
+  #   but never rewrites the global quant_algo, and
+  #   DeepseekV4DecoderLayer.__init__ reads the global one:
+  #     assert quant_config.quant_algo is not QuantAlgo.MIXED_PRECISION
+  #   so the load aborts before any weight is read (observed 08-18, job 504153).
+  #   This checkpoint carries no hf_quant_config.json -- config.json says
+  #   quant_method fp8 with quant_algo null -- so the global value stays
+  #   concrete and the assert passes. The framework then sniffs the routed
+  #   expert dtype from safetensors metadata
+  #   (_detect_deepseek_v4_routed_moe_layout: I8 -> MXFP4, U8 -> NVFP4) and
+  #   builds the per-layer config itself.
+  #
+  # BOTH ARE 4-BIT, despite the "fp8" in config.json: experts are I8-packed
+  # MXFP4 (732.4 GiB) with E8M0 scales at group 32 (45.8 GiB), attention is
+  # FP8 E4M3 (21.6 GiB). The NVFP4 variants are 45 GiB larger only because
+  # their E4M3 scales at group 16 are twice as many, which also makes them the
+  # more accurate quantisation -- worth revisiting if the MIXED_PRECISION
+  # handling is ever fixed.
+  #
+  # hf-5607980_orig rather than the sibling hf-0366e4e_orig: it is newer
+  # (2026-07-06 against 07-01) and is the checkpoint the reference GB300
+  # recipes were measured on. The only config.json difference is
+  # `expert_dtype: fp4` against null, and no TRT-LLM code path reads that key.
+  path: /scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/deepseek-ai_deepseek-v4-pro/hf/hf-5607980_orig
+  # Applied to the GENERATION worker only -- see the note in the gen config.
+  tool_parser: deepseek_v4
+
+slurm:
+  account: coreai_mlperf_inference
+  partition: batch
+  # interactive rather than normal: priority 700 against normal's 100, which
+  # matters because this deployment needs two whole nodes at once and the
+  # normal queue had 170 higher-priority jobs ahead of it. The QoS caps at
+  # MaxTRESPU node=4 with DenyOnLimit -- over the cap the job is rejected at
+  # submit, not queued -- so 1 ctx + 1 gen node is within budget but a second
+  # concurrent deployment on this QoS would not be.
+  qos: interactive
+  time: "4:00:00"
+  # 1 ctx x 4 ranks + 1 gen x 4 ranks = 8 GPUs = 2 whole nodes. serve.sh
+  # cross-checks this against the two server configs at submit time.
+  nodes: 2
+  gpus_per_node: 4
+  extra_args: []
+
+container:
+  image: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/containers/trtllm-devel-sbsa-26.05-16194.sqsh
+  mounts:
+    - /scratch/fsw:/scratch/fsw
+    - /lustre/fsw:/lustre/fsw
+
+server:
+  # The PROXY port on the first allocated node. The workers take the two ports
+  # above it (8334, 8335) and are not addressed by clients. This lives on a GPU
+  # node and is unrelated to gateway.port below.
+  port: 8333
+  install_repo: true
+  # These are GB300 NVL72 nodes with two Grace sockets, and
+  # slurm/benchmark/config.yaml turns numa_bind on for exactly this hardware:
+  # "Only allocate memory from nodes on GB200/GB300 NVL72". Passed to
+  # `numactl -m` in front of each worker.
+  numactl: "0,1"
+  capture: true
+  extra_args: []
+  env:
+    TLLM_PROFILE_LOG_RANKS: all
+    # No UCX_TLS. The reference recipes pin it to
+    # "cuda_ipc,cuda_copy,sm,self,tcp", and copying that here broke NIXL
+    # outright on this container (job 513029): UCX reported "4 NVIDIA GPU(s)
+    # were detected, but UCX CUDA support was not found", then "VRAM memory is
+    # detected as host by UCX", and NixlTransferAgent::registerMemory aborted on
+    # status == NIXL_SUCCESS. Those recipes run nvcr.io/nvidia/tensorrt-llm/
+    # release:1.3.0rc24; this deployment runs a locally built sbsa image whose
+    # UCX does not accept that transport list. serve.sh unsets UCX_TLS instead,
+    # which is the state the Flash disaggregated bring-up (job 505096) validated
+    # end to end -- NIXL registered and a request completed.
+  # Presence of this block selects disaggregated serving.
+  disagg:
+    ctx:
+      config: server_configs/deepseek_v4_pro_ctx_tep4.yaml
+      instances: 1
+    gen:
+      config: server_configs/deepseek_v4_pro_gen_tep4.yaml
+      instances: 1
+
+trace:
+  root: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/claude-traces
+
+gateway:
+  # 8333, the same port agadisagg_deepseek_v4_flash and aga_deepseek_v4_flash
+  # use. The fleet directories differ (cluster_name + model.name), so their
+  # backends never mix, but only one of the three can hold the port at a time --
+  # they are alternatives, not neighbours. agadisagg_glm5.2 is on 8334 and can
+  # run alongside any of them.
+  port: 8333
+  account: coreai_mlperf_inference
+  partition: cpu
+  qos: cpu-long
+  time: "7-00:00:00"
+  users: gateway_users.txt
+  # Pro is 850 GiB against Flash's 155, and a disaggregated start has to bring
+  # up three processes rather than one, so the successor needs longer than the
+  # 30 minutes the Flash deployment uses. Raise further if the observed
+  # submit-to-healthy time gets close to this.
+  lead_time: 2700
+  extra_args: ["--exclusive"]
