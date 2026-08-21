@@ -171,7 +171,16 @@ def analyze_records(
             )
             turns.append(turn)
 
-            for result in record.get("tool_results_in_last_message") or []:
+            # Scan the whole history, not just the last message. Claude Code
+            # often appends a system message after a tool result, which hides
+            # the result from a last-message scan and leaves the call forever
+            # unmatched -- measured at 21-26% of calls. Re-reading history is
+            # safe because pending_calls.pop removes an id on first match, so
+            # a result can only ever match once, and history is append-only,
+            # so that first match is the turn the result actually arrived in.
+            # Measured effect: unmatched 20.9% -> 0.0% and 25.7% -> 1.7% on
+            # two real traces, recovering the long tail (max gap 59s -> 190s).
+            for result in record.get("tool_results_in_request") or []:
                 tool_use_id = result.get("tool_use_id")
                 pending = pending_calls.pop(tool_use_id, None)
                 if pending is None:

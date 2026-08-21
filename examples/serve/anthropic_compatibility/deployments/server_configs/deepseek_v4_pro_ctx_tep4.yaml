@@ -115,10 +115,19 @@ kv_cache_config:
 # the router had saved was being spent waiting instead. The reference dep4-tep4
 # recipe runs 128 here for the same reason.
 #
-# max_num_tokens stays at 8192: that is the chunked-prefill chunk, and it is
-# what actually bounds how much work lands in one step. Raising the batch size
-# only lets the scheduler interleave more requests across those chunks.
-max_batch_size: 128
+# Back to 16. 128 was set off a synthetic test -- eight concurrent 2026-token
+# requests, where raising it cut the ctx GPU forward time from 9420ms to 3239ms
+# because the scheduler could finally interleave them across chunks. Real
+# traffic is not that shape: a single Claude Code prompt runs to tens of
+# thousands of tokens, and at 128 the scheduler admitted far more work per step
+# than the startup profiling had measured. The MoE kernel then asked for
+# 3.93 GiB with 709 MiB free and the rank died (job 525279, 22:08).
+#
+# The headroom is not recoverable by lowering free_gpu_memory_fraction either:
+# _cal_max_memory splits what is left AFTER the profiled peak, so the KV pool
+# is already committed by the time activations grow. Bounding the batch is what
+# keeps the step within what profiling saw.
+max_batch_size: 16
 max_beam_width: 1
 max_input_len: 1048575
 max_num_tokens: 8192

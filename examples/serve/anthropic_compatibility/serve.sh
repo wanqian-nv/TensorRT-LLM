@@ -574,7 +574,12 @@ cmd_run() {
     fi
 
     # user_MMDDHH_slurmjob_jobname, shared across every attempt of this job.
-    RUN_DIR="${CFG_TRACE_ROOT}/${USER}_$(date +%m%d%H)_${SLURM_JOB_ID}_${CFG_NAME}"
+    # Date-partitioned: <root>/2026-08/19/serli_081914_... . The flat layout
+    # reached 122 sibling directories, which made finding a specific run a
+    # matter of reading job ids. Nothing globs the trace root itself -- the
+    # gateway only reads _fleet/<deployment>/*.json, and every consumer takes
+    # an absolute run directory -- so the extra levels are free.
+    RUN_DIR="${CFG_TRACE_ROOT}/$(date +%Y-%m)/$(date +%d)/${USER}_$(date +%m%d%H)_${SLURM_JOB_ID}_${CFG_NAME}"
     if [[ -n "${ARG_LABEL}" ]]; then
         RUN_DIR="${RUN_DIR}_${ARG_LABEL}"
     fi
@@ -622,8 +627,14 @@ cmd_run() {
     PERF_TARGET_NAMES=()
     declare -gA PERF_TARGET_URLS=()
     if [[ "${CFG_DISAGG}" == "1" ]]; then
-        PERF_TARGET_NAMES+=("proxy")
-        PERF_TARGET_URLS["proxy"]="http://${nodes[0]}:${CFG_PORT}"
+        # The proxy is deliberately NOT a target. Its /perf_metrics handler is
+        # what makes it poll the workers -- DisaggPerfMetricsCollector.
+        # get_perf_metrics calls collect_metrics() on each client, and the
+        # worker endpoints are drain-on-read. So a GET here does not just return
+        # nothing useful (the collector is off, see launch_disagg); it also
+        # empties both workers' queues on the way, and those records are then
+        # dropped because nothing pairs with them. Leaving the proxy alone is
+        # what lets the two worker drains below see every request.
         local perf_cursor=0 perf_port=$((CFG_PORT + 1)) perf_i perf_role perf_step
         for perf_role in ctx gen; do
             if [[ "${perf_role}" == "ctx" ]]; then
@@ -956,12 +967,28 @@ launch_disagg() {
         echo "backend: pytorch"
         echo "hostname: ${proxy_node}"
         echo "port: ${CFG_PORT}"
-        # DisaggServerConfig.perf_metrics_max_requests defaults to 0, which
-        # leaves the proxy's collector off entirely -- separate from the
-        # per-worker setting in the engine configs. The proxy is the only place
-        # a request's ctx and gen records are joined (on ctx_request_id), so
-        # without this there is no end-to-end view.
-        echo "perf_metrics_max_requests: 4096"
+        # The proxy's collector stays OFF (0 is also the DisaggServerConfig
+        # default). Turning it on costs almost every request's metrics.
+        #
+        # DisaggPerfMetricsCollector.get_perf_metrics polls each worker's own
+        # /perf_metrics, which is drain-on-read, and files what it finds under
+        # _server_metrics[server]. It then emits only the entries that pair with
+        # something in _request_meteics -- and that list is appended to by
+        # RawRequestResponseHooks.on_resp_done, gated on
+        # request.disaggregated_params. Streaming responses do not satisfy it:
+        # measured over one backend, 1009 of 1016 requests were streaming and
+        # exactly 7 records came out, matching the 7 non-streaming ones. The
+        # other 1009 requests' worker metrics were drained by the proxy, parked
+        # in memory, never matched, and dropped once the map hit its cap.
+        #
+        # Claude Code streams everything, so leaving the proxy collector on
+        # loses queue time, KV transfer size and duration, block reuse counts
+        # and ctx GPU forward time for ~99% of traffic -- and KV transfer timing
+        # has no other source at all. With the collector off the proxy stops
+        # polling, the controller's own drain reaches both workers directly, and
+        # every request is covered. The ctx/gen join the proxy would have done
+        # is reproducible offline: both sides carry ctx_request_id, and the
+        # route trace and audit records key on it too.
         echo "context_servers:"
         echo "  num_instances: ${CFG_CTX_INSTANCES}"
         echo "  urls:"

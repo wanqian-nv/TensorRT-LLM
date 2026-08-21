@@ -61,15 +61,23 @@ model:
 
 slurm:
   account: coreai_mlperf_inference
-  partition: batch
+  # batch_long, not batch. Same 5400 nvl72 nodes, same AllowQos=ALL and
+  # AllowAccounts=ALL, but MaxTime is 7 days against batch's 4 hours. At 4h a
+  # relay landed every ~3h15m -- and a relay is not free: the successor loads
+  # 805 GiB before it can take over, so two jobs hold 4 nodes for the ~7
+  # minutes that overlap, and every changeover is a chance to hit the
+  # shutdown-path abort that killed job 521036.
+  partition: batch_long
   # interactive rather than normal: priority 700 against normal's 100, which
-  # matters because this deployment needs two whole nodes at once and the
-  # normal queue had 170 higher-priority jobs ahead of it. The QoS caps at
-  # MaxTRESPU node=4 with DenyOnLimit -- over the cap the job is rejected at
-  # submit, not queued -- so 1 ctx + 1 gen node is within budget but a second
-  # concurrent deployment on this QoS would not be.
+  # matters because two whole nodes must land at once. The QoS caps at
+  # MaxTRESPU node=4 with DenyOnLimit, so this deployment's 2 nodes leave room
+  # for one more 2-node deployment and no more.
   qos: interactive
-  time: "4:00:00"
+  # 24h. Not the full 7 days the partition allows: a serving job that has run
+  # for a day has usually drifted from whatever the config file now says, and
+  # one changeover per day is a cheap way to keep the two in step. Raise it if
+  # the relay itself becomes the problem.
+  time: "24:00:00"
   # 1 ctx x 4 ranks + 1 gen x 4 ranks = 8 GPUs = 2 whole nodes. serve.sh
   # cross-checks this against the two server configs at submit time.
   nodes: 2
@@ -131,9 +139,10 @@ gateway:
   qos: cpu-long
   time: "7-00:00:00"
   users: gateway_users.txt
-  # Pro is 850 GiB against Flash's 155, and a disaggregated start has to bring
-  # up three processes rather than one, so the successor needs longer than the
-  # 30 minutes the Flash deployment uses. Raise further if the observed
-  # submit-to-healthy time gets close to this.
+  # 45 minutes. Measured submit-to-healthy on this deployment is ~7 minutes for
+  # 805 GiB across two workers, so the margin is wide -- but a successor that
+  # is not ready when the incumbent's wall clock runs out means a gap in
+  # service, and the incumbent does not release its allocation early, so lead
+  # time beyond the startup cost is time spent holding four nodes to serve two.
   lead_time: 2700
   extra_args: ["--exclusive"]

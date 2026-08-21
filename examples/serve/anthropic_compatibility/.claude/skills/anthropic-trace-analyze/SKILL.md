@@ -10,6 +10,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Audit trace analysis skill
 
+Scope: the Anthropic audit log — per-turn cache health and tool loops, with
+root-cause drill-down into captured request bodies. For a whole-run picture
+that also covers prefill-server iterations and the wall-clock decomposition,
+use `trtllm-perf-report`, which calls back here for the anomaly analysis.
+
 **Skill base directory** (all relative paths below are relative to this):
 `TensorRT-LLM/examples/serve/anthropic_compatibility/`
 
@@ -435,12 +440,14 @@ Two systematic limits — state them whenever you report tool-gap statistics:
   timeout (`max 600000` ms), not a real job duration. Long jobs are also commonly
   launched with `run_in_background`, which returns immediately, so their duration
   never enters this metric at all.
-- **Unmatched tool loops carry no gap.** `analyze_audit.py` matches results via
-  `tool_results_in_last_message`; when the client appends a system message after a
-  tool result, the result is no longer in the last message and the call never
-  matches. Observed unmatched rates: 24–27%, dominated by `Bash`. Report the
-  unmatched count alongside any gap percentile.
+- **Unmatched tool loops carry no gap.** Report the unmatched count alongside
+  any gap percentile. It should now be near zero; a large one means something
+  new is hiding results.
 
-Do not switch the matching to `tool_results_in_request` — that field is the
-cumulative count over the entire history, so it would re-match every historical
-result on every request.
+`analyze_audit.py` matches results by scanning `tool_results_in_request` — the
+whole history — and popping the id from the pending set on first match. The
+earlier last-message-only scan missed every result the client buried behind a
+trailing system message, leaving 21–26% of calls unmatched and truncating the
+long tail (max gap 59s where the true value was 190s). Re-reading history is
+safe precisely because of the pop: an id matches once, and since history is
+append-only, that first match is the turn the result arrived in.
