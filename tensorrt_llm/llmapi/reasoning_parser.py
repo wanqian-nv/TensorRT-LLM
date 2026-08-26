@@ -231,8 +231,13 @@ class DeepSeekR1Parser(BaseReasoningParser):
         # `qwen3` key deliberately keeps `reasoning_at_start=False` for
         # back-compat (see the note above this class), so an `enable_thinking`
         # of True must not silently flip it.
+        # A `thinking` of True outranks it. The two keys are two spellings of
+        # one switch, so a caller that sets them apart is contradicting itself
+        # and the OR the wrappers apply decides; the server writes both to the
+        # same value, so this only affects hand-written kwargs.
         if (isinstance(chat_template_kwargs, dict)
-                and chat_template_kwargs.get("enable_thinking") is False):
+                and chat_template_kwargs.get("enable_thinking") is False
+                and chat_template_kwargs.get("thinking") is not True):
             reasoning_at_start = False
         self.reasoning_start = "<think>"
         self.reasoning_end = "</think>"

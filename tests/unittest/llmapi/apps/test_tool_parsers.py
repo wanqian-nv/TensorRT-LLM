@@ -1963,6 +1963,26 @@ class TestDeepSeekDsmlStreamingDegradation:
         assert "chatter" in result.normal_text
         assert result.calls[0].name == "get_weather"
 
+    def test_prose_that_diverges_from_the_invoke_marker_survives_finish(
+            self, parser_cls, sample_tools):
+        """The bare marker is not a tool call, so prose must not be captured.
+
+        `<｜DSML｜invoke` occurs verbatim in prose about the format, and a real
+        header always continues with `name="`. Treating the marker alone as a
+        call strands the rest of the text in the buffer and leaves
+        `_inside_tool_calls` set, so `finish()` raises and takes the whole
+        response with it.
+        """
+        parser = parser_cls()
+        deltas = ["Use <｜DSML｜function", "ality and <｜DSML｜invoke", "ality"]
+
+        streamed = "".join(
+            parser.parse_streaming_increment(delta, sample_tools).normal_text
+            for delta in deltas)
+        streamed += parser.finish(sample_tools).normal_text
+
+        assert streamed == "".join(deltas)
+
     def test_eos_inside_tool_section_does_not_fail_stream(
             self, parser_cls, sample_tools):
         parser = parser_cls()

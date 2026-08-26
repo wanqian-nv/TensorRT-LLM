@@ -71,6 +71,16 @@ class DeepSeekV32Parser(BaseToolParser):
     # Invoke header up to the function name, which is arbitrary text.
     _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
 
+    # The marker on its own is ambiguous -- it opens a real invoke header, but
+    # it also occurs verbatim in prose. `_invoke_marker_state` tells them apart.
+    _INVOKE_MARKER = "<｜DSML｜invoke"  # nosec B105
+    # Whitespace is whatever the template rendered, so match it the way
+    # `invoke_pattern` does rather than assuming a single space.
+    _INVOKE_HEADER_RE = re.compile(r'<｜DSML｜invoke\s+name="')
+    # Prefixes of `name="` that a partial header may have reached so far.
+    _INVOKE_HEADER_CONTINUATIONS = ('n', 'na', 'nam', 'name', 'name=',
+                                    'name="')
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"  # nosec B105
@@ -172,10 +182,36 @@ class DeepSeekV32Parser(BaseToolParser):
         return (
             self.bot_token,
             self.eot_token,
-            "<｜DSML｜invoke",
+            self._INVOKE_MARKER,
             self.invoke_end_token,
             self._eos_token,
         )
+
+    def _invoke_marker_state(self, text: str) -> str:
+        """Classify text that starts with the bare invoke marker.
+
+        The marker alone does not make a tool call: a real header continues
+        with ``name="``. Prose may also contain the marker and then diverge
+        (``<｜DSML｜invoke`` + ``ality``), and treating that as a tool call
+        strands it in the buffer and makes ``finish()`` abort the response.
+
+        Returns ``"header"`` when a real invoke header is already present,
+        ``"partial"`` while more characters could still complete one, and
+        ``"text"`` once the continuation has ruled a header out.
+        """
+        if self._INVOKE_HEADER_RE.match(text):
+            return "header"
+        rest = text[len(self._INVOKE_MARKER):]
+        if rest == "" or rest.isspace():
+            return "partial"
+        stripped = rest.lstrip()
+        # Whitespace must separate the marker from `name="`, so a continuation
+        # that never had any cannot become a header.
+        if len(rest) > len(stripped) and any(
+                continuation.startswith(stripped)
+                for continuation in self._INVOKE_HEADER_CONTINUATIONS):
+            return "partial"
+        return "text"
 
     def _ambiguous_suffix_length(self, text: str) -> int:
         """Find the longest suffix that still may become a control token."""
@@ -279,7 +315,19 @@ class DeepSeekV32Parser(BaseToolParser):
                     self._inside_tool_calls = True
                     self._expects_tool_calls_end = True
                     continue
-                if token == "<｜DSML｜invoke":
+                if token == self._INVOKE_MARKER:
+                    state = self._invoke_marker_state(self._buffer)
+                    if state == "partial":
+                        # Could still become a header; wait for the next chunk
+                        # rather than committing either way.
+                        break
+                    if state == "text":
+                        # Prose that merely looks like a marker. Emit it and
+                        # keep scanning after it.
+                        normal_parts.append(self._INVOKE_MARKER)
+                        self._consume_normal_text(self._INVOKE_MARKER)
+                        self._buffer = self._buffer[len(self._INVOKE_MARKER):]
+                        continue
                     self._inside_tool_calls = True
                     self._expects_tool_calls_end = False
                     continue

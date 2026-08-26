@@ -324,6 +324,20 @@ def _render_user_content(message: dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
+def _only_reminders_follow(index: int, messages: list[dict[str, Any]]) -> bool:
+    """True when every message after `index` is a ``latest_reminder``.
+
+    A reminder carries its own token but never emits a turn boundary, so when
+    reminders are all that remains there is no assistant message for the
+    preceding user turn to hand the floor to. Deferring the handoff past them
+    keeps the prompt ending on it; emitting it early leaves the prompt ending
+    inside the reminder text with the assistant turn already open, and the
+    model continues the document instead of answering.
+    """
+    rest = messages[index + 1:]
+    return bool(rest) and all(m.get("role") == "latest_reminder" for m in rest)
+
+
 def _render_message(
     index: int,
     messages: list[dict[str, Any]],
@@ -417,12 +431,19 @@ def _render_message(
             prompt += ASSISTANT_TOKEN
             prompt += THINKING_START_TOKEN if thinking_mode == "thinking" else THINKING_END_TOKEN
         prompt += VALID_TASKS[task]
-    elif role in ("user", "developer") and (next_role == "assistant" or add_generation_prompt):
+    elif role in ("user", "developer") and (
+            next_role == "assistant"
+            or (add_generation_prompt and not _only_reminders_follow(index, messages))):
         prompt += ASSISTANT_TOKEN
         if thinking_mode == "thinking" and (not drop_thinking or index >= last_user_index):
             prompt += THINKING_START_TOKEN
         else:
             prompt += THINKING_END_TOKEN
+    elif role == "latest_reminder" and next_role is None and add_generation_prompt:
+        # Deferred from the user turn above so the prompt ends on the boundary
+        # rather than inside the reminder text.
+        prompt += ASSISTANT_TOKEN
+        prompt += THINKING_START_TOKEN if thinking_mode == "thinking" else THINKING_END_TOKEN
 
     return prompt
 
@@ -511,6 +532,12 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
         revision: str | None = None,
         **kwargs,
     ) -> "DeepseekV4Tokenizer":
+        # AutoTokenizer resolves the checkpoint config first, and the
+        # deepseek_v4 model_type is invisible to stock transformers; the
+        # registration is an import side effect of tensorrt_llm._torch.configs
+        # (previously guaranteed by the eager `import tensorrt_llm`).
+        import tensorrt_llm._torch.configs  # noqa: F401
+
         tokenizer = AutoTokenizer.from_pretrained(
             path_or_repo_id,
             *args,

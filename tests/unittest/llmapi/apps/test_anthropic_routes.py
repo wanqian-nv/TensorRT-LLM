@@ -433,7 +433,11 @@ def test_messages_route_records_adjacent_prompt_lcp(tmp_path, monkeypatch):
     assert records[1]["current_reuse_opportunity_ratio"] == 0.5
 
 
-def test_standard_and_disagg_register_messages_route():
+def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
+    # Registering the disagg routes also mounts a Prometheus multiprocess
+    # collector, which refuses to build without a real directory.
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+
     standard = object.__new__(OpenAIServer)
     standard.app = FastAPI()
     standard.generator = SimpleNamespace(
@@ -452,6 +456,7 @@ def test_standard_and_disagg_register_messages_route():
         get_perf_metrics=AsyncMock()
     )
     disagg._disagg_cluster_storage = None
+    disagg._coordinator = None
     disagg.register_routes()
 
     for server in (standard, disagg):
