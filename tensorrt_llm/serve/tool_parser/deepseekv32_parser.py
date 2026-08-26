@@ -68,6 +68,9 @@ class DeepSeekV32Parser(BaseToolParser):
 
     _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
 
+    # Invoke header up to the function name, which is arbitrary text.
+    _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"  # nosec B105
