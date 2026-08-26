@@ -1,0 +1,6 @@
+# Generated performance reports: perf_report.py writes REPORT.html plus the
+# per-request, per-session and per-iteration CSVs here (REPORTS_ROOT), and
+# build_index.py adds index.html. Iteration-grain files run to tens of MB even
+# gzipped, so they stay out of the tree's history.
+_reports/
+_reports_pending/

@@ -8,7 +8,13 @@ per-request perf metrics the controller drained, the attention-DP routing
 trace, and the per-rank iteration logs -- and emits four CSVs plus a single
 self-contained HTML report.
 
-    python3 analysis/perf_report.py <attempt_dir> [--out DIR]
+    python3 analysis/perf_report.py <attempt_dir>… [--out LABEL]
+
+Every report lands in one place -- `REPORTS_ROOT/<label>`, defaulting to the
+run's own name -- and never beside the run it describes. An attempt directory
+is raw capture: it gets re-run, rsynced and cleaned up, while a report is the
+thing you link to. Collecting them also gives `build_index.py` a directory to
+rank, which it can only do over siblings, since the index links relatively.
 
 Sections, and the CSV each one leaves behind for re-analysis:
 
@@ -35,10 +41,11 @@ import csv
 import gzip
 import io
 import json
+import os
 import re
 import statistics
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -50,8 +57,27 @@ _KV_PAIR = re.compile(r"(\w+) = ")
 # tokens per block=64, primary blocks=36506, secondary blocks=13359, ...
 _KV_CAPACITY = re.compile(
     r"\[batchmgr\]\[RANK (\d+)\].*tokens per block=(\d+), primary blocks=(\d+)")
+# The v2 manager's startup banner. Its presence is the only way to recognise
+# a v2 run whose logs predate the cross-tier counters, and on those runs
+# alloc_total - alloc_new is a zero that means nothing rather than no
+# evictions -- see _kv_deltas.
+_KV_V2 = re.compile(r"KV cache manager v2")
 
 HIT_RATE_FLOOR = 0.90  # below this a request is called out for investigation
+
+# Where every report goes: `_reports` beside this checkout, not beside the runs
+# it describes. The trace root holds raw capture that gets rsynced and cleaned
+# up, and it is read-only to some callers; a report is the thing you link to and
+# open, so it lives where the editor already has the tree loaded. `.gitignore`
+# keeps it out of `git status`. A different trace root (computelab has its own)
+# sets PERF_REPORTS_DIR; build_index.py reads the same variable, and the two
+# must agree or the index misses reports.
+REPORTS_ROOT = Path(os.environ.get(
+    "PERF_REPORTS_DIR",
+    "/lustre/fsw/portfolios/coreai/users/serli/workspace/TensorRT-LLM"
+    "/examples/serve/anthropic_compatibility/_reports"))
+
+_ATTEMPT_DIR = re.compile(r"attempt-\d+")
 
 
 # --------------------------------------------------------------------------
@@ -64,6 +90,20 @@ def _f(value: Any) -> float | None:
         return None
 
 
+def _f_list(value: Any) -> list[float] | None:
+    """A slash-joined per-pool-group vector, as the worker writes it.
+
+    Slash rather than a list literal because the iteration log is parsed as
+    ``key = value, `` pairs and a ``[1, 2, 3]`` would split across three of
+    them. None when absent, never an empty list: a run written before the
+    per-group fields existed must not read as a run with zero pool groups.
+    """
+    if value in (None, ""):
+        return None
+    out = [_f(part) for part in str(value).split("/")]
+    return None if any(v is None for v in out) else out
+
+
 def _parse_iso(value: str | None) -> float | None:
     if not value:
         return None
@@ -71,6 +111,41 @@ def _parse_iso(value: str | None) -> float | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def parse_bound(value: str | None) -> float | None:
+    """One end of the analysis window, as epoch seconds.
+
+    A naive stamp is read as *local* time, which is the iteration logs'
+    convention (`timestamp = 2026-08-21 16:59:23`); the audit log writes UTC
+    with an explicit offset and is unambiguous either way. Pass the offset when
+    the two machines disagree -- the report prints the resolved window in both
+    forms so a mistake is visible rather than silently shifting every figure.
+    """
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise SystemExit(f"cannot read {value!r} as an ISO-8601 instant")
+    return (stamp if stamp.tzinfo else stamp.astimezone()).timestamp()
+
+
+def _inside(value: float | None, window: tuple[float | None, float | None]) -> bool:
+    """Whether an epoch stamp falls in the window, with no window meaning yes.
+
+    An unplaceable row -- no stamp at all -- is kept when nothing is being
+    filtered and dropped when something is, because a row that cannot be dated
+    cannot be claimed to belong to the window. ``_apply_window`` counts those
+    separately so the report can say how many were lost that way.
+    """
+    since, until = window
+    if since is None and until is None:
+        return True
+    if value is None:
+        return False
+    return ((since is None or value >= since)
+            and (until is None or value <= until))
 
 
 def _pct(values: Iterable[float | None], q: float) -> float | None:
@@ -141,8 +216,16 @@ class Run:
     def __init__(self, attempt_dir: Path):
         self.dir = attempt_dir
         self.audit = attempt_dir / "anthropic_audit.jsonl"
-        self.perf = sorted(attempt_dir.glob("perf_metrics-*.jsonl"))
+        # disagg_config's perf_metrics_output_dir sends these to a
+        # ``perf_metrics/`` subdirectory on newer runs; older ones drop them
+        # beside the logs. Both layouts are in the wild, so take either.
+        self.perf = sorted(attempt_dir.glob("perf_metrics-*.jsonl")) + sorted(
+            attempt_dir.glob("perf_metrics/perf_metrics-*.jsonl"))
         self.route = sorted(attempt_dir.glob("adp_route_trace*.jsonl"))
+        # Client ids seen under more than one worker; set by build_requests.
+        # Non-zero means those requests carry no routing columns rather than
+        # another worker's, which is the tradeoff that keeps the join honest.
+        self.route_client_ambiguous = 0
         # Worker logs. Disaggregated runs name them by role; aggregated runs
         # write a single server.log.
         self.iter_logs = sorted(attempt_dir.glob("ctx-*.log")) + sorted(
@@ -171,6 +254,33 @@ class Run:
     def worker_name(self, path: Path) -> str:
         return path.stem
 
+    def kv_manager_v2(self) -> bool:
+        """Whether the workers ran the v2 KV cache manager.
+
+        Read from the startup banner rather than inferred from the cross-tier
+        counters, because those counters only exist on logs written after they
+        were added: a v2 run from before that would otherwise keep reporting
+        ``alloc_total - alloc_new`` as a measured zero eviction count, which is
+        the one number on this report that has been actively misleading.
+
+        Only the head of one log is scanned. The banner is printed during
+        engine construction, before any iteration line, and these files reach
+        several gigabytes.
+        """
+        cached = getattr(self, "_kv_v2", None)
+        if cached is None:
+            cached = False
+            for path in (self.prefill_logs() + self.decode_logs())[:1]:
+                with path.open(encoding="latin-1", errors="replace") as handle:
+                    for line in handle:
+                        if _KV_V2.search(line):
+                            cached = True
+                            break
+                        if _ITER_LINE.search(line):
+                            break
+            self._kv_v2 = cached
+        return cached
+
 
 def parse_iter_log(path: Path) -> list[dict]:
     """One row per (rank, iteration) from a worker's stdout log.
@@ -178,8 +288,18 @@ def parse_iter_log(path: Path) -> list[dict]:
     The log is `key = value, ` pairs ending in a Python dict literal, and the
     file can carry stray control bytes from the launcher's tee, so it is read
     as latin-1 and matched loosely.
+
+    One log holds more than one engine lifetime. Sizing the KV pool builds a
+    throwaway engine first, runs it, measures, and tears it down before the
+    real one starts -- and each gets its own ``PyExecutor``, so each restarts
+    ``iter`` at 1. Rows are tagged with an ``instance`` that advances whenever a
+    rank's counter goes backwards. Nothing is dropped: the estimation pass is
+    real work the GPU did. It is only kept *apart*, so its iteration 1 does not
+    merge with the real engine's into one row averaging two different pools.
     """
     rows: list[dict] = []
+    instance = 0
+    seen_iter: dict[int, int] = {}
     with path.open(encoding="latin-1", errors="replace") as handle:
         for line in handle:
             if not _ITER_LINE.search(line):
@@ -203,9 +323,19 @@ def parse_iter_log(path: Path) -> list[dict]:
                 continue
             fetched = row.get("currank_total_requests", "")
             cur, _, glob = fetched.partition("/")
+            iteration, rank = int(row["iter"]), int(row.get("rank", -1))
+            # Not advancing is the restart signal, not merely going backwards:
+            # within one engine a rank's counter strictly increases, and the
+            # estimation pass can be a single iteration, so the real engine's
+            # first line repeats the value rather than dropping below it.
+            if iteration <= seen_iter.get(rank, 0):
+                instance += 1
+                seen_iter.clear()
+            seen_iter[rank] = iteration
             rows.append({
-                "iter": int(row["iter"]),
-                "rank": int(row.get("rank", -1)),
+                "instance": instance,
+                "iter": iteration,
+                "rank": rank,
                 "global_rank": int(row.get("global_rank", -1)),
                 "num_scheduled_requests": int(row.get("num_scheduled_requests", 0)),
                 # Added by this fork; absent on older logs.
@@ -216,6 +346,25 @@ def parse_iter_log(path: Path) -> list[dict]:
                 "kv_missed_blocks": _f(row.get("kv_missed_blocks")),
                 "kv_alloc_total_blocks": _f(row.get("kv_alloc_total_blocks")),
                 "kv_alloc_new_blocks": _f(row.get("kv_alloc_new_blocks")),
+                # Levels, not counters: how the pool's slots stand right now.
+                # Absent before the fields were added, and None is the whole
+                # point -- a run without them must not report a full pool as an
+                # empty one.
+                "kv_free_blocks": _f(row.get("kv_free_blocks")),
+                "kv_evictable_blocks": _f(row.get("kv_evictable_blocks")),
+                # The same two, split per pool group. The sums above cannot
+                # show one saturated group, and a saturated group is what
+                # drives eviction: the manager sizes each eviction off a single
+                # group's free-slot count. Absent on logs written before the
+                # worker emitted them.
+                "kv_free_blocks_by_pg": _f_list(row.get("kv_free_blocks_by_pg")),
+                "kv_evictable_blocks_by_pg": _f_list(
+                    row.get("kv_evictable_blocks_by_pg")),
+                # Cumulative, so these are differenced in _kv_deltas like the
+                # reuse counters, never read as a level.
+                "kv_offload_blocks": _f(row.get("kv_offload_blocks")),
+                "kv_onboard_blocks": _f(row.get("kv_onboard_blocks")),
+                "kv_host_dropped_blocks": _f(row.get("kv_host_dropped_blocks")),
                 "fetched_currank": _f(cur),
                 "fetched_global": _f(glob),
                 "host_step_time_ms": _f(row.get("host_step_time", "").rstrip("ms")),
@@ -310,6 +459,61 @@ def _tool_latencies(audit_rows: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
+def _perf_role(path: Path, records: list[dict], disagg: bool) -> str:
+    """Which hop a perf_metrics file came from, when the name does not say.
+
+    Two writers are in the wild. The proxy's poller wraps each record and names
+    the file after the hop it drained -- ``perf_metrics-{ctx,gen}-N.jsonl`` --
+    so the name is the answer. A worker writing its own
+    ``perf_metrics_output_dir`` names the file after the *process*, so both
+    hops land in ``perf_metrics-server-<host>-<pid>-<stamp>.jsonl`` and the
+    name says nothing. Sniff the content instead: only the generation hop
+    receives a KV transfer, and only the context hop chunks its prefill.
+    """
+    token = path.stem.split("-")[1] if "-" in path.stem else ""
+    if token in ("ctx", "gen"):
+        return token
+    if not disagg or token in ("proxy", "disagg"):
+        return ""  # aggregated, or already-paired proxy records
+    for record in records:
+        inner = record.get("perf_metrics") or {}
+        if "kv_cache_transfer_start" in (inner.get("timing_metrics") or {}):
+            return "gen"
+        if (record.get("time_breakdown_metrics") or {}).get("ctx_chunk_metrics"):
+            return "ctx"
+    return ""
+
+
+def _load_perf(run: "Run") -> list[dict]:
+    """Every perf record the run offers, unwrapped, role-tagged and paired.
+
+    Cached on the run: ``build_requests`` and ``gpu_forward_ms`` both need it,
+    and one of these files runs to millions of lines.
+    """
+    cached = getattr(run, "_perf_cache", None)
+    if cached is not None:
+        return cached
+    rows: list[dict] = []
+    for path in run.perf:
+        raw = _read_jsonl(path)
+        # The poller wraps; a worker writing the file itself does not, and
+        # then the record *is* the line.
+        wrapped = [w for w in raw if "record" in w]
+        records = [w["record"] for w in wrapped] + [w for w in raw if "record" not in w]
+        role = _perf_role(path, records, run.disagg)
+        for entry in raw:
+            record = entry.get("record")
+            if record is None:
+                record, drained = entry, None
+            else:
+                drained = entry.get("drained_at")
+            record["_source"] = entry.get("source") or role
+            record["_drained_at"] = drained
+            rows.append(record)
+    run._perf_cache = _pair_worker_records(rows)
+    return run._perf_cache
+
+
 def _pair_worker_records(records: list[dict]) -> list[dict]:
     """Fold per-worker disaggregated records into the proxy's nested shape.
 
@@ -329,7 +533,14 @@ def _pair_worker_records(records: list[dict]) -> list[dict]:
         already_nested = ("ctx_perf_metrics" in record
                           or "gen_perf_metrics" in record)
         if already_nested or role not in ("ctx", "gen") or key in (None, ""):
-            out.append(record)
+            # An unpairable generation record still has to be nested: _phase's
+            # flat fallback reads a bare record as the *context* hop, which
+            # would file decode timing and decode GPU time under prefill.
+            out.append({"gen_perf_metrics": record,
+                        "_source": record.get("_source"),
+                        "_drained_at": record.get("_drained_at"),
+                        "request_id": record.get("request_id")}
+                       if role == "gen" and not already_nested else record)
             continue
         merged = paired.get(str(key))
         if merged is None:
@@ -345,14 +556,7 @@ def _pair_worker_records(records: list[dict]) -> list[dict]:
 
 def build_requests(run: Run) -> list[dict]:
     audit = _read_jsonl(run.audit)
-    perf_rows = []
-    for path in run.perf:
-        for wrapped in _read_jsonl(path):
-            record = wrapped.get("record") or {}
-            record["_source"] = wrapped.get("source")
-            record["_drained_at"] = wrapped.get("drained_at")
-            perf_rows.append(record)
-    perf_rows = _pair_worker_records(perf_rows)
+    perf_rows = _load_perf(run)
 
     # Proxy records nest both hops; aggregated records are flat.
     perf_index: dict[str, dict] = {}
@@ -375,7 +579,48 @@ def build_requests(run: Run) -> list[dict]:
                 decision["_log_iter"] = batch.get("log_iter")
                 decision["_load_before"] = batch.get("load_before")
                 decisions.append(decision)
-    route_index = _index_by_ids(decisions, ("req_id", "client_id"))
+    # ``req_id`` is engine-global and safe to flatten. ``client_id`` is not: it
+    # is a per-worker counter that restarts at 1 on every context server, so
+    # merging both into one dict lets ``setdefault`` attach worker A's decision
+    # to worker B's request the moment a run has more than one ctx instance --
+    # silently, since the ids collide only in the small-integer range. Kept in a
+    # separate index, and a client id that more than one worker used resolves to
+    # nothing rather than to whichever file happened to sort first.
+    route_index = _index_by_ids(decisions, ("req_id",))
+    client_index: dict[str, dict] = {}
+    client_ambiguous: set[str] = set()
+    for decision in decisions:
+        value = decision.get("client_id")
+        if value in (None, ""):
+            continue
+        key = str(value)
+        earlier = client_index.get(key)
+        if earlier is None:
+            client_index[key] = decision
+        elif earlier.get("_worker") != decision.get("_worker"):
+            client_ambiguous.add(key)
+    run.route_client_ambiguous = len(client_ambiguous)
+
+    def route_for(*ids: Any) -> dict:
+        """The routing decision for a request, engine id first.
+
+        Both passes run over every id before falling through, rather than
+        resolving each id across both indexes in turn: an engine-id hit is
+        always right, and a client-id hit is only a fallback for the aggregated
+        deployment, where the serve edge and the engine share one counter.
+        """
+        keys = [str(value) for value in ids if value not in (None, "")]
+        for key in keys:
+            found = route_index.get(key)
+            if found is not None:
+                return found
+        for key in keys:
+            if key in client_ambiguous:
+                continue
+            found = client_index.get(key)
+            if found is not None:
+                return found
+        return {}
 
     tool_map = _tool_latencies(audit)
     rows: list[dict] = []
@@ -383,7 +628,7 @@ def build_requests(run: Run) -> list[dict]:
         rid = record.get("disagg_request_id") or record.get("engine_request_id")
         ctx_rid = record.get("ctx_request_id")
         perf = perf_index.get(str(rid)) or perf_index.get(str(ctx_rid)) or {}
-        route = route_index.get(str(rid)) or route_index.get(str(ctx_rid)) or {}
+        route = route_for(rid, ctx_rid)
         rows.append(_request_row(record, perf, route, tool_map))
 
     # Requests the audit never saw (direct-to-worker probes, or a run without
@@ -395,7 +640,7 @@ def build_requests(run: Run) -> list[dict]:
                or record.get("request_id"))
         if rid is None or str(rid) in seen:
             continue
-        rows.append(_request_row({}, record, route_index.get(str(rid), {}), {}))
+        rows.append(_request_row({}, record, route_for(rid), {}))
     rows.sort(key=lambda r: (r.get("started_at") or 0, str(r.get("rid"))))
     for index, row in enumerate(rows):
         row["request_index"] = index
@@ -656,15 +901,24 @@ def _rank_hit_rates(ranks: list[dict], prev: dict[int, dict]) -> list[float | No
 
 
 def _kv_deltas(ranks: list[dict], prev: dict[int, dict]
-               ) -> tuple[float, float, float, bool, bool]:
+               ) -> tuple[float, float, float, dict[str, float], bool, bool, bool]:
     """Per-iteration KV deltas summed across one instance's ranks.
 
-    ``have_alloc`` is tracked apart from ``have_delta`` because logs written
-    before the alloc counters existed would otherwise difference None-as-zero
-    and report a confident zero evictions where there is no measurement.
+    ``have_alloc`` and ``have_tier`` are tracked apart from ``have_delta``
+    because logs written before each set of counters existed would otherwise
+    difference None-as-zero and report a confident zero where there is no
+    measurement.
+
+    ``have_tier`` doubles as the KV-manager version test, which is why it
+    matters beyond presence. On v2 every call site assigns
+    ``alloc_total_blocks`` and ``alloc_new_blocks`` the same value, so
+    ``evicted`` below is identically zero there and means nothing; the tier
+    counters are v2-only, so their presence says "believe host_dropped, not
+    evicted".
     """
     reused = missed = evicted = 0.0
-    have_delta = have_alloc = False
+    tier = {"offload": 0.0, "onboard": 0.0, "host_dropped": 0.0}
+    have_delta = have_alloc = have_tier = False
     for entry in ranks:
         before = prev.get(entry["rank"])
         if before:
@@ -677,8 +931,161 @@ def _kv_deltas(ranks: list[dict], prev: dict[int, dict]
                 evicted += ((entry["kv_alloc_total_blocks"] - entry["kv_alloc_new_blocks"])
                             - (before["kv_alloc_total_blocks"]
                                - before["kv_alloc_new_blocks"]))
+            if (entry["kv_host_dropped_blocks"] is not None
+                    and before["kv_host_dropped_blocks"] is not None):
+                have_tier = True
+                for key, field in (("offload", "kv_offload_blocks"),
+                                   ("onboard", "kv_onboard_blocks"),
+                                   ("host_dropped", "kv_host_dropped_blocks")):
+                    tier[key] += (entry[field] or 0) - (before[field] or 0)
         prev[entry["rank"]] = entry
-    return reused, missed, evicted, have_delta, have_alloc
+    return reused, missed, evicted, tier, have_delta, have_alloc, have_tier
+
+
+def _pool_capacity(entries: list[dict]) -> dict[tuple[int, int], float]:
+    """Total KV slots per (engine instance, rank), from the level counters.
+
+    The v2 manager never prints the line :func:`parse_kv_capacity` looks for,
+    so capacity has to come out of the levels themselves. ``free + evictable +
+    pinned = max`` and pinned is never negative, so the largest ``free +
+    evictable`` ever observed *is* max -- exact on any iteration where nothing
+    was pinned, which every run has.
+
+    Dividing instead -- ``max = (free + evictable) / (1 - util)`` -- looks
+    equivalent and is not: util is printed to three decimals, and at the low
+    pin rates these workers actually run the rounding dominates and the
+    estimate wanders by tens of slots.
+
+    Keyed on the instance too, not the rank alone. A log holds more than one
+    engine lifetime and the pool-sizing pass runs a pool several times smaller;
+    charging its rows against the real engine's capacity reports a nearly empty
+    throwaway pool as three-quarters full.
+    """
+    capacity: dict[tuple[int, int], float] = {}
+    for entry in entries:
+        free, evictable = entry["kv_free_blocks"], entry["kv_evictable_blocks"]
+        if free is None or evictable is None:
+            continue
+        key = (entry["instance"], entry["rank"])
+        capacity[key] = max(capacity.get(key, 0.0), free + evictable)
+    return capacity
+
+
+_ROLE_LINE = re.compile(
+    r"deepseek_role=(\w+),\s*compress_ratio=(\d+),\s*role=\S+?,\s*"
+    r"pool_group_id=(\d+),\s*layer_group_id=(\d+)")
+
+# COMPRESSOR_KV / INDEXER_COMPRESSOR_SCORE / ... all describe one thing at the
+# grain a reader cares about. Collapsed so a legend entry stays legible; the
+# caption keeps the unabridged list.
+_ROLE_FAMILY = (("INDEXER_COMPRESSOR", "COMPRESSOR"), ("COMPRESSOR", "COMPRESSOR"),
+                ("INDEXER_COMPRESS", "COMPRESS"), ("COMPRESS", "COMPRESS"),
+                ("SWA", "SWA"))
+
+
+def parse_pool_group_roles(path: Path) -> dict[int, dict[str, Any]]:
+    """Which KV content each pool group holds, from the worker's own mapping line.
+
+    ``DeepseekV4CacheManager`` prints one line per (role, compress_ratio) naming
+    the ``pool_group_id`` it landed in, so the mapping is read rather than
+    assumed. That matters: pool group index is not a semantic order but the
+    ascending sort of each group's slot-size vector, so it is neither the order
+    the roles are declared in nor the order a hand-written ``pool_ratio``
+    comment is likely to guess.
+
+    Empty for any model that does not print the line, and the caller falls back
+    to bare ``pgN`` labels rather than inventing names.
+    """
+    groups: dict[int, dict[str, Any]] = {}
+    with path.open(encoding="latin-1", errors="replace") as handle:
+        for line in handle:
+            found = _ROLE_LINE.search(line)
+            if not found:
+                continue
+            role, ratio, pg_id, _layer = found.groups()
+            entry = groups.setdefault(int(pg_id), {"roles": set(), "ratios": set()})
+            entry["roles"].add(role)
+            entry["ratios"].add(int(ratio))
+    for entry in groups.values():
+        families: list[str] = []
+        for role in sorted(entry["roles"]):
+            for prefix, family in _ROLE_FAMILY:
+                if role.startswith(prefix):
+                    if family not in families:
+                        families.append(family)
+                    break
+        entry["label"] = "+".join(sorted(families))
+        entry["roles"] = sorted(entry["roles"])
+        entry["ratios"] = sorted(entry["ratios"])
+    return groups
+
+
+def _pool_capacity_by_pg(entries: list[dict]
+                         ) -> dict[tuple[int, int, int], float]:
+    """Slots per (engine instance, rank, pool group), same estimator as pooled.
+
+    ``free + evictable`` peaks when nothing is pinned, so its maximum over the
+    run is that group's slot count. Kept per group precisely because the groups
+    are not the same size: the ratio splits *bytes*, and a group whose blocks
+    are large gets proportionally fewer slots, so a summed capacity is
+    dominated by the smallest-block group and says nothing about the others.
+    """
+    capacity: dict[tuple[int, int, int], float] = {}
+    for entry in entries:
+        free = entry.get("kv_free_blocks_by_pg")
+        evictable = entry.get("kv_evictable_blocks_by_pg")
+        if not free or not evictable or len(free) != len(evictable):
+            continue
+        for pg, (f, e) in enumerate(zip(free, evictable)):
+            key = (entry["instance"], entry["rank"], pg)
+            capacity[key] = max(capacity.get(key, 0.0), f + e)
+    return capacity
+
+
+def _final_capacity_by_pg(capacity: dict[tuple[int, int, int], float]
+                          ) -> list[float] | None:
+    """Per-pool-group slot counts of the engine that served the traffic.
+
+    Summed per group rather than taken from the pooled estimate, and the two
+    are not interchangeable. ``max_t sum_g x_g(t) <= sum_g max_t x_g(t)``: the
+    pooled form is exact only if every group is unpinned on the *same*
+    iteration, while this one needs each group unpinned at *some* iteration.
+    They agree when the log starts at engine startup, where nothing is pinned
+    yet, and diverge on a windowed report or a rolled log -- with the pooled
+    form understating.
+    """
+    if not capacity:
+        return None
+    last = max(instance for instance, _, _ in capacity)
+    groups = sorted({pg for instance, _, pg in capacity if instance == last})
+    return [max((value for (i, _, pg), value in capacity.items()
+                 if i == last and pg == group), default=0.0)
+            for group in groups]
+
+
+def _final_capacity(capacity: dict[tuple[int, int], float]) -> float | None:
+    """Per-rank slot count of the engine that served the traffic -- the last."""
+    if not capacity:
+        return None
+    last = max(instance for instance, _ in capacity)
+    return max(value for (instance, _), value in capacity.items() if instance == last)
+
+
+def _pool_filled(entry: dict, capacity: dict[tuple[int, int], float]) -> float | None:
+    """Share of a rank's pool holding content, pinned or merely retained.
+
+    ``1 - free/max`` rather than ``evictable/max`` deliberately. A block whose
+    content is reusable but currently locked by an in-flight request counts as
+    pinned, not evictable, so ``evictable`` dips whenever traffic is active and
+    reads as the cache shrinking while it is in fact growing -- measured, it
+    fell from 478 to 40 slots across two iterations that added content. Free is
+    the quantity that only moves when the pool genuinely fills.
+    """
+    total = capacity.get((entry["instance"], entry["rank"]))
+    free = entry["kv_free_blocks"]
+    if not total or free is None:
+        return None
+    return 1.0 - free / total
 
 
 def build_gen_iters(run: Run, max_batch_size: int) -> list[dict]:
@@ -694,24 +1101,43 @@ def build_gen_iters(run: Run, max_batch_size: int) -> list[dict]:
     rows: list[dict] = []
     for path in run.decode_logs():
         worker = run.worker_name(path)
-        per_iter: dict[int, list[dict]] = defaultdict(list)
-        for entry in parse_iter_log(path):
-            per_iter[entry["iter"]].append(entry)
+        manager_v2 = run.kv_manager_v2()
+        entries = parse_iter_log(path)
+        capacity = _pool_capacity(entries)
+        # Keyed on (instance, iter), not iter alone: the pool-sizing engine and
+        # the real one both count from 1, and merging their first iterations
+        # would average two differently sized pools into one row.
+        per_iter: dict[tuple[int, int], list[dict]] = defaultdict(list)
+        for entry in entries:
+            per_iter[(entry["instance"], entry["iter"])].append(entry)
 
         prev: dict[int, dict] = {}
-        for iteration in sorted(per_iter):
-            ranks = per_iter[iteration]
+        current_instance = None
+        for key in sorted(per_iter):
+            instance, iteration = key
+            if instance != current_instance:
+                # Every counter restarts with the engine, so differencing this
+                # instance's first iteration against the previous instance's
+                # last would subtract a live total from a fresh zero and report
+                # a large negative delta.
+                prev.clear()
+                current_instance = instance
+            ranks = per_iter[key]
             batch = [r["num_scheduled_requests"] for r in ranks]
             tokens = [r["num_generation_tokens"] or 0 for r in ranks]
             batch_mean = statistics.fmean(batch) if batch else 0.0
             batch_total, tokens_total = sum(batch), sum(tokens)
             per_rank_hit = _rank_hit_rates(ranks, prev)
-            reused, missed, evicted, have_delta, have_alloc = _kv_deltas(ranks, prev)
+            (reused, missed, evicted, tier,
+             have_delta, have_alloc, have_tier) = _kv_deltas(ranks, prev)
             device = [r["device_step_time_ms"] for r in ranks
                       if r["device_step_time_ms"] is not None]
             util = [r["kv_cache_util"] for r in ranks if r["kv_cache_util"] is not None]
+            filled = [f for f in (_pool_filled(r, capacity) for r in ranks)
+                      if f is not None]
             rows.append({
                 "worker": worker,
+                "instance": instance,
                 "iter": iteration,
                 "ranks": len(ranks),
                 "has_decode": batch_total > 0,
@@ -738,7 +1164,20 @@ def build_gen_iters(run: Run, max_batch_size: int) -> list[dict]:
                 "gen_tokens_spread": _spread(tokens),
                 "kv_hit_rate_iter": (
                     reused / (reused + missed) if have_delta and (reused + missed) else None),
-                "kv_evicted_tokens": evicted * 128 if have_alloc else None,
+                # v2 assigns alloc_total and alloc_new the same value at every
+                # call site, so this difference is identically zero there and
+                # would read as a measured "no evictions". The tier counters
+                # only exist on v2, so their presence is the version test.
+                "kv_evicted_tokens": (evicted * 128 if have_alloc
+                                      and not manager_v2 else None),
+                "kv_capacity_blocks": capacity.get((instance, ranks[0]["rank"])),
+                "kv_free_blocks": _opt_sum(ranks, "kv_free_blocks"),
+                "kv_evictable_blocks": _opt_sum(ranks, "kv_evictable_blocks"),
+                "kv_pool_filled": statistics.fmean(filled) if filled else None,
+                "kv_offload_blocks_iter": tier["offload"] if have_tier else None,
+                "kv_onboard_blocks_iter": tier["onboard"] if have_tier else None,
+                "kv_host_dropped_blocks_iter": (tier["host_dropped"]
+                                                if have_tier else None),
                 "host_step_time_ms": statistics.fmean(
                     [r["host_step_time_ms"] for r in ranks
                      if r["host_step_time_ms"] is not None] or [0.0]),
@@ -746,6 +1185,16 @@ def build_gen_iters(run: Run, max_batch_size: int) -> list[dict]:
                 "timestamp": ranks[0]["timestamp"],
             })
     return rows
+
+
+def _opt_sum(ranks: list[dict], field: str) -> float | None:
+    """Sum a field across ranks, or None when no rank reported it.
+
+    Summing with ``or 0`` would turn "this log predates the field" into a
+    confident zero, which for a pool level is the opposite of the truth.
+    """
+    kept = [r[field] for r in ranks if r.get(field) is not None]
+    return sum(kept) if kept else None
 
 
 def _spread(values: list[float]) -> float | None:
@@ -767,7 +1216,7 @@ def _spread(values: list[float]) -> float | None:
 
 
 def build_ctx_iters(run: Run, max_num_tokens: int
-                    ) -> tuple[list[dict], dict, list[dict]]:
+                    ) -> tuple[list[dict], dict, list[dict], list[dict]]:
     """One row per (prefill instance, iteration), plus the KV capacity found.
 
     Utilization is the mean context tokens across that instance's ranks over
@@ -779,9 +1228,14 @@ def build_ctx_iters(run: Run, max_num_tokens: int
     # which is right for occupancy but wrong for a hit rate: pooling hides the
     # one rank that is missing while its peers hit.
     rank_rows: list[dict] = []
+    # Per (worker, rank, pool group, iteration). Eviction is decided one pool
+    # group at a time, so this is the only grain at which "the pool filled"
+    # is the same question the allocator asks.
+    pg_rows: list[dict] = []
     capacity: dict[str, Any] = {}
     for path in run.prefill_logs():
         worker = run.worker_name(path)
+        manager_v2 = run.kv_manager_v2()
         blocks, tokens_per_block = parse_kv_capacity(path)
         if blocks and tokens_per_block:
             capacity = {
@@ -791,13 +1245,40 @@ def build_ctx_iters(run: Run, max_num_tokens: int
             }
         tokens_per_block = tokens_per_block or 128
 
-        per_iter: dict[int, list[dict]] = defaultdict(list)
-        for entry in parse_iter_log(path):
-            per_iter[entry["iter"]].append(entry)
+        entries = parse_iter_log(path)
+        slots = _pool_capacity(entries)
+        pg_slots = _pool_capacity_by_pg(entries)
+        pg_roles = parse_pool_group_roles(path)
+        if pg_roles:
+            capacity = {**capacity, "pool_group_roles": pg_roles}
+        if slots and not capacity.get("capacity_tokens"):
+            # v2 prints no capacity line at all, so this is the only place the
+            # pool size comes from on a v2 run. Slots, not tokens: with more
+            # than one pool group the slot sizes differ, and multiplying a slot
+            # count by tokens_per_block overstates the pool -- on the DeepSeek
+            # pilot by 1.38x against the engine's own quota arithmetic.
+            capacity = {**capacity, "slots_per_rank": _final_capacity(slots),
+                        "slots_per_rank_by_pg": _final_capacity_by_pg(pg_slots),
+                        "tokens_per_block": tokens_per_block}
+        # Keyed on (instance, iter), not iter alone: the pool-sizing engine and
+        # the real one both count from 1, and merging their first iterations
+        # would average two differently sized pools into one row.
+        per_iter: dict[tuple[int, int], list[dict]] = defaultdict(list)
+        for entry in entries:
+            per_iter[(entry["instance"], entry["iter"])].append(entry)
 
         prev: dict[int, dict] = {}
-        for iteration in sorted(per_iter):
-            ranks = per_iter[iteration]
+        current_instance = None
+        for key in sorted(per_iter):
+            instance, iteration = key
+            if instance != current_instance:
+                # Every counter restarts with the engine, so differencing this
+                # instance's first iteration against the previous instance's
+                # last would subtract a live total from a fresh zero and report
+                # a large negative delta.
+                prev.clear()
+                current_instance = instance
+            ranks = per_iter[key]
             ctx_tokens = [r["num_ctx_tokens"] or 0 for r in ranks]
             mean = statistics.fmean(ctx_tokens) if ctx_tokens else 0.0
             peak = max(ctx_tokens, default=0)
@@ -808,20 +1289,56 @@ def build_ctx_iters(run: Run, max_num_tokens: int
                     "worker": worker,
                     "rank": entry["rank"],
                     "series": f'{worker} r{entry["rank"]}',
+                    "instance": entry["instance"],
                     "iter": iteration,
                     "timestamp": entry["timestamp"],
                     "kv_hit_rate_iter": hit,
+                    # Named for what it is rather than what the log calls it:
+                    # this is 1 - available/max, and available counts a retained
+                    # reusable block as free, so it only ever measures slots
+                    # pinned by in-flight requests.
                     "kv_cache_util": entry["kv_cache_util"],
+                    "kv_free_blocks": entry["kv_free_blocks"],
+                    "kv_evictable_blocks": entry["kv_evictable_blocks"],
+                    "kv_capacity_blocks": slots.get((entry["instance"], entry["rank"])),
+                    "kv_pool_filled": _pool_filled(entry, slots),
                     "num_ctx_tokens": entry["num_ctx_tokens"],
                     "utilization": ((entry["num_ctx_tokens"] or 0) / max_num_tokens
                                     if max_num_tokens else None),
                 })
-            reused, missed, evicted, have_delta, have_alloc = _kv_deltas(ranks, prev)
+                free_pg = entry.get("kv_free_blocks_by_pg") or []
+                evict_pg = entry.get("kv_evictable_blocks_by_pg") or []
+                for pg, free_slots in enumerate(free_pg):
+                    total = pg_slots.get((entry["instance"], entry["rank"], pg))
+                    named = (pg_roles.get(pg) or {}).get("label")
+                    tag = f"pg{pg}" + (f" {named}" if named else "")
+                    pg_rows.append({
+                        "worker": worker,
+                        "rank": entry["rank"],
+                        "pool_group": pg,
+                        "pool_group_roles": ",".join(
+                            (pg_roles.get(pg) or {}).get("roles") or []) or None,
+                        "series": f'{worker} r{entry["rank"]} {tag}',
+                        "instance": entry["instance"],
+                        "iter": iteration,
+                        "timestamp": entry["timestamp"],
+                        "kv_free_blocks": free_slots,
+                        "kv_evictable_blocks": (evict_pg[pg]
+                                                if pg < len(evict_pg) else None),
+                        "kv_capacity_blocks": total,
+                        "kv_pool_filled": (1.0 - free_slots / total
+                                           if total else None),
+                    })
+            (reused, missed, evicted, tier,
+             have_delta, have_alloc, have_tier) = _kv_deltas(ranks, prev)
 
             device = [r["device_step_time_ms"] for r in ranks
                       if r["device_step_time_ms"] is not None]
+            filled = [f for f in (_pool_filled(r, slots) for r in ranks)
+                      if f is not None]
             rows.append({
                 "worker": worker,
+                "instance": instance,
                 "iter": iteration,
                 "ranks": len(ranks),
                 # An aggregated server spends most iterations in decode with no
@@ -836,7 +1353,29 @@ def build_ctx_iters(run: Run, max_num_tokens: int
                 "imbalance": (peak - mean) / mean if mean else None,
                 "kv_hit_rate_iter": (
                     reused / (reused + missed) if have_delta and (reused + missed) else None),
-                "kv_evicted_tokens": evicted * tokens_per_block if have_alloc else None,
+                # v2 assigns alloc_total and alloc_new the same value at every
+                # call site, so this difference is identically zero there and
+                # would read as a measured "no evictions". Gated on the manager
+                # version rather than on have_tier: the tier counters are newer
+                # than v2 itself, and a v2 run predating them still needs this
+                # blanked. kv_host_dropped_blocks_iter is the answer instead,
+                # where the run is new enough to have it.
+                "kv_evicted_tokens": (evicted * tokens_per_block if have_alloc
+                                      and not manager_v2 else None),
+                "kv_capacity_blocks": slots.get((instance, ranks[0]["rank"])),
+                "kv_free_blocks": _opt_sum(ranks, "kv_free_blocks"),
+                "kv_evictable_blocks": _opt_sum(ranks, "kv_evictable_blocks"),
+                "kv_pool_filled": statistics.fmean(filled) if filled else None,
+                # The spread that is worth reading. Pool fill is rank-resident
+                # and persists across iterations, so a difference between ranks
+                # is a real difference in what they hold -- unlike the pinned
+                # and utilization spreads, which are structural under
+                # attention-DP because one prefill occupies one rank.
+                "kv_pool_filled_spread": _spread(filled),
+                "kv_offload_blocks_iter": tier["offload"] if have_tier else None,
+                "kv_onboard_blocks_iter": tier["onboard"] if have_tier else None,
+                "kv_host_dropped_blocks_iter": (tier["host_dropped"]
+                                                if have_tier else None),
                 "kv_util_mean": statistics.fmean(
                     [r["kv_cache_util"] for r in ranks if r["kv_cache_util"] is not None]
                     or [0.0]),
@@ -851,7 +1390,7 @@ def build_ctx_iters(run: Run, max_num_tokens: int
                      if r["host_step_time_ms"] is not None] or [0.0]),
                 "timestamp": ranks[0]["timestamp"],
             })
-    return rows, capacity, rank_rows
+    return rows, capacity, rank_rows, pg_rows
 
 
 # --------------------------------------------------------------------------
@@ -868,21 +1407,19 @@ def gpu_forward_ms(run: Run) -> dict[str, float | None]:
     """
     batches: dict[str, dict[float, float]] = {"prefill": {}, "decode": {}}
     missing = 0
-    for path in run.perf:
-        for wrapped in _read_jsonl(path):
-            record = wrapped.get("record") or {}
-            for side, role in (("ctx", "prefill"), ("gen", "decode")):
-                phase = _phase(record, side)
-                breakdown = phase["breakdown"]
-                if not breakdown:
-                    if phase["timing"]:
-                        missing += 1
-                    continue
-                for entry in (breakdown.get("ctx_chunk_metrics") or []) + (
-                        breakdown.get("step_metrics") or []):
-                    key, value = entry.get("forward_start_time"), entry.get("gpu_forward_time")
-                    if key is not None and value:
-                        batches[role][key] = value
+    for record in _load_perf(run):
+        for side, role in (("ctx", "prefill"), ("gen", "decode")):
+            phase = _phase(record, side)
+            breakdown = phase["breakdown"]
+            if not breakdown:
+                if phase["timing"]:
+                    missing += 1
+                continue
+            for entry in (breakdown.get("ctx_chunk_metrics") or []) + (
+                    breakdown.get("step_metrics") or []):
+                key, value = entry.get("forward_start_time"), entry.get("gpu_forward_time")
+                if key is not None and value:
+                    batches[role][key] = value
     return {
         "prefill_ms": sum(batches["prefill"].values()) or None,
         "decode_ms": sum(batches["decode"].values()) or None,
@@ -892,9 +1429,20 @@ def gpu_forward_ms(run: Run) -> dict[str, float | None]:
     }
 
 
+def _tier_total(iters: list[dict], name: str) -> float | None:
+    """Run total for one cross-tier counter, or None if the run never had it."""
+    field = f"kv_{name}_blocks_iter"
+    kept = [row[field] for row in iters if row.get(field) is not None]
+    return sum(kept) if kept else None
+
+
+def _ratio(top: float | None, bottom: float | None) -> float | None:
+    return None if top is None or not bottom else top / bottom
+
+
 def build_summary(runs: list[Run], requests: list[dict], sessions: list[dict],
                   ctx_iters: list[dict], gen_iters: list[dict],
-                  capacity: dict) -> dict:
+                  capacity: dict, rank_iters: list[dict] | None = None) -> dict:
     """Totals for one run, or for several merged.
 
     Time is accumulated per run and then summed rather than measured across
@@ -962,8 +1510,30 @@ def build_summary(runs: list[Run], requests: list[dict], sessions: list[dict],
                               if c["imbalance"] is not None]) if prefilling else None),
         # 0 evictions is a measurement; only an absent iteration log is missing.
         "kv_evicted_tokens_total": (
-            sum(c["kv_evicted_tokens"] or 0 for c in ctx_iters) if ctx_iters else None),
+            sum(c["kv_evicted_tokens"] or 0 for c in ctx_iters)
+            if any(c["kv_evicted_tokens"] is not None for c in ctx_iters) else None),
         "kv_capacity_tokens": capacity.get("capacity_tokens"),
+        "kv_capacity_blocks": capacity.get("slots_per_rank"),
+        # Peak over the per-rank series, not the rank-mean and not the last
+        # row. The pool fills monotonically until it starts evicting, so a mean
+        # over time reports roughly half of how full it got; a "last row"
+        # depends on which worker lands last in the list; and averaging across
+        # ranks hides the one that fills first, which is where eviction starts.
+        # Ranks diverge in practice -- 2.8% against 3.9% on the relay pilot.
+        "kv_pool_filled_peak": max(
+            (c["kv_pool_filled"] for c in (rank_iters or ctx_iters)
+             if c.get("kv_pool_filled") is not None), default=None),
+        # Cross-tier movement, the three that replace the dead eviction proxy
+        # on v2. offload left the GPU but survives on the host tier; onboard is
+        # a hit that had to be copied back; host_dropped fell out of the
+        # hierarchy altogether and is the only real loss of reusable prefix.
+        **{f"kv_{name}_blocks_total": _tier_total(ctx_iters, name)
+           for name in ("offload", "onboard", "host_dropped")},
+        # The two ratios worth acting on: the share of hits that cost a copy,
+        # and the share of written content that was lost outright.
+        "kv_onboard_share_of_reuse": _ratio(
+            _tier_total(ctx_iters, "onboard"),
+            sum(r["isl_cached"] or 0 for r in requests) / 128 or None),
         "decode_iters": len(gen_iters),
         "decode_batch_mean": (
             statistics.fmean([g["decode_batch_total"] for g in gen_iters
@@ -990,7 +1560,8 @@ INK, MUTED, ACCENT, WARN = "#1b2733", "#7a8794", "#3b7dd8", "#c2410c"
 def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
            pct: bool = False, origin: float | None = None,
            time_field: str = "timestamp", series_field: str = "worker",
-           marker_only: bool = False) -> str:
+           marker_only: bool = False, toggle: bool = False,
+           mean_line: bool = False) -> str:
     """One series per prefill instance against wall clock, as an inline PNG.
 
     Three choices worth stating, because the obvious version of this chart
@@ -1001,6 +1572,17 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
     because a continuous line across a ten-minute silence claims the metric
     held that value while nothing was running. Points are marked, so a burst
     of five events does not read as one thick segment.
+
+    ``toggle`` renders each series as its own transparent overlay above a
+    shared axes image, so the legend can switch individual ranks off. Four
+    overlapping rank curves are unreadable where they cross, and the question
+    asked of these charts is usually about one rank against the others. The
+    axes are drawn once and every layer reuses that exact box, so the overlays
+    register regardless of how the browser scales them.
+
+    ``mean_line`` draws the series mean as a horizontal rule. On a metric with
+    a structural ceiling -- token-budget utilization, or an imbalance pinned at
+    ``ranks - 1`` -- the eye tracks the excursions and misreads the level.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1026,6 +1608,7 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
     fig, axis = plt.subplots(figsize=(9, 2.6), dpi=130)
     colors = [ACCENT, WARN, "#0f766e", "#7c3aed"]
     drawn: list[tuple[str, list[tuple[float, float]]]] = []
+    handles: list[Any] = []
     for index, (name, points) in enumerate(sorted(series.items())):
         points.sort()
         points = _downsample(points)
@@ -1040,9 +1623,22 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
             xs.append((stamp - origin) / 60.0)
             ys.append(value)
         drawn.append((name, [(x, y) for x, y in zip(xs, ys) if x is not None]))
-        axis.plot(xs, ys, linewidth=0 if marker_only else 1.0, label=name,
-                  color=colors[index % len(colors)],
-                  marker="o", markersize=2.6 if marker_only else 1.8, markevery=1)
+        handles.append(axis.plot(
+            xs, ys, linewidth=0 if marker_only else 1.0, label=name,
+            color=colors[index % len(colors)],
+            marker="o", markersize=2.6 if marker_only else 1.8, markevery=1)[0])
+    mean_value = None
+    if mean_line:
+        flat = [y for _, pts in drawn for _, y in pts]
+        if flat:
+            mean_value = statistics.fmean(flat)
+            axis.axhline(mean_value, color=INK, linestyle=(0, (5, 3)),
+                         linewidth=0.9, zorder=1.5)
+            axis.annotate(f"mean {mean_value * 100:.1f}%" if pct
+                          else f"mean {mean_value:,.3g}",
+                          xy=(1.0, mean_value), xycoords=("axes fraction", "data"),
+                          xytext=(-3, 3), textcoords="offset points",
+                          ha="right", va="bottom", fontsize=7, color=INK)
     axis.set_title(title, fontsize=10, color=INK, loc="left")
     axis.set_xlabel("minutes into the run", fontsize=8, color=MUTED)
     axis.set_ylabel(ylabel, fontsize=8, color=MUTED)
@@ -1071,12 +1667,65 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
                     "pts": [[round(x, 3), round(y, 5)] for x, y in pts]}
                    for name, pts in drawn],
     }
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png")
+    def render(transparent: bool = False) -> str:
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png", transparent=transparent)
+        return base64.b64encode(buffer.getvalue()).decode()
+
+    if not (toggle and len(drawn) > 1):
+        image = render()
+        plt.close(fig)
+        return ('<figure class="chart"><img alt="%s" src="data:image/png;base64,%s">'
+                '<script type="application/json">%s</script></figure>'
+                % (title, image, json.dumps(payload, separators=(",", ":"))))
+
+    # Layered: the axes once, then one transparent overlay per series. The
+    # limits are frozen first so every layer maps data to pixels identically --
+    # without that, matplotlib re-autoscales to whichever single series is
+    # visible and the overlays no longer line up with the axes beneath them.
+    axis.set_xlim(*payload["xlim"])
+    axis.set_ylim(*payload["ylim"])
+    legend = axis.get_legend()
+    if legend is not None:
+        legend.set_visible(False)
+    for handle in handles:
+        handle.set_visible(False)
+    base = render()
+
+    # set_title(..., loc="left") stores the text on the left-hand title artist,
+    # not on ``axis.title``, so clearing that one leaves the heading painted
+    # onto every overlay and it stacks up four deep.
+    axis.set_title("", loc="left")
+    axis.set_xlabel("")
+    axis.set_ylabel("")
+    axis.grid(False)
+    axis.tick_params(labelleft=False, labelbottom=False, length=0)
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+    mean_artists = [a for a in axis.lines if a not in handles] + list(axis.texts)
+    for artist in mean_artists:
+        artist.set_visible(False)
+
+    layers = []
+    for handle, (name, _) in zip(handles, drawn):
+        handle.set_visible(True)
+        layers.append((name, handle.get_color(), render(transparent=True)))
+        handle.set_visible(False)
     plt.close(fig)
-    return ('<figure class="chart"><img alt="%s" src="data:image/png;base64,%s">'
+
+    chips = "".join(
+        f'<button class="chip on" data-series="{name}">'
+        f'<span style="background:{color}"></span>{name}</button>'
+        for name, color, _ in layers)
+    stack = "".join(
+        f'<img class="layer" data-series="{name}" alt="" '
+        f'src="data:image/png;base64,{data}">' for name, _, data in layers)
+    return ('<figure class="chart layered">'
+            '<div class="stack"><img class="base" alt="%s" '
+            'src="data:image/png;base64,%s">%s</div>'
+            '<div class="legend">%s</div>'
             '<script type="application/json">%s</script></figure>'
-            % (title, base64.b64encode(buffer.getvalue()).decode(),
+            % (title, base, stack, chips,
                json.dumps(payload, separators=(",", ":"))))
 
 
@@ -1306,6 +1955,103 @@ def _dur(ms: float | None) -> str:
     return f"{ms / 1000:,.2f} s" if abs(ms) >= 1000 else f"{ms:,.0f} ms"
 
 
+def _capacity_total(rank_iters: list[dict]) -> float | None:
+    """Total KV pages across every rank of every prefill instance.
+
+    Summed over *distinct* ranks, not over rows: capacity is a level repeated
+    on every iteration, so summing the column would multiply it by the
+    iteration count. Keyed on the instance too, for the same reason
+    :func:`_pool_capacity` is -- one log can hold more than one engine
+    lifetime, and the pool-sizing pass runs a much smaller pool.
+
+    An instance with a single logged iteration is left out, because the
+    numerator this denominates cannot contain it: the tier counters are
+    cumulative and differenced *within* an instance, so one iteration yields
+    no delta. Counting its pool anyway inflates the denominator by a pool that
+    never moved a page -- measured on the DeepSeek pilot, the sizing pass added
+    35,600 slots to a 157,240-slot run and pulled every share down by a fifth.
+    """
+    seen: dict[tuple, tuple[set, float]] = {}
+    for r in rank_iters:
+        cap = r.get("kv_capacity_blocks")
+        if cap is None:
+            continue
+        key = (r.get("worker"), r.get("instance"), r.get("rank"))
+        iters, _ = seen.setdefault(key, (set(), cap))
+        iters.add(r.get("iter"))
+    return sum(cap for iters, cap in seen.values() if len(iters) > 1) or None
+
+
+def _tier_table(ctx_iters: list[dict], rank_iters: list[dict]) -> str:
+    """Cross-tier page movement over the run, as totals rather than a spread.
+
+    These are cumulative counters, and after differencing they are rates that
+    are zero on almost every iteration -- a p50/p90/p99 over them would say
+    nothing. What matters is the run total, and each total against the pool it
+    moved through: how much left the GPU, how much was copied back, and how
+    much fell out of the hierarchy, which is the only real loss of reusable
+    prefix.
+
+    Empty on any run without the counters -- they arrived with the v2 manager,
+    and before them the report has nothing to say here rather than zero.
+    """
+    totals = {name: _tier_total(ctx_iters, name)
+              for name in ("offload", "onboard", "host_dropped")}
+    if all(v is None for v in totals.values()):
+        return ""
+    # Every count here is a page -- ``_record_migrated_slots`` and
+    # ``_record_dropped_pages`` both increment once per page -- so the
+    # denominator has to be pages too, or the quotient is not a share of
+    # anything. Pool capacity is the only page-denominated total the run
+    # offers. The engine records no "pages written": ``iter_alloc_new_blocks``
+    # counts pages on the migration path and logical blocks on the main
+    # allocation path, and ``ctx_blocks_new`` / ``isl_cached`` are logical
+    # blocks and tokens, which convert to pages at no fixed rate -- a block's
+    # data occupies a page in each pool group it touches, and the groups differ
+    # in both size and count. Dividing a page count by either overstated the
+    # share by that unknown factor, which is what this replaces.
+    capacity = _capacity_total(rank_iters)
+    shares = {name: _ratio(totals[name], capacity) for name in totals}
+    filled = [r["kv_pool_filled"] for r in rank_iters
+              if r.get("kv_pool_filled") is not None]
+    quiet = all((v or 0) == 0 for v in totals.values())
+
+    def row(label: str, key: str) -> str:
+        share = shares[key]
+        return (f"<tr><td>{label}</td><td>{_num(totals[key], 0)}</td>"
+                f'<td class="lead">{_num(share and share * 100, 2, "%")}'
+                f"{' of pool capacity' if share is not None else ''}</td></tr>")
+
+    return (
+        "<table><thead><tr><th>cross-tier movement</th><th>pages</th>"
+        "<th>share</th></tr></thead><tbody>"
+        + row("Offloaded GPU → host", "offload")
+        + row("Onboarded host → GPU", "onboard")
+        + row("Dropped out of the hierarchy", "host_dropped")
+        + "</tbody></table>"
+        '<p class="sub">'
+        "<b>Onboarded</b> is the cost a healthy hit rate hides: a prefix served "
+        "from the host tier is still a hit, but it is paid for with a copy back "
+        "onto the GPU before the prefill can run. <b>Dropped</b> is the only one "
+        "of the three that loses reusable content outright, and the one a falling "
+        "hit rate can be charged to; offloading merely moves it down a tier. "
+        "All three are counted <b>per page</b>, one page per pool-group slot, "
+        "so the share is against the run's total pool capacity in pages — the "
+        "only page-denominated total there is. It is cumulative movement over "
+        "a fixed pool, so it reads as turnover: 100% would mean the run moved "
+        "a pool's worth of pages, not that the pool was full. "
+        "These replace <code>Evicted tokens</code> above, which is "
+        "<code>alloc_total − alloc_new</code> — a v1 signal that the v2 manager "
+        "sets to zero by construction, since every call site assigns both "
+        "counters the same value."
+        + (" All three are zero on this run"
+           + (f", and the pool only reached "
+              f"{max(filled) * 100:.1f}% full, so nothing had to be reclaimed."
+              if filled else ".")
+           if quiet else "")
+        + "</p>")
+
+
 def _rank_totals(rank_iters: list[dict]) -> str:
     """Cumulative per-rank prefill share over the whole run.
 
@@ -1323,26 +2069,32 @@ def _rank_totals(rank_iters: list[dict]) -> str:
                              {"iters": 0, "tokens": 0, "hit": [], "util": []})
         acc["iters"] += 1
         acc["tokens"] += row["num_ctx_tokens"]
-        for key, field in (("hit", "kv_hit_rate_iter"), ("util", "kv_cache_util")):
+        for key, field in (("hit", "kv_hit_rate_iter"), ("util", "kv_cache_util"),
+                           ("filled", "kv_pool_filled")):
             if row.get(field) is not None:
-                acc[key].append(row[field])
+                acc.setdefault(key, []).append(row[field])
     if not per:
         return ""
     total = sum(a["tokens"] for a in per.values()) or 1
     body = []
     for (worker, rank), acc in sorted(per.items()):
         share = acc["tokens"] / total
+        peak_filled = max(acc["filled"]) if acc.get("filled") else None
         body.append(
             f"<tr><td>{worker} r{rank}</td><td>{acc['iters']:,}</td>"
             f"<td>{acc['tokens']:,}</td>"
             f'<td class="imb">{share * 100:.1f}%</td>'
             f'<td class="lead">{_num(statistics.fmean(acc["hit"]) if acc["hit"] else None, 3)}</td>'
-            f'<td>{_num(statistics.fmean(acc["util"]) if acc["util"] else None, 3)}</td></tr>')
+            f'<td>{_num(statistics.fmean(acc["util"]) if acc["util"] else None, 3)}</td>'
+            # Peak, not mean: the pool fills monotonically, so a mean over the
+            # run would report roughly half of how full it actually got.
+            f'<td>{_num(peak_filled and peak_filled * 100, 1, "%")}</td></tr>')
     shares = [a["tokens"] / total for a in per.values()]
     skew = max(shares) / min(shares) if min(shares) else None
     return ("<table><thead><tr><th>rank</th><th>prefill iters</th>"
             "<th>ctx tokens</th>"
-            '<th class="imb">share</th><th>hit rate</th><th>KV util</th>'
+            '<th class="imb">share</th><th>hit rate</th><th>pinned</th>'
+            "<th>pool filled</th>"
             f"</tr></thead><tbody>{''.join(body)}</tbody></table>"
             f'<p class="sub">Cumulative over the run, prefilling iterations only. '
             "An even split is 1/ranks each; this run's busiest rank took "
@@ -1390,6 +2142,21 @@ document.querySelectorAll('figure.chart').forEach(function (fig) {
   var tip = document.createElement('div'); tip.className = 'tip';
   var rule = document.createElement('div'); rule.className = 'rule';
   fig.appendChild(rule); fig.appendChild(tip);
+  // Layered charts: the legend switches overlays on and off. `hidden` is what
+  // keeps the readout honest -- a cursor must not report a series the reader
+  // has just switched off, because the nearest point would then come from a
+  // curve that is not on screen.
+  var hidden = {};
+  fig.querySelectorAll('.chip').forEach(function (chip) {
+    chip.addEventListener('click', function () {
+      var name = chip.dataset.series;
+      var on = chip.classList.toggle('on');
+      hidden[name] = !on;
+      fig.querySelectorAll('.layer').forEach(function (el) {
+        if (el.dataset.series === name) el.classList.toggle('off', !on);
+      });
+    });
+  });
   var fmt = function (v) {
     return data.pct ? (v * 100).toFixed(1) + '%'
                     : (Math.abs(v) >= 1000 ? v.toLocaleString(undefined, {maximumFractionDigits: 0})
@@ -1409,20 +2176,31 @@ document.querySelectorAll('figure.chart').forEach(function (fig) {
       var cx = (data.box[0] + inner * data.box[2]) * r.width;
       tip.textContent = x.toFixed(1) + ' ' + data.unit + '   \u00b7   '
                       + live + ' in flight';
-      tip.style.left = cx + 'px';
-      tip.style.top = (data.box[1] * r.height + 10) + 'px';
-      rule.style.left = cx + 'px';
       tip.classList.add('on'); rule.classList.add('on');
+      // Follow the cursor instead of anchoring to the top of the axes box.
+      // This panel's height scales with the session count -- 396 sessions
+      // render a 2860px-tall figure -- and the in-flight strip being read is
+      // its bottom sliver, so a fixed top anchor put the number thousands of
+      // pixels above the cursor, off screen. Measured against the figure, not
+      // the image: the image carries a 6px top margin inside it.
+      // offsetWidth is read after the text is set, so the clamp uses the width
+      // this readout actually has rather than the previous one's.
+      var fr = fig.getBoundingClientRect();
+      var half = tip.offsetWidth / 2;
+      tip.style.left = Math.max(half, Math.min(r.width - half, cx)) + 'px';
+      tip.style.top = (ev.clientY - fr.top) + 'px';
+      rule.style.left = cx + 'px';
       return;
     }
     var best = null;
     data.series.forEach(function (s) {
+      if (hidden[s.name]) return;
       s.pts.forEach(function (p) {
         var d = Math.abs(p[0] - x);
         if (!best || d < best.d) best = {d: d, x: p[0], y: p[1], name: s.name};
       });
     });
-    if (!best) return;
+    if (!best) { tip.classList.remove('on'); rule.classList.remove('on'); return; }
     var px = (data.box[0] + (best.x - data.xlim[0]) / (data.xlim[1] - data.xlim[0]) * data.box[2]) * r.width;
     var py = (data.box[1] + (data.ylim[1] - best.y) / (data.ylim[1] - data.ylim[0]) * data.box[3]) * r.height;
     tip.textContent = (data.series.length > 1 ? best.name + '  ' : '')
@@ -1468,6 +2246,17 @@ tr.total td{border-top:2px solid #d8dee5;font-weight:650;background:#fafbfc}
 margin:12px 0;font-size:12px;color:#41505f}
 img{max-width:100%;display:block;margin:6px 0}
 figure.chart{margin:6px 0;position:relative}
+figure.chart .stack{position:relative}
+figure.chart .stack img{display:block;width:100%}
+figure.chart .stack img.layer{position:absolute;left:0;top:0;pointer-events:none}
+figure.chart .stack img.layer.off{display:none}
+figure.chart .legend{display:flex;flex-wrap:wrap;gap:4px;margin:2px 0 0 4px}
+.chip{display:inline-flex;align-items:center;gap:4px;font:inherit;font-size:11px;
+color:#7a8794;background:#f7f9fb;border:1px solid #e3e8ee;border-radius:11px;
+padding:1px 8px;cursor:pointer;font-variant-numeric:tabular-nums}
+.chip span{width:8px;height:8px;border-radius:50%;opacity:.28}
+.chip.on{color:#1b2733;background:#fff;border-color:#c3cad2}
+.chip.on span{opacity:1}
 .tip{position:absolute;pointer-events:none;background:#1b2733;color:#fff;
 font-size:11px;padding:3px 7px;border-radius:4px;white-space:nowrap;
 transform:translate(-50%,-140%);opacity:0;transition:opacity .08s;
@@ -1482,7 +2271,9 @@ code{background:#f2f5f7;padding:1px 4px;border-radius:3px;font-size:11px}
 
 def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                 ctx_iters: list[dict], gen_iters: list[dict],
-                rank_iters: list[dict], summary: dict, notes: list[str]) -> str:
+                rank_iters: list[dict], summary: dict, notes: list[str],
+                rank_pg_iters: list[dict] | None = None,
+                capacity_meta: dict | None = None) -> str:
     stamps = [_parse_stamp(r.get("timestamp"))
               for r in (ctx_iters + gen_iters) if r.get("timestamp")]
     run_origin = min((t for t in stamps if t is not None), default=None)
@@ -1658,18 +2449,97 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
         # Per rank, not pooled. A four-rank mean of 0.28 is the same number
         # whether all four sit at 0.28 or one sits at 1.0 and three at 0.04,
         # and only the second is a capacity problem.
-        parts.append(_chart(rank_occupancy or occupancy, "kv_util_mean"
-                            if not rank_occupancy else "kv_cache_util",
-                            "KV cache utilization per rank",
-                            "used / max blocks", pct=True, origin=run_origin,
-                            series_field="series" if rank_occupancy else "worker"))
+        #
+        # 1 - free/max, not the log's kv_cache_util. That field is
+        # 1 - available/max and available counts a retained reusable block as
+        # free, so it measures only what in-flight requests have pinned and
+        # reads identically on an empty pool and a full one. This curve is the
+        # one that answers "when does the pool fill and start evicting"; the
+        # pinned share is kept below as a statistic, where it belongs.
+        pg_rows = [r for r in (rank_pg_iters or [])
+                   if r.get("kv_pool_filled") is not None]
+        pg_filled = _chart(pg_rows, "kv_pool_filled",
+                           "KV pool filled per rank and pool group",
+                           "1 − free / capacity", pct=True, origin=run_origin,
+                           series_field="series", toggle=True) if pg_rows else ""
+        if pg_filled:
+            parts.append(pg_filled)
+            roles = (summary.get("pool_group_roles")
+                     or (capacity_meta or {}).get("pool_group_roles") or {})
+            if roles:
+                spelled = "; ".join(
+                    f"<b>pg{pg}</b> = {', '.join(info['roles'])}"
+                    + (f" (compress_ratio {', '.join(str(r) for r in info['ratios'])})"
+                       if info.get("ratios") else "")
+                    for pg, info in sorted(roles.items()))
+                parts.append(
+                    f'<p class="sub">Pool groups hold different KV content: '
+                    f"{spelled}. Read from the worker's own "
+                    "<code>role-to-pool/lifecycle mapping</code> lines, not assumed: "
+                    "the pool group index is the ascending sort of each group's "
+                    "slot-size vector, so it follows neither the order the roles are "
+                    "declared in nor the order of the <code>pool_ratio</code> list a "
+                    "config comment is likely to name.</p>")
+            parts.append(
+                '<p class="sub">One curve per (rank, pool group). This is the '
+                "grain the allocator actually works at: an eviction is sized off "
+                "a <em>single</em> group's free-slot count, so one group pinned "
+                "at 0 evicts on every allocation while the summed curve below "
+                "still reads roomy. The groups are not the same size — the pool "
+                "ratio splits bytes, so a group whose blocks are large gets "
+                "proportionally fewer slots — which is why they are not pooled "
+                "and why a group's own capacity is its own high-water "
+                "<code>free + evictable</code>. Counts are slots, one slot per "
+                "page: a token block spanning three groups occupies three "
+                "slots, so these are not logical KV blocks.</p>")
+        # Drawn only when the per-(rank, pool group) chart above is not: this
+        # is the same quantity summed over groups, and that sum is precisely
+        # what hides a saturated small group -- the thing the split exists to
+        # show. The paragraph below still applies, since it defines
+        # kv_pool_filled, which the pool-group curves and the stats table use.
+        filled = any(r.get("kv_pool_filled") is not None for r in rank_occupancy)
+        if not pg_filled:
+            parts.append(_chart(
+                rank_occupancy, "kv_pool_filled", "KV pool filled per rank",
+                "1 − free / capacity", pct=True, origin=run_origin,
+                series_field="series", toggle=True) or _chart(
+                    rank_occupancy or occupancy,
+                    "kv_util_mean" if not rank_occupancy else "kv_cache_util",
+                    "KV slots pinned by in-flight requests, per rank",
+                    "pinned / max blocks", pct=True, origin=run_origin,
+                    series_field="series" if rank_occupancy else "worker",
+                    toggle=True))
+        if filled:
+            parts.append(
+                '<p class="sub">Share of each rank\'s KV slots holding content, '
+                "pinned or merely retained for reuse — <code>1 − free/capacity</code>. "
+                "Not the log's <code>kv_cache_util</code>, which is "
+                "<code>1 − available/max</code> where <code>available = free + "
+                "evictable</code>: a block whose last reference was dropped stays in "
+                "the eviction LRU still holding matchable content and counts there as "
+                "free, so that field only ever measures what is pinned right now and "
+                "reads the same on a full pool as on an empty one. It is reported "
+                "below as <b>Pinned by in-flight</b>. Capacity is recovered as the "
+                "largest <code>free + evictable</code> observed, which is exact "
+                "because pinned is never negative.</p>")
+        else:
+            parts.append(
+                '<p class="sub">Slots pinned by requests in flight — the log\'s '
+                "<code>kv_cache_util</code>, which is <code>1 − available/max</code> "
+                "with <code>available = free + evictable</code>, so a block retained "
+                "for reuse counts as free and this reads the same on a full pool as "
+                "on an empty one. <b>It is not an occupancy figure.</b> This run's "
+                "logs predate <code>kv_free_blocks</code> / "
+                "<code>kv_evictable_blocks</code>, so how full the pool actually got "
+                "is not measured here at all.</p>")
         # The KV manager's own reused/missed block counters, differenced per
         # rank. Pooling ranks would average away the rank that is missing while
         # its peers hit -- the one case the curve exists to show.
         iter_hits = _chart(rank_occupancy, "kv_hit_rate_iter",
                            "KV hit rate per rank (server block counters)",
                            "reused / (reused+missed)", pct=True,
-                           origin=run_origin, series_field="series")
+                           origin=run_origin, series_field="series",
+                           toggle=True)
         parts.append(iter_hits)
         notes_html = ["Per rank, from the KV manager's own block counters in "
                       "the worker log: of the blocks acquired between two "
@@ -1688,17 +2558,20 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
             parts.append('<p class="sub">' + " ".join(notes_html) + "</p>")
     if ctx_iters:
         parts.append(_chart(ctx_iters, "utilization", "Token-budget utilization",
-                            "mean ctx tokens / budget", pct=True, origin=run_origin))
+                            "mean ctx tokens / budget", pct=True,
+                            origin=run_origin, mean_line=True))
         parts.append(_chart(ctx_iters, "imbalance", "Rank imbalance",
-                            "(max − mean) / mean", origin=run_origin))
+                            "(max − mean) / mean", origin=run_origin,
+                            mean_line=True))
         parts.append("<table><thead><tr><th>metric</th><th>n</th><th>mean</th>"
                      '<th class="imb">imbalance</th>'
                      "<th>p50</th><th>p90</th><th>p99</th></tr></thead><tbody>")
         for label, field, digits, spread in (
                 ("Utilization", "utilization", 3, "imbalance"),
                 ("Hit rate", "kv_hit_rate_iter", 3, "kv_hit_rate_spread"),
+                ("Pool filled", "kv_pool_filled", 3, "kv_pool_filled_spread"),
                 ("Evicted tokens", "kv_evicted_tokens", 0, None),
-                ("KV util", "kv_util_mean", 3, "kv_util_spread"),
+                ("Pinned by in-flight", "kv_util_mean", 3, "kv_util_spread"),
                 ("Device step ms", "device_step_time_ms", 1, "device_step_spread"),
                 ("Host step ms", "host_step_time_ms", 1, None)):
             parts.append(_stat_row(
@@ -1706,6 +2579,7 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                 duration="ms" in label, with_spread=True,
                 spread=[c.get(spread) for c in ctx_iters] if spread else None))
         parts.append("</tbody></table>")
+        parts.append(_tier_table(occupancy, rank_iters))
         parts.append(_rank_totals(rank_iters))
         parts.append('<p class="sub">'
                      "The imbalance column is (max − mean) / mean across that "
@@ -1714,13 +2588,28 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                      "<b>utilization</b> under attention-DP it is pinned near "
                      "<code>ranks − 1</code> by construction — one prefill occupies "
                      "one rank — so read routing skew off the per-rank table above, "
-                     "not off this column. For <b>KV util</b> and <b>hit rate</b> it "
-                     "is meaningful: those are rank-resident state, and a spread "
-                     "there means the ranks really do hold different amounts. "
-                     "Evicted tokens come from "
-                     "<code>alloc_total − alloc_new</code>, which counts blocks taken "
-                     "while still holding reusable content — an upper bound, since a "
-                     "freed partial block lands there too. "
+                     "not off this column. <b>Pinned by in-flight</b> is structural "
+                     "for the same reason and to the same value: the rank running the "
+                     "prefill holds every pinned slot and the others hold none, which "
+                     "scores exactly <code>ranks − 1</code>. Measured on the relay "
+                     "pilot, 89.5% of iterations sat at 3.000 on four ranks, because "
+                     "on 136 of 151 iterations exactly one rank had anything pinned "
+                     "at all. It says nothing about routing. For <b>hit rate</b> and "
+                     "<b>pool filled</b> the column is meaningful: those are "
+                     "rank-resident state that persists across iterations, and a "
+                     "spread there means the ranks really do hold different amounts — "
+                     "pool fill spread was 0.126 on the same run, against 3.000 for "
+                     "pinned. "
+                     + ("<b>Evicted tokens</b> is blank: it is "
+                        "<code>alloc_total − alloc_new</code>, and the v2 manager "
+                        "assigns those two counters the same value at every call "
+                        "site, so the difference is zero by construction and "
+                        "measures nothing. "
+                        if runs and runs[0].kv_manager_v2() else
+                        "Evicted tokens come from "
+                        "<code>alloc_total − alloc_new</code>, which counts blocks "
+                        "taken while still holding reusable content — an upper "
+                        "bound, since a freed partial block lands there too. ") +
                      "<code>device step</code> brackets the whole loop body, so it "
                      "tracks wall clock rather than GPU-busy time.</p>")
     else:
@@ -1816,6 +2705,9 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
         ("isl_cached_total", "cached ISL"), ("isl_new_total", "new ISL"),
         ("osl_total", "OSL"), ("low_hit_rate_requests", f"< {HIT_RATE_FLOOR:.0%}"),
         ("kv_evicted_tokens_total", "evicted tok"),
+        ("kv_host_dropped_blocks_total", "dropped pg"),
+        ("kv_onboard_blocks_total", "onboard pg"),
+        ("kv_pool_filled_peak", "pool filled"),
         ("prefill_utilization_mean", "util"), ("prefill_imbalance_mean", "imbalance"),
         ("gpu_prefill_batches", "prefill batches"),
         ("gpu_decode_batches", "decode batches")]))
@@ -1917,22 +2809,110 @@ def _budget(attempt_dir: Path, key: str, names: tuple[str, ...],
     return default
 
 
-def load_run(attempt_dir: Path) -> dict:
+def _apply_window(run: Run, loaded: dict,
+                  window: tuple[float | None, float | None]) -> dict:
+    """Drop everything outside the window, from every source at once.
+
+    Filtering happens *after* the rows are built, never while reading, because
+    the iteration metrics are deltas against the previous iteration: cutting the
+    log first would charge the whole idle stretch to the first surviving
+    iteration, inventing a burst of allocations and evictions that never
+    happened. Built first, then filtered, every delta is still the one-step
+    delta it claims to be.
+
+    ``gpu_forward_ms`` re-reads the perf records rather than the request rows,
+    so the run's perf cache has to be narrowed too -- by request id, since those
+    records carry a per-process monotonic clock that cannot be compared to wall
+    time. A record whose request was dropped is dropped with it, which is what
+    keeps section 4's GPU time inside the window.
+    """
+    kept = {"requests": [], "ctx_iters": [], "gen_iters": [], "rank_iters": [],
+            "rank_pg_iters": []}
+    undated = 0
+    for row in loaded["requests"]:
+        if _inside(row.get("started_at"), window):
+            kept["requests"].append(row)
+        elif row.get("started_at") is None:
+            undated += 1
+    for key in ("ctx_iters", "gen_iters", "rank_iters", "rank_pg_iters"):
+        kept[key] = [row for row in loaded[key]
+                     if _inside(_parse_stamp(row.get("timestamp")), window)]
+
+    ids = {str(row["rid"]) for row in kept["requests"] if row.get("rid") is not None}
+    ids |= {str(row["ctx_request_id"]) for row in kept["requests"]
+            if row.get("ctx_request_id") is not None}
+    narrowed = []
+    for record in _load_perf(run):
+        ctx = record.get("ctx_perf_metrics") or {}
+        gen = record.get("gen_perf_metrics") or {}
+        if any(str(key) in ids for key in
+               (ctx.get("ctx_request_id"), gen.get("ctx_request_id"),
+                record.get("ctx_request_id"), record.get("request_id"))
+               if key not in (None, "")):
+            narrowed.append(record)
+    run._perf_cache = narrowed
+
+    excluded = {key: len(loaded[key]) - len(kept[key]) for key in kept}
+    excluded["undated_requests"] = undated
+    return {**loaded, **kept, "excluded": excluded}
+
+
+def load_run(attempt_dir: Path,
+             window: tuple[float | None, float | None] = (None, None)) -> dict:
     """Everything one attempt directory yields, tagged with its run name."""
     run = Run(attempt_dir)
     token_budget = _budget(attempt_dir, "max_num_tokens",
                            ("ctx_config.yaml", "server_config.yaml"), 8192)
     batch_budget = _budget(attempt_dir, "max_batch_size",
                            ("gen_config.yaml", "server_config.yaml"), 128)
-    ctx_iters, capacity, rank_iters = build_ctx_iters(run, token_budget)
+    ctx_iters, capacity, rank_iters, rank_pg_iters = build_ctx_iters(
+        run, token_budget)
     gen_iters = build_gen_iters(run, batch_budget)
     requests = build_requests(run)
-    for rows in (ctx_iters, gen_iters, requests, rank_iters):
+    for rows in (ctx_iters, gen_iters, requests, rank_iters, rank_pg_iters):
         for row in rows:
             row["run"] = run.name
-    return {"run": run, "requests": requests, "ctx_iters": ctx_iters,
-            "gen_iters": gen_iters, "capacity": capacity,
-            "rank_iters": rank_iters}
+    loaded = {"run": run, "requests": requests, "ctx_iters": ctx_iters,
+              "gen_iters": gen_iters, "capacity": capacity,
+              "rank_iters": rank_iters, "rank_pg_iters": rank_pg_iters}
+    if window[0] is None and window[1] is None:
+        return {**loaded, "excluded": {}}
+    return _apply_window(run, loaded, window)
+
+
+def _run_name(attempt_dir: Path) -> str:
+    """The run a directory belongs to, named or not.
+
+    Both layouts are in the wild -- `<root>/<run>/attempt-NNN` and, since the
+    dated rollout, `<root>/<YYYY-MM>/<DD>/<run>/attempt-NNN` -- so the run is
+    recognised by shape rather than by depth, and a run directory passed
+    without its attempt still names itself.
+    """
+    resolved = attempt_dir.resolve()
+    return (resolved.parent.name if _ATTEMPT_DIR.fullmatch(resolved.name)
+            else resolved.name)
+
+
+def resolve_out(out: Path | None, attempt_dirs: list[Path]) -> Path:
+    """Report directory: a label under REPORTS_ROOT, unless --out is absolute.
+
+    A relative --out is read as a label, not a path, so `--out glm5.2_pilot`
+    lands where every other report lives instead of wherever the shell happened
+    to be standing. An absolute path is the one way out of the root, for the
+    case where somebody deliberately wants the report elsewhere.
+
+    Two attempts of one run share a label and the later overwrites the earlier,
+    which is the wanted behaviour for a re-run and not for a comparison; give
+    the second an explicit label when both are being kept.
+    """
+    if out is not None:
+        return out if out.is_absolute() else REPORTS_ROOT / out
+    names = [_run_name(d) for d in attempt_dirs]
+    # A merge is named after the run it starts from, which is only ever a
+    # stand-in: pass --out when the merge has a subject of its own.
+    label = (names[0] if len(names) == 1
+             else f"_merged_{len(names)}runs_{names[0]}")
+    return REPORTS_ROOT / label
 
 
 def main() -> int:
@@ -1940,23 +2920,41 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("attempt_dir", type=Path, nargs="+")
-    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--out", type=Path, default=None,
+                        help=f"report label under {REPORTS_ROOT}, or an "
+                             "absolute path to write outside it "
+                             "(default: the run's own name)")
     parser.add_argument("--causes", type=Path, default=None,
                         help="CSV of request_index,cause to annotate the "
                              "low-hit-rate table")
+    parser.add_argument("--since", default=None, metavar="ISO",
+                        help="ignore everything before this instant, e.g. "
+                             "2026-08-21T12:57:49+00:00 -- for a run whose "
+                             "traffic came in waves separated by idle hours, "
+                             "which would otherwise be charged to the workload "
+                             "(naive stamps are read as local time)")
+    parser.add_argument("--until", default=None, metavar="ISO",
+                        help="ignore everything after this instant")
     args = parser.parse_args()
 
-    loaded = [load_run(d) for d in args.attempt_dir]
+    window = (parse_bound(args.since), parse_bound(args.until))
+    loaded = [load_run(d, window) for d in args.attempt_dir]
     runs = [entry["run"] for entry in loaded]
-    out = args.out or (args.attempt_dir[0] / "analysis")
+    out = resolve_out(args.out, args.attempt_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     requests = [r for entry in loaded for r in entry["requests"]]
     ctx_iters = [r for entry in loaded for r in entry["ctx_iters"]]
     gen_iters = [r for entry in loaded for r in entry["gen_iters"]]
     rank_iters = [r for entry in loaded for r in entry["rank_iters"]]
-    capacity = next((e["capacity"] for e in loaded if e["capacity"].get("capacity_tokens")),
-                    {})
+    rank_pg_iters = [r for entry in loaded for r in entry["rank_pg_iters"]]
+    # Prefer a run that found the v1 capacity line, since that one yields
+    # tokens; fall back to any run that at least recovered the slot count from
+    # the level counters, which is all a v2 log offers.
+    capacity = next(
+        (e["capacity"] for e in loaded if e["capacity"].get("capacity_tokens")),
+        next((e["capacity"] for e in loaded if e["capacity"].get("slots_per_rank")),
+             {}))
 
     requests.sort(key=lambda r: (r.get("started_at") or 0, str(r.get("rid"))))
     for index, row in enumerate(requests):
@@ -1978,9 +2976,32 @@ def main() -> int:
     for session in sessions:
         session["runs"] = len({r["run"] for r in requests
                                if r.get("session_id") == session["session_id"]})
-    summary = build_summary(runs, requests, sessions, ctx_iters, gen_iters, capacity)
+    summary = build_summary(runs, requests, sessions, ctx_iters, gen_iters,
+                            capacity, rank_iters)
 
     notes = []
+    if window[0] is not None or window[1] is not None:
+        def edge(value: float | None, fallback: str) -> str:
+            if value is None:
+                return fallback
+            stamp = datetime.fromtimestamp(value).astimezone()
+            return (f"{stamp.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S} UTC "
+                    f"({stamp:%H:%M:%S} local)")
+        dropped = {key: sum(e["excluded"].get(key, 0) for e in loaded)
+                   for key in ("requests", "ctx_iters", "gen_iters",
+                               "undated_requests")}
+        notes.append(
+            f"Analysis window: {edge(window[0], 'run start')} → "
+            f"{edge(window[1], 'run end')}. Everything outside it is excluded "
+            f"from every figure below — {dropped['requests']:,} requests, "
+            f"{dropped['ctx_iters']:,} prefill and {dropped['gen_iters']:,} "
+            "decode iterations, and the GPU time of the requests dropped. Wall "
+            "clock is measured inside the window only, so an idle stretch "
+            "outside it is not charged to the workload."
+            + (f" {dropped['undated_requests']:,} requests carried no timestamp "
+               "(engine-only rows the audit never saw) and could not be placed "
+               "in the window, so they are dropped too."
+               if dropped["undated_requests"] else ""))
     if len(runs) > 1:
         spanning = sum(1 for s in sessions if s.get("runs", 1) > 1)
         notes.append(
@@ -1995,6 +3016,15 @@ def main() -> int:
               " restarts, so the key in the merged CSVs is"
               " <code>(run, rid)</code>. Every cross-source join happens inside"
               " a run before merging, so the collisions are cosmetic.")
+    ambiguous = sum(r.route_client_ambiguous for r in runs)
+    if ambiguous:
+        notes.append(
+            f"{ambiguous:,} client ids appeared under more than one context "
+            "worker, so the routing columns are blank for the requests that "
+            "resolve only by client id. <code>client_id</code> is a per-worker "
+            "counter that restarts at 1 on every instance, so attaching one "
+            "worker's decision to another's request would be worse than "
+            "attaching none.")
     if not any(r.audit.exists() for r in runs):
         notes.append("No <code>anthropic_audit.jsonl</code>: sections 1 and 2 carry "
                      "only what the engine reported.")
@@ -2002,19 +3032,36 @@ def main() -> int:
         notes.append(f"{summary['phases_without_gpu_time']} request phases reported "
                      "timing but no GPU breakdown (overlap scheduler).")
     if not capacity.get("capacity_tokens"):
-        notes.append("KV capacity not found in the worker logs "
-                     "(<code>Max KV cache blocks per sequence</code>), so per-rank "
-                     "session capacity is blank.")
+        notes.append(
+            "KV capacity in <em>tokens</em> not found in the worker logs "
+            "(<code>Max KV cache blocks per sequence</code>), so per-rank session "
+            "capacity is blank."
+            + (f" The pool size in <em>slots</em> is known — "
+               f"{capacity['slots_per_rank']:,.0f} per rank, recovered from the "
+               "level counters — but it is deliberately not converted to tokens: "
+               "with more than one pool group the slot sizes differ, and "
+               "multiplying by <code>tokens_per_block</code> overstates the pool."
+               if capacity.get("slots_per_rank") else "")
+            + (" That single number is itself a poor summary: the pool ratio "
+               "splits <em>bytes</em>, so a group whose blocks are large gets "
+               "proportionally fewer slots. Per pool group the split is "
+               + " / ".join(f"{v:,.0f}"
+                            for v in capacity["slots_per_rank_by_pg"])
+               + ", so the largest group can dominate the total while a small "
+               "one saturates and evicts."
+               if capacity.get("slots_per_rank_by_pg") else ""))
 
     _write_csv(out / "requests.csv", requests)
     _write_csv(out / "sessions.csv", sessions)
     _write_csv(out / "ctx_iters.csv", ctx_iters)
     _write_csv(out / "ctx_rank_iters.csv", rank_iters)
+    if rank_pg_iters:
+        _write_csv(out / "ctx_rank_pg_iters.csv", rank_pg_iters)
     _write_csv(out / "gen_iters.csv", gen_iters)
     _write_csv(out / "summary.csv", [summary])
     (out / "REPORT.html").write_text(
         render_html(runs, requests, sessions, ctx_iters, gen_iters, rank_iters,
-                    summary, notes),
+                    summary, notes, rank_pg_iters, capacity),
         encoding="utf-8")
 
     label = (f"{len(runs)} runs merged" if len(runs) > 1 else runs[0].name)

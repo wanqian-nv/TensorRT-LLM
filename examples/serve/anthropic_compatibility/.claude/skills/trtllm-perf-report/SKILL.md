@@ -13,16 +13,40 @@ SPDX-License-Identifier: Apache-2.0
 Base directory (all paths relative to it):
 `TensorRT-LLM/examples/serve/anthropic_compatibility/`
 
+Reports directory, written `<REPORTS>` below — every report this skill
+produces goes here and nowhere else:
+`/lustre/fsw/portfolios/coreai/users/serli/workspace/TensorRT-LLM/examples/serve/anthropic_compatibility/_reports/`
+
+It sits beside this checkout, not beside the runs it describes: the trace root
+is raw capture that gets rsynced and cleaned up, and it is read-only to some
+callers, while a report is the thing you link to and open — so it lives where
+the editor already has the tree loaded. `.gitignore` keeps `_reports/` out of
+`git status`; it is in the working tree but never in its history.
+
+`perf_report.py` writes there on its own, so **do not pass a path to `--out`**
+and never leave a report in the run directory or `/tmp`. `--out` takes a
+*label*, which is resolved under that root; omit it and the label is the run's
+own name. `build_index.py` reads the same root by default and its index links
+relatively, so a report written outside it is invisible to the index.
+`PERF_REPORTS_DIR` moves the root for both — set it when working against a
+different trace root (computelab has its own), never to redirect a single
+report.
+
+`index.html` lists the reports **newest first**, so the run just built is the
+top row; it is the intended entry point rather than the file tree.
+
 ## Step 0 — Find the run
 
 A run is an **attempt** directory: it holds `ctx-0.log` / `gen-0.log` (disaggregated)
 or `server.log` (aggregated). Search under
-`/lustre/fsw/portfolios/coreai/users/serli/claude-traces/`, layout
-`<root>/<run_name>/attempt-NNN/`. Skip `_fleet` and `_sbatch_logs`. Highest
-attempt number unless the user names one.
+`/lustre/fsw/portfolios/coreai/users/serli/claude-traces/`. Both layouts are in
+the wild — `<root>/<run_name>/attempt-NNN/` and, since serve.sh started dating
+them, `<root>/<YYYY-MM>/<DD>/<run_name>/attempt-NNN/` — so search to depth 5:
+at depth 3 all but the oldest handful of runs are invisible. Skip `_fleet`,
+`_sbatch_logs` and `_reports`. Highest attempt number unless the user names one.
 
 ```bash
-find /lustre/fsw/portfolios/coreai/users/serli/claude-traces -maxdepth 3 \
+find /lustre/fsw/portfolios/coreai/users/serli/claude-traces -maxdepth 5 \
      \( -name 'ctx-0.log' -o -name 'server.log' \) -printf '%h\n' | sort -u
 ```
 
@@ -45,14 +69,12 @@ answers produce different documents and neither is recoverable from the other:
   the runs differ in config and the question is which config won.
 
 ```bash
-# merged: one report over all of them
-python3 analysis/perf_report.py <DIR_1> <DIR_2> … --out <REPORTS>/<label>
+# merged: one report over all of them, under a label naming the merge
+python3 analysis/perf_report.py <DIR_1> <DIR_2> … --out _merged_<subject>
 
-# compared: one report each, then an index
-for d in <DIR_1> <DIR_2> …; do
-  python3 analysis/perf_report.py "$d" --out <REPORTS>/$(basename $(dirname $d))
-done
-python3 analysis/build_index.py <REPORTS>
+# compared: one report each — the label defaults to the run name — then index
+for d in <DIR_1> <DIR_2> …; do python3 analysis/perf_report.py "$d"; done
+python3 analysis/build_index.py
 ```
 
 A merged report states how many runs went into it and lists each one's
@@ -68,7 +90,8 @@ figure — they only matter if you re-join the CSVs by hand.
 python3 analysis/perf_report.py <ATTEMPT_DIR>
 ```
 
-Writes to `<ATTEMPT_DIR>/analysis/`:
+Writes to `<REPORTS>/<run name>/`, and prints the path it chose — quote that
+path rather than reconstructing it:
 
 | file | grain |
 |---|---|
@@ -125,8 +148,13 @@ and Steps 4b/4c label it. Do not re-derive that logic here.
 Run the mechanical pass first — it labels the cases that are decidable from
 the captured bodies alone, so only the residue needs reading:
 
+It reads `requests.csv` from the report, so it takes the report directory
+first and the attempt directories it was built from second, and the causes
+live in the report beside the numbers they explain:
+
 ```bash
-python3 analysis/classify_causes.py <ATTEMPT_DIR> -o /tmp/causes.csv
+python3 analysis/classify_causes.py <REPORTS>/<label> <ATTEMPT_DIR>… \
+    > <REPORTS>/<label>/causes.csv
 ```
 
 Its labels: `COLD_START`, `THREAD_START`, `SYSTEM_CHANGED`, `SYSTEM_HOISTED`,
@@ -136,12 +164,11 @@ those lines to the same CSV, then feed the whole file back so the causes live
 next to the numbers:
 
 ```bash
-cat >> /tmp/causes.csv <<'EOF'
-request_index,cause
+cat >> <REPORTS>/<label>/causes.csv <<'EOF'
 0,turn 1 of the session — cold by construction
 118,SYSTEM_HOISTED — a task-notification system message was appended, rewriting the prompt head
 EOF
-python3 analysis/perf_report.py <ATTEMPT_DIR> --causes /tmp/causes.csv
+python3 analysis/perf_report.py <ATTEMPT_DIR> --causes <REPORTS>/<label>/causes.csv
 ```
 
 Turn 1 of a session is cold by construction; say so and move on rather than

@@ -3,11 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Index every report under a directory into one comparison page.
 
-    python3 analysis/build_index.py <reports_dir>
+    python3 analysis/build_index.py [reports_dir]
 
-Each immediate subdirectory holding a ``summary.csv`` becomes a row. Shares of
-wall clock sit next to the absolute figures because only the share survives
-comparison between runs of different length.
+Each immediate subdirectory holding a ``summary.csv`` becomes a row, newest
+first. Shares of wall clock sit next to the absolute figures because only the
+share survives comparison between runs of different length.
+
+The directory defaults to the reports root ``perf_report.py`` writes to, since
+the index links to its rows relatively and so only ever spans one root.
 """
 
 from __future__ import annotations
@@ -15,7 +18,16 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import os
 from pathlib import Path
+
+# Kept in step with perf_report.py's REPORTS_ROOT by the shared variable name:
+# a reports root that the writer and the indexer disagree about produces an
+# index that silently omits every report.
+REPORTS_ROOT = Path(os.environ.get(
+    "PERF_REPORTS_DIR",
+    "/lustre/fsw/portfolios/coreai/users/serli/workspace/TensorRT-LLM"
+    "/examples/serve/anthropic_compatibility/_reports"))
 
 CSS = """
 body{font:14px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,sans-serif;
@@ -41,18 +53,28 @@ def _f(value, fmt="{:,.0f}"):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("reports_dir", type=Path)
+    parser.add_argument("reports_dir", type=Path, nargs="?",
+                        default=REPORTS_ROOT,
+                        help=f"directory of reports to index "
+                             f"(default: {REPORTS_ROOT})")
     args = parser.parse_args()
 
+    # Newest first, keyed on summary.csv's mtime rather than the directory
+    # name: the label is chosen by the caller and sorts arbitrarily, so
+    # alphabetical order buries the run just built under whatever happens to
+    # start with an earlier character. The report you want is nearly always the
+    # one you just wrote, so it belongs in the first row.
     rows = []
-    for entry in sorted(args.reports_dir.iterdir()):
+    for entry in args.reports_dir.iterdir():
         summary = entry / "summary.csv"
         if not entry.is_dir() or not summary.exists():
             continue
         with summary.open(encoding="utf-8") as handle:
             record = next(csv.DictReader(handle), None)
         if record:
-            rows.append((entry.name, record))
+            rows.append((summary.stat().st_mtime, entry.name, record))
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    rows = [(name, record) for _, name, record in rows]
 
     body = []
     for name, r in rows:
@@ -85,8 +107,8 @@ def main() -> int:
     (args.reports_dir / "index.html").write_text(
         "<!doctype html><meta charset=utf-8><title>serving run reports</title>"
         f"<style>{CSS}</style><h1>Serving run reports</h1>"
-        "<p class='sub'>Derived metrics only — no prompt content. "
-        "Busy and idle are shares of wall clock.</p>"
+        "<p class='sub'>Newest first. Derived metrics only — no prompt "
+        "content. Busy and idle are shares of wall clock.</p>"
         "<table><thead><tr><th>run</th><th>req</th><th>sess</th><th>wall h</th>"
         "<th>busy</th><th>idle</th><th>hit</th><th>&lt;90%</th><th>util</th>"
         "<th>imbal</th><th>runs</th><th>csv</th></tr></thead><tbody>"
