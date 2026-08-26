@@ -1994,12 +1994,78 @@ class PyExecutor:
                         # rank's eviction count -- an upper bound, since a
                         # freed partial block that was never stored for reuse
                         # also lands there.
+                        #
+                        # That difference is a v1 signal only. The v2 manager
+                        # assigns alloc_total_blocks and alloc_new_blocks the
+                        # same value at every call site, so on v2 it is
+                        # identically zero and says nothing about eviction --
+                        # read kv_free_blocks/kv_evictable_blocks instead.
                         kv_extra_str = (
                             f"kv_hit_rate = {kv_stats.cache_hit_rate:.4f}, "
                             f"kv_reused_blocks = {kv_stats.reused_blocks}, "
                             f"kv_missed_blocks = {kv_stats.missed_blocks}, "
                             f"kv_alloc_total_blocks = {kv_stats.alloc_total_blocks}, "
                             f"kv_alloc_new_blocks = {kv_stats.alloc_new_blocks}, ")
+
+                        # kv_cache_util above is 1 - available/max, and
+                        # available is free + evictable, so it only ever
+                        # measures the blocks pinned by in-flight requests: it
+                        # reads the same on an empty pool and on one packed
+                        # with reusable prefixes. The split tells them apart --
+                        # free draining to zero while evictable rises is the
+                        # pool filling, and every allocation past that point
+                        # costs somebody's cached prefix.
+                        occupancy = getattr(self.kv_cache_manager,
+                                            "get_tier_occupancy", None)
+                        if occupancy is not None:
+                            free_blocks, evictable_blocks = occupancy()
+                            kv_extra_str += (
+                                f"kv_free_blocks = {free_blocks}, "
+                                f"kv_evictable_blocks = {evictable_blocks}, ")
+
+                        # The two sums above cannot show a single saturated
+                        # pool group, and one group at zero free is what
+                        # actually drives eviction: _prepare_free_slots sizes
+                        # its eviction off get_num_free_slots(pg_idx), one
+                        # group at a time. Summed, a starving group hides
+                        # behind whichever group holds the most slots, so the
+                        # pool reads 40% full while it evicts on every
+                        # allocation. Slash-joined rather than a list literal
+                        # so the line stays parseable as "key = value, " pairs.
+                        by_group = getattr(self.kv_cache_manager,
+                                           "get_tier_occupancy_by_pool_group",
+                                           None)
+                        if by_group is not None:
+                            free_pg, evictable_pg = by_group()
+                            free_pg_str = "/".join(map(str, free_pg))
+                            evictable_pg_str = "/".join(map(str, evictable_pg))
+                            kv_extra_str += (
+                                f"kv_free_blocks_by_pg = {free_pg_str}, "
+                                f"kv_evictable_blocks_by_pg = "
+                                f"{evictable_pg_str}, ")
+
+                        # Cross-tier movement, drained here rather than read
+                        # from the stats path: that path is off by default
+                        # (enable_iter_perf_stats) while the recording of these
+                        # counters is not (it rides on return_perf_metrics
+                        # too), so they are normally being kept and never
+                        # collected. Draining here makes the log their sole
+                        # consumer; when the stats path is on it drains and
+                        # totals them itself and we only read the totals, so
+                        # there is exactly one drain either way.
+                        accumulate = getattr(self.kv_cache_manager,
+                                             "accumulate_tier_totals", None)
+                        if accumulate is not None:
+                            tiers = (self.kv_cache_manager.get_tier_totals()
+                                     if self.enable_iter_perf_stats else
+                                     accumulate())
+                            # No iter_ prefix on the log keys: these are running
+                            # totals here, not per-iteration deltas.
+                            kv_extra_str += (
+                                f"kv_offload_blocks = {tiers.iter_offload_blocks}, "
+                                f"kv_onboard_blocks = {tiers.iter_onboard_blocks}, "
+                                f"kv_host_dropped_blocks = {tiers.iter_host_dropped_blocks}, "
+                            )
                     formatted_timestamp = datetime.datetime.now().strftime(
                         "%Y-%m-%d %H:%M:%S")
                     logger.info(

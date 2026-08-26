@@ -869,6 +869,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.enable_stats = enable_stats
+        # Cumulative cross-tier page movement. Whether these are recorded and
+        # whether anyone collects them are two different switches: enable_stats
+        # here is `enable_iter_perf_stats or return_perf_metrics` (_util.py
+        # _enable_kv_cache_stats), while the only drain in the tree --
+        # py_executor's stats path -- runs on enable_iter_perf_stats alone. So a
+        # run with return_perf_metrics on and iteration perf stats off keeps
+        # these counters and never reads them. Totalling them at every drain
+        # point lets a reader pick them up without a second consumer appearing.
+        self._tier_totals = KVCacheIterationStatsDelta()
         kv_cache_event_hash_algo = get_effective_kv_cache_event_hash_algo(
             kv_cache_config.kv_cache_event_hash_algo,
             use_kv_cache_manager_v2=True,
@@ -3002,6 +3011,73 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return kv_cache_stats
 
+    def get_tier_occupancy(self, cache_level: CacheLevel = GPU_LEVEL) -> tuple[int, int]:
+        """(free, evictable) slots at one cache level -- the split KvCacheStats merges.
+
+        ``get_kv_cache_stats`` reports ``free_num_blocks = available = free +
+        evictable``, and a block whose last reference was dropped stays in the
+        eviction LRU still holding valid, still-matchable content, so it counts
+        as free there. That merge is right for the allocator, which only asks
+        whether it can get a slot at all, but it leaves any utilization derived
+        from it blind to occupancy: an empty pool and one packed with reusable
+        prefixes read the same. Reported apart here so "the pool is full" and
+        "the pool is evicting" become observable at all.
+
+        Non-destructive -- introspection over the storage manager, not one of
+        the drain-on-read iteration counters below.
+        """
+        stats = self._get_storage_statistics(cache_level)
+        return sum(s.free for s in stats), sum(s.evictable for s in stats)
+
+    def get_tier_occupancy_by_pool_group(
+            self,
+            cache_level: CacheLevel = GPU_LEVEL) -> tuple[list[int], list[int]]:
+        """The same (free, evictable) slots, split per pool group.
+
+        ``get_tier_occupancy`` sums these, and the sum cannot answer the
+        question the split exists for. Allocation is decided one pool group at
+        a time -- ``StorageManager._prepare_free_slots`` sizes its eviction off
+        ``storage.get_num_free_slots(pg_idx)`` for a single group -- so one
+        saturated group evicts on every allocation while the summed free count,
+        dominated by whichever group has the most slots, still reads roomy.
+        Summing them is what makes "the pool is only 40% full yet it evicts
+        constantly" look like a contradiction rather than a pool-group split.
+
+        Ordered by pool group index, so the caller can zip it against
+        ``pool_group_descs``. Non-destructive, like the summed form.
+        """
+        stats = self._get_storage_statistics(cache_level)
+        return [s.free for s in stats], [s.evictable for s in stats]
+
+    def accumulate_tier_totals(self) -> KVCacheIterationStatsDelta:
+        """Drain the raw iteration deltas into the running totals, and return them.
+
+        The cheap path, for a caller that wants the totals and nothing else:
+        ``get_iteration_stats`` rebuilds the whole per-window and per-life-cycle
+        structure, far too much to do once per iteration, and it drains the same
+        counters -- so calling it from the iteration log would both cost and
+        collide.
+
+        Still a drain. Exactly one consumer may exist: call this only while the
+        iteration-stats path is off, or the deltas are split between the two and
+        both totals come out short.
+        """
+        if self.enable_stats:
+            for delta in self.impl.get_and_reset_iteration_stats().values():
+                self._tier_totals.add(delta)
+        return self._tier_totals
+
+    def get_tier_totals(self) -> KVCacheIterationStatsDelta:
+        """The same totals, without draining anything.
+
+        ``iter_offload_blocks`` is content evicted off GPU but still resident on
+        the host tier, ``iter_onboard_blocks`` is a hit paid for with a copy back
+        up, and ``iter_host_dropped_blocks`` is content that fell out of the
+        hierarchy altogether -- the only one of the three that is a real loss of
+        reusable prefix, and so the only one a hit-rate drop can be charged to.
+        """
+        return self._tier_totals
+
     def flush_iteration_events(self):
         if self.event_manager is not None:
             self.event_manager.flush_iteration_events()
@@ -3019,6 +3095,10 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
+        # This is a drain, so it is also where the running totals have to be
+        # kept up to date -- see accumulate_tier_totals for the other one.
+        for delta in raw_iteration_stats.values():
+            self._tier_totals.add(delta)
         raw_ssm_snapshot_iteration_stats = self.impl.get_and_reset_ssm_snapshot_iteration_stats()
         primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         num_cache_levels = len(self.impl.cache_tier_list)

@@ -102,19 +102,12 @@ moe_config:
 moe_expert_parallel_size: 4
 
 num_postprocess_workers: 8
-# Per-request timing and KV block counts, surfaced on /perf_metrics and as the
-# request-scoped Prometheus histograms (TTFT / TPOT / e2e) under
-# /prometheus/metrics. Independent of enable_iter_perf_stats: the request
-# metrics are logged from the response path (openai_server.py _extract_metrics),
-# not from the iteration-stats collector, so this alone is enough for them.
-# Costs a CUDA-event elapsed_time per batch in PerfMetricsManager, guarded by
-# query() but able to block when the event is not yet ready.
-perf_metrics_max_requests: 4096
-pipeline_parallel_size: 1
-print_iter_log: true
-reasoning_parser: deepseek_v4
-# perf_metrics_max_requests defaults to 0, which leaves the /perf_metrics deque
-# unbuilt (openai_server.py:623) even with this on -- both are required.
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. The pull endpoint
+# /perf_metrics that these settings used to feed no longer exists; serve.sh
+# appends perf_metrics_output_dir per attempt, since only it knows the path.
+# perf_metrics_max_requests went with the endpoint -- retention is the file now.
 return_perf_metrics: true
 scheduler_config:
   capacity_scheduler_policy: MAX_UTILIZATION

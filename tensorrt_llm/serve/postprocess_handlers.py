@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
@@ -22,6 +24,7 @@ from ..llmapi.reasoning_parser import (BaseReasoningParser,
                                        ReasoningParserFactory,
                                        ReasoningParserResult)
 from ..llmapi.tokenizer import TransformersTokenizer
+from ..logger import logger
 # yapf: disable
 from .chat_utils import make_tool_call_id
 from .harmony_adapter import (handle_non_streaming_response,
@@ -71,6 +74,13 @@ def _ctx_usage_for_postproc(args: PostprocArgs,
     return _ctx_usage_from_outputs(outputs)
 
 
+# Environment variable to record how each response was split into visible
+# text and tool calls. Set to a path; one JSON object per line, one line per
+# finished response. Unset (default) collects nothing.
+TOOL_PARSE_TRACE_ENV_VAR_NAME = "TRTLLM_TOOL_PARSE_TRACE"
+_PARSE_TRACE_PATH = os.environ.get(TOOL_PARSE_TRACE_ENV_VAR_NAME)
+
+
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
     echo: bool = False
@@ -90,6 +100,15 @@ class ChatPostprocArgs(PostprocArgs):
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
+    # Parse-trace accumulators, per choice, filled only when
+    # TRTLLM_TOOL_PARSE_TRACE names a path. The parsers hand back deltas, so
+    # the post-parse streams have to be rebuilt here; `output.text` and
+    # `output.token_ids` are already cumulative and are read at dump time.
+    trace_reasoning: dict[int, List[str]] = field(default_factory=dict)
+    trace_content: dict[int, List[str]] = field(default_factory=dict)
+    trace_text: dict[int, List[str]] = field(default_factory=dict)
+    trace_calls: dict[int, List[Any]] = field(default_factory=dict)
+    trace_steps: dict[int, List[Any]] = field(default_factory=dict)
     tool_call_id_type: str = "random"
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
@@ -223,6 +242,65 @@ def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
     return normal_text, calls
 
 
+def _record_parse_step(args: ChatPostprocArgs, output_index: int, output: Any,
+                       reasoning_delta: str, parser_input: str,
+                       text_delta: str, calls: List[ToolCallItem]) -> None:
+    """Accumulate one streaming step of the parse trace."""
+    args.trace_reasoning.setdefault(output_index, []).append(reasoning_delta or "")
+    args.trace_content.setdefault(output_index, []).append(parser_input or "")
+    args.trace_text.setdefault(output_index, []).append(text_delta or "")
+    if calls:
+        args.trace_calls.setdefault(output_index, []).extend({
+            "index": call.tool_index,
+            "name": call.name,
+            "parameters": call.parameters,
+        } for call in calls)
+    # `text_diff` is a slice of `text`, so recording the cumulative lengths
+    # rebuilds the streaming chunk boundaries without storing the deltas.
+    args.trace_steps.setdefault(output_index, []).append(
+        [len(output.token_ids or []), len(output.text or "")])
+
+
+def _write_parse_trace(args: ChatPostprocArgs, output_index: int,
+                       output: Any) -> None:
+    """Append one line describing how this response was split up.
+
+    Written for every finished response rather than when something looks
+    wrong. Each boundary it records is independently checkable offline:
+    re-decoding ``token_ids`` and diffing against ``detokenized`` isolates
+    detokenization, ``reasoning + content`` against ``detokenized`` isolates
+    the reasoning parser, and ``text + calls`` against ``content`` isolates
+    the tool parser. A trigger would have to predict which one breaks, and
+    the failures seen so far have not all broken the same one -- so
+    ``degraded_branches`` is recorded as a field to filter on, not as the
+    condition for capturing at all.
+    """
+    tool_parser = args.tool_parser_dict.get(output_index)
+    record = {
+        "event": "tool_parse_trace",
+        "response_id": args.stream_response_id,
+        "choice": output_index,
+        "finish_reason": output.finish_reason,
+        "token_ids": output.token_ids,
+        "detokenized": output.text,
+        "reasoning": "".join(args.trace_reasoning.pop(output_index, [])),
+        "content": "".join(args.trace_content.pop(output_index, [])),
+        "text": "".join(args.trace_text.pop(output_index, [])),
+        "calls": args.trace_calls.pop(output_index, []),
+        "steps": args.trace_steps.pop(output_index, []),
+        "degraded_branches": ([] if tool_parser is None else
+                              tool_parser._degraded_branches),
+    }
+    try:
+        with open(_PARSE_TRACE_PATH, "a", encoding="utf-8") as trace_file:
+            trace_file.write(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+            trace_file.write("\n")
+    except OSError as error:
+        logger.warning("Failed to write tool parse trace to %s: %s",
+                       _PARSE_TRACE_PATH, error)
+
+
 @nvtx_range_debug("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase,
                                args: ChatPostprocArgs) -> List[str]:
@@ -301,12 +379,18 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 ),
             ], )
         else:
+            parser_input = delta_text
             delta_text, calls = apply_tool_parser(
                 args,
                 i,
                 delta_text,
                 True,
                 finished=(output.finish_reason is not None))
+            if _PARSE_TRACE_PATH:
+                _record_parse_step(args, i, output, reasoning_delta_text,
+                                   parser_input, delta_text, calls)
+                if output.finish_reason is not None:
+                    _write_parse_trace(args, i, output)
             tool_calls = []
             for call_item in calls:
                 # Tool call ID should be generated only once per tool call

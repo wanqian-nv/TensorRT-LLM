@@ -414,46 +414,6 @@ FLEET_END_TIME=0
 # runs under `set -e`: if a stalled filesystem could fail this function, it
 # could take the server down with it. The subshell absorbs both the exit status
 # and any message.
-# /perf_metrics is drain-on-read: each GET returns everything accumulated since
-# the last one and leaves the deque empty. Nothing polls it by default, so the
-# records are simply overwritten as the deque wraps at
-# perf_metrics_max_requests. The reference benchmark suite solves this with a
-# standalone poller process; here the controller already ticks every 10s for the
-# fleet heartbeat, so it drains the endpoints on the same beat and appends to
-# the attempt directory -- which means the files follow a relay to the next
-# backend the way adp_route_trace and anthropic_audit already do.
-#
-# Silent by design: a worker that is still loading, or a proxy without
-# perf_metrics_max_requests set, answers 404/empty and is skipped. Failing here
-# must never take down a serving controller.
-drain_perf_metrics() {
-    local attempt_dir
-    attempt_dir="$(cat "${CONTROL_DIR}/current_attempt_dir" 2>/dev/null || true)"
-    [[ -n "${attempt_dir}" && -d "${attempt_dir}" ]] || return 0
-    local name url
-    for name in "${PERF_TARGET_NAMES[@]:-}"; do
-        [[ -n "${name}" ]] || continue
-        url="${PERF_TARGET_URLS[${name}]}"
-        # A single non-empty JSON array becomes one line per record, each
-        # stamped so a consumer can tell which server and when it was drained.
-        curl -sS --max-time 5 "${url}/perf_metrics" 2>/dev/null \
-            | python3 -c '
-import json, sys, time
-try:
-    records = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if not records:
-    sys.exit(0)
-stamp = time.time()
-for record in records:
-    print(json.dumps({"source": sys.argv[1], "drained_at": stamp,
-                      "record": record}, default=str))
-' "${name}" >> "${attempt_dir}/perf_metrics-${name}.jsonl" 2>/dev/null || true
-    done
-    return 0
-}
-
 write_fleet() {
     [[ -n "${FLEET_FILE}" ]] || return 0
     local state
@@ -620,43 +580,6 @@ cmd_run() {
     FLEET_URL="http://${nodes[0]}:${CFG_PORT}"
     FLEET_FILE="${CFG_FLEET_DIR}/${SLURM_JOB_ID}.json"
 
-    # Where drain_perf_metrics looks. The aggregated path has one server; the
-    # disaggregated path has the proxy plus one endpoint per worker instance,
-    # placed by the same node/port walk launch_disagg uses, so the two stay in
-    # step without the controller reading the generated disagg_config.yaml.
-    PERF_TARGET_NAMES=()
-    declare -gA PERF_TARGET_URLS=()
-    if [[ "${CFG_DISAGG}" == "1" ]]; then
-        # The proxy is deliberately NOT a target. Its /perf_metrics handler is
-        # what makes it poll the workers -- DisaggPerfMetricsCollector.
-        # get_perf_metrics calls collect_metrics() on each client, and the
-        # worker endpoints are drain-on-read. So a GET here does not just return
-        # nothing useful (the collector is off, see launch_disagg); it also
-        # empties both workers' queues on the way, and those records are then
-        # dropped because nothing pairs with them. Leaving the proxy alone is
-        # what lets the two worker drains below see every request.
-        local perf_cursor=0 perf_port=$((CFG_PORT + 1)) perf_i perf_role perf_step
-        for perf_role in ctx gen; do
-            if [[ "${perf_role}" == "ctx" ]]; then
-                perf_step=$((CFG_CTX_RANKS / CFG_TASKS_PER_NODE))
-                for ((perf_i = 0; perf_i < CFG_CTX_INSTANCES; perf_i++)); do
-                    PERF_TARGET_NAMES+=("ctx-${perf_i}")
-                    PERF_TARGET_URLS["ctx-${perf_i}"]="http://${nodes[perf_cursor]}:${perf_port}"
-                    perf_cursor=$((perf_cursor + perf_step)); perf_port=$((perf_port + 1))
-                done
-            else
-                perf_step=$((CFG_GEN_RANKS / CFG_TASKS_PER_NODE))
-                for ((perf_i = 0; perf_i < CFG_GEN_INSTANCES; perf_i++)); do
-                    PERF_TARGET_NAMES+=("gen-${perf_i}")
-                    PERF_TARGET_URLS["gen-${perf_i}"]="http://${nodes[perf_cursor]}:${perf_port}"
-                    perf_cursor=$((perf_cursor + perf_step)); perf_port=$((perf_port + 1))
-                done
-            fi
-        done
-    else
-        PERF_TARGET_NAMES+=("server")
-        PERF_TARGET_URLS["server"]="http://${nodes[0]}:${CFG_PORT}"
-    fi
     mkdir -p "${CFG_FLEET_DIR}" 2>/dev/null || true
 
     echo "run dir: ${RUN_DIR}"
@@ -722,7 +645,6 @@ cmd_run() {
                 exit 0
             fi
             write_fleet
-            drain_perf_metrics
         fi
 
         sleep 2
@@ -792,6 +714,28 @@ cmd_launch() {
 
     local config_file="${attempt_dir}/server_config.yaml"
     local container_name="${CFG_NAME}-${SLURM_JOB_ID}"
+
+    # Upstream retired the pull-based /perf_metrics endpoint in favour of a
+    # writer that appends JSONL from inside each serving process, so the
+    # directory has to be named in the engine config rather than polled. Only
+    # this attempt knows its own path, which is why it is appended to the
+    # snapshot instead of living in the checked-in config.
+    #
+    # Appended here rather than beside the cp in start_attempt so that a
+    # restart is enough to pick the change up: the controller is a long-lived
+    # bash process still running whichever serve.sh it started with, while
+    # launch is re-exec'd per attempt and always reads the current file.
+    # Idempotent because a relaunch onto an existing attempt directory must not
+    # leave two keys behind -- the later one would silently win.
+    local perf_dir="${attempt_dir}/perf_metrics"
+    local cfg
+    mkdir -p "${perf_dir}"
+    for cfg in "${attempt_dir}"/{ctx,gen,server}_config.yaml; do
+        [[ -f "${cfg}" ]] || continue
+        grep -q '^perf_metrics_output_dir:' "${cfg}" && continue
+        # The leading newline guards a source config with no trailing one.
+        printf '\nperf_metrics_output_dir: %s\n' "${perf_dir}" >> "${cfg}"
+    done
     # Capture records raw /v1/messages bodies, which is what you want while
     # bringing a model up and not what you want once the URL is shared: every
     # user's prompts would land in this run directory. Both paths follow the
@@ -800,6 +744,15 @@ cmd_launch() {
     if [[ "${CFG_CAPTURE}" == "1" ]]; then
         export_env+=",TRTLLM_ANTHROPIC_AUDIT_LOG=${attempt_dir}/anthropic_audit.jsonl"
         export_env+=",TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR=${attempt_dir}/anthropic_message_capture"
+        # How each response was split into visible text and tool calls: token
+        # ids, the detokenized text, and the text after each of the two
+        # parsers. Gated with the two above rather than with the route trace:
+        # it holds no prompts, but model output quotes them freely, so once
+        # the URL is shared it carries other people's content just as they do.
+        # Unconditional within a captured run -- the three malformed-parse
+        # shapes seen so far each broke a different boundary, so a trigger
+        # would have had to predict which one to watch.
+        export_env+=",TRTLLM_TOOL_PARSE_TRACE=${attempt_dir}/tool_parse_trace.jsonl"
     fi
     # Attention-DP routing decisions, one JSON line per batch that routed
     # something. Content-free -- request ids, token counts and per-rank prefix
@@ -967,28 +920,16 @@ launch_disagg() {
         echo "backend: pytorch"
         echo "hostname: ${proxy_node}"
         echo "port: ${CFG_PORT}"
-        # The proxy's collector stays OFF (0 is also the DisaggServerConfig
-        # default). Turning it on costs almost every request's metrics.
-        #
-        # DisaggPerfMetricsCollector.get_perf_metrics polls each worker's own
-        # /perf_metrics, which is drain-on-read, and files what it finds under
-        # _server_metrics[server]. It then emits only the entries that pair with
-        # something in _request_meteics -- and that list is appended to by
-        # RawRequestResponseHooks.on_resp_done, gated on
-        # request.disaggregated_params. Streaming responses do not satisfy it:
-        # measured over one backend, 1009 of 1016 requests were streaming and
-        # exactly 7 records came out, matching the 7 non-streaming ones. The
-        # other 1009 requests' worker metrics were drained by the proxy, parked
-        # in memory, never matched, and dropped once the map hit its cap.
-        #
-        # Claude Code streams everything, so leaving the proxy collector on
-        # loses queue time, KV transfer size and duration, block reuse counts
-        # and ctx GPU forward time for ~99% of traffic -- and KV transfer timing
-        # has no other source at all. With the collector off the proxy stops
-        # polling, the controller's own drain reaches both workers directly, and
-        # every request is covered. The ctx/gen join the proxy would have done
-        # is reproducible offline: both sides carry ctx_request_id, and the
-        # route trace and audit records key on it too.
+        # Upstream replaced the pull-based /perf_metrics endpoint with a
+        # writer that appends JSONL from inside each serving process, so the
+        # controller no longer polls anything. That also makes the proxy safe to
+        # enable: it used to drain both workers' queues on every GET and drop
+        # whatever failed to pair, which cost ~99% of records because Claude
+        # Code streams and only non-streaming responses paired. Workers now push
+        # their metrics back in response headers (Server-Timing,
+        # X-TRTLLM-Step-Metrics) or an SSE event, and the proxy files the joined
+        # ctx+gen record itself -- the pairing we used to redo offline.
+        echo "perf_metrics_output_dir: ${attempt_dir}/perf_metrics"
         echo "context_servers:"
         echo "  num_instances: ${CFG_CTX_INSTANCES}"
         echo "  urls:"
@@ -1056,6 +997,7 @@ launch_disagg() {
             # put in export_env and the two streams would interleave. Give each
             # its own file; the aggregated path keeps the undecorated name.
             local worker_env="${export_env//adp_route_trace.jsonl/adp_route_trace-${role}-${i}.jsonl}"
+            worker_env="${worker_env//tool_parse_trace.jsonl/tool_parse_trace-${role}-${i}.jsonl}"
             "${clean_env[@]}" srun "${common[@]}" \
                 --nodelist "${worker_nodes}" \
                 --nodes "$([[ ${role} == ctx ]] && echo "${nodes_per_ctx}" || echo "${nodes_per_gen}")" \

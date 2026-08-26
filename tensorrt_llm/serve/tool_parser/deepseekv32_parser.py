@@ -346,6 +346,7 @@ class DeepSeekV32Parser(BaseToolParser):
                     # is not part of an invoke. Surfacing it as text loses no
                     # tool call -- the invoke that follows is still parsed --
                     # whereas raising here aborts the whole response.
+                    self._record_degradation("prefix-before-invoke", prefix)
                     normal_parts.append(prefix)
                     self._consume_normal_text(prefix)
                 self._append_tool_call(invoke_match, all_calls)
@@ -365,6 +366,8 @@ class DeepSeekV32Parser(BaseToolParser):
                     # while streaming, since the marker arrives before the
                     # invoke it belongs to. Neither is worth killing the stream
                     # for, so emit what we have as text and close the section.
+                    self._record_degradation("leftover-at-section-close",
+                                             leftover)
                     normal_parts.append(leftover)
                     self._consume_normal_text(leftover)
                 self._buffer = self._buffer[eot_position +
@@ -380,6 +383,7 @@ class DeepSeekV32Parser(BaseToolParser):
                 # request, and finish() still reports a truncated control token.
                 leftover = self._buffer[:eos_position]
                 if leftover.strip():
+                    self._record_degradation("leftover-at-eos", leftover)
                     normal_parts.append(leftover)
                     self._consume_normal_text(leftover)
                 self._buffer = self._buffer[eos_position +

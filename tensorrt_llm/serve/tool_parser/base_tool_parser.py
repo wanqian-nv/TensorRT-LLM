@@ -45,6 +45,22 @@ class BaseToolParser(ABC):
         self.eot_token = ""  # nosec B105
         self.tool_call_separator = ", "
 
+        # Markup that was surfaced as plain text instead of being parsed into
+        # a tool call. A parser only records here; the serving layer reads it
+        # when writing the parse trace, because only it holds the token ids
+        # that produced this text. Subclasses opt in via `_record_degradation`.
+        self._degraded_chars = 0
+        self._degraded_branches: List[str] = []
+
+    def _record_degradation(self, branch: str, text: str) -> None:
+        """Note that `text` was surfaced as prose instead of a tool call.
+
+        `branch` names the code path that gave up, so a report can say where
+        the parse fell apart rather than only that it did.
+        """
+        self._degraded_chars += len(text)
+        self._degraded_branches.append(branch)
+
     def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
         """
         Get a mapping of tool names to their indices in the tools list.

@@ -104,9 +104,12 @@ moe_config:
   backend: CUTEDSL
 moe_expert_parallel_size: 4
 
-# Per-request timing and KV block counts, matching what the aggregated
-# deployment collects so the two can be compared on the same numbers.
-perf_metrics_max_requests: 4096
+# Per-request timing and KV block counts, written straight to JSONL by the
+# serving process (PerfMetricsJsonlWriter) and echoed on each response so the
+# disaggregated proxy can file the joined ctx+gen record. The pull endpoint
+# /perf_metrics that these settings used to feed no longer exists; serve.sh
+# appends perf_metrics_output_dir per attempt, since only it knows the path.
+# perf_metrics_max_requests went with the endpoint -- retention is the file now.
 return_perf_metrics: true
 pipeline_parallel_size: 1
 print_iter_log: true
