@@ -145,4 +145,21 @@ gateway:
   # service, and the incumbent does not release its allocation early, so lead
   # time beyond the startup cost is time spent holding four nodes to serve two.
   lead_time: 2700
-  extra_args: ["--exclusive"]
+  # Pinned to one node because the gateway URL is the one address users hold --
+  # it goes in ANTHROPIC_BASE_URL and outlives every serving job, so letting the
+  # scheduler pick would silently invalidate everyone's environment on each
+  # resubmit. Unlike the serving jobs there is no automatic successor here: the
+  # gateway is submitted by hand, so the node is free to be a fixed choice.
+  #
+  # cpu-0044 rather than the cpu-0033 this used to name: cpu-[0029-0038] fell
+  # inside a 480-CPU, 7-day reservation, so the pin would have queued for most
+  # of a week instead of starting. cpu-[0044-0055] were all fully idle when this
+  # moved, which is the property worth pinning to. Changing the node changes the
+  # URL, so anyone holding ANTHROPIC_BASE_URL has to be told.
+  #
+  # No --exclusive. The gateway proxies HTTP on 4 of the node's 90 CPUs and has
+  # no claim on the other 86; exclusivity only bought isolation it does not need
+  # while making the pin fail on any node that is merely partly busy -- which is
+  # exactly how the cpu-0033 pin got stuck. Restore it only if the gateway is
+  # ever seen contending for CPU, and prefer raising --cpus-per-task first.
+  extra_args: ["--nodelist=cpu-0044"]

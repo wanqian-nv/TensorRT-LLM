@@ -93,6 +93,12 @@ enable_autotuner: false
 enable_chunked_prefill: true
 
 kv_cache_config:
+  # Inert as long as pool_ratio below is set: the whole avg_seq_len /
+  # typical_step / warm-up constraints derivation is gated on
+  # `if kv_cache_config.pool_ratio is None` (kv_cache_manager_v2.py), which
+  # llm_args documents as "This does not take effect when pool_ratio is set."
+  # Kept so the intended sequence length stays on the record, and so removing
+  # pool_ratio restores a sized configuration rather than an unsized one.
   avg_seq_len: 262144
   dtype: fp8
   # Kept on. The aggregated deployment's traffic is Claude Code sessions whose
@@ -113,10 +119,33 @@ kv_cache_config:
   host_cache_size: 42949672960
   # DeepseekV4CacheManager only accepts 128 or 256.
   tokens_per_block: 128
-  # Split across the three pool groups DeepseekV4CacheManager builds -- SWA,
-  # COMPRESS, and COMPRESSOR -- in the ratio every reference recipe uses.
-  # Without it the manager falls back to its own split, which is not tuned
-  # for this checkpoint's compress ratios.
+  # Indexed by pool group, and the pool group index is the ascending sort of each
+  # group's slot-size vector -- an emergent order, not a semantic one, and not
+  # the order the roles are declared in. Verified end to end: the list is passed
+  # through verbatim (kv_cache_manager_v2.py, initial_pool_ratio) and indexed
+  # positionally in the C++ backend (storage/core.cpp, activeRatio[i] =
+  # ratioList[activePgs[i]]), where the grouping is a sorted
+  # std::map<std::vector<size_t>, ...> (storage/config.cpp). For this checkpoint:
+  #
+  #   [0] 0.55  COMPRESS + INDEXER_COMPRESS        non-sliding    0.63 MB/slot
+  #   [1] 0.22  SWA + r128 COMPRESSOR_KV/SCORE     windowed      20.3 MB/slot
+  #   [2] 0.23  r4 COMPRESSOR + INDEXER_COMPRESSOR windowed      39.3 MB/slot
+  #
+  # So 0.55 goes to COMPRESS, NOT to SWA, and "COMPRESSOR" is not one group: the
+  # r128 compressor state shares [1] with SWA, only the r4 quad is [2]. Confirmed
+  # against measurement -- the realised byte shares are 0.550/0.220/0.230, and the
+  # observed slot counts are 38,638 / 437 / 235 per rank, which is why the summed
+  # "free blocks" figure is ~98% group [0] and blind to the other two.
+  #
+  # Check the worker's own "DeepseekV4CacheManager role-to-pool/lifecycle mapping"
+  # log line before touching these. The order is emergent, so it moves with the
+  # layer mix, and TLLM_KV_CACHE_MANAGER_V2_BACKEND=python groups by insertion
+  # order instead of sorted -- config.cpp says so in as many words.
+  #
+  # Locally tuned; no in-tree reference recipe sets pool_ratio at all (the only
+  # guidance is blog26, "Users should therefore tune pool_ratio manually"). The
+  # manager's own fallback derivation is ~[0.94, 0.02, 0.04], i.e. even more
+  # group-[0]-heavy than this, so these values already concede budget to [1]/[2].
   pool_ratio: [0.55, 0.22, 0.23]
   event_buffer_max_size: 0
 
