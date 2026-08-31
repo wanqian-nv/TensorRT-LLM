@@ -45,6 +45,7 @@ deployments/
   computelab_deepseek_v4.yaml
   coreai_deepseek_v4_flash.yaml
   gateway_users.txt                 who may use the gateway, one username per line
+                                    (enforcement currently commented out -- see below)
   server_configs/                   trtllm-serve --config files (one per model)
 analysis/                           audit-log analysis and plotting
 ```
@@ -172,7 +173,7 @@ failure takes both models' front doors down together.
 Once per deployment, then only when the gateway's seven days run out:
 
 ```bash
-vi deployments/gateway_users.txt                                        # one username per line
+vi deployments/gateway_users.txt                                        # one username per line (not enforced right now)
 ./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --submit
 curl -s http://lego-c2-qs-26:8333/_gateway/health
 # {"status": "no_backend", "active": null, "uptime_s": 12}
@@ -279,7 +280,7 @@ What the three failures mean:
 
 | Response | Meaning | What to do |
 |---|---|---|
-| `401` | Not on the allowlist | Ask for a line in `gateway_users.txt`; it takes effect without a restart |
+| `401` | Not on the allowlist | **The allowlist check is currently commented out in `Gateway.handle`, so `/v1/*` no longer returns this.** With it on: ask for a line in `gateway_users.txt`; it takes effect without a restart |
 | `503` | Backends are rotating, or none has started | Wait -- clients retry on their own. Tens of minutes means no serving job is running |
 | `overloaded_error` partway through a reply | The backend went away mid-stream | Resend; the partial reply cannot be recovered |
 

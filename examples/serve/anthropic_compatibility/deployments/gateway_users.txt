@@ -1,3 +1,7 @@
+# NOTE: enforcement is currently commented out in gateway.py (Gateway.handle),
+# so every caller is let through regardless of this file. It is still loaded,
+# still watched, and still guards /_gateway/fleet -- uncomment to restore.
+#
 # Who may use the gateway. One username per line; blank lines and everything
 # after a '#' are ignored. The gateway rereads this file when it changes, so
 # adding somebody does not need a restart.

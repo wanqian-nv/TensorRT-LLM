@@ -515,10 +515,19 @@ class Gateway:
             return
 
         key = extract_key(headers) or "kf-anonymous"
-        if key not in self.fleet.users:
-            LOG.info("401 %s %s user=%r", method, path, key)
-            await respond(writer, error_response(401))
-            return
+        # Allowlist disabled on purpose. The check below rejected any key that
+        # was not a line in the users file, and an OpenAI-native client sends
+        # whatever OPENAI_API_KEY happens to be -- usually an sk-... string. It
+        # would be turned away here, by the gateway, so the request left no
+        # trace at all in the backend's server.log and looked like it had never
+        # been sent. `key` is still resolved above: the access line and the
+        # upstream user header keep attributing every request.
+        # Re-enable by uncommenting; the users file is still loaded and watched,
+        # and /_gateway/fleet still checks it.
+        # if key not in self.fleet.users:
+        #     LOG.info("401 %s %s user=%r", method, path, key)
+        #     await respond(writer, error_response(401))
+        #     return
 
         # Resolved once. The election loop may move `active` while this request
         # is in flight; everything below must keep talking about the same
@@ -1071,9 +1080,10 @@ async def main_async(args):
     fleet = Fleet(args)
     os.makedirs(args.fleet_dir, exist_ok=True)
     fleet.reload_users()
-    if not fleet.users:
-        LOG.warning("users file %s is empty; every request will get 401",
-                    args.users)
+    # Says it once per start, where an operator will see it: the source comment
+    # in Gateway.handle is not somewhere anyone looks before restarting this.
+    LOG.warning("user allowlist is DISABLED (%s is loaded but not enforced); "
+                "every caller on this network can use this gateway", args.users)
     fleet.discover()
 
     gateway = Gateway(fleet)
