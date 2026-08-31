@@ -44,6 +44,7 @@ from tensorrt_llm.serve.anthropic_adapter import (
     anthropic_error_response,
     anthropic_lcp_tracking_enabled,
     capture_anthropic_message_request,
+    capture_openai_request,
     collect_anthropic_lcp_observation,
     convert_anthropic_request,
     convert_chat_response,
@@ -285,6 +286,16 @@ class OpenAIDisaggServer:
             if request.url.path.startswith("/v1/messages"):
                 return anthropic_error_response(str(exc),
                                                 "invalid_request_error", 400)
+            # Opt-in only. A rejected body never reaches a worker and the log
+            # line above is throttled and carries no payload, so this is the
+            # only place the request that caused a 400 can still be kept.
+            try:
+                errors = exc.errors()
+            except Exception:  # noqa: BLE001
+                errors = None
+            await capture_openai_request(request,
+                                         outcome="reject",
+                                         validation_errors=errors)
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
@@ -365,6 +376,9 @@ class OpenAIDisaggServer:
         # annotation with request_type (as openai_server.py does).
         @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
+            # Before anything can raise, so an accepted body is kept even when
+            # the request goes on to fail somewhere downstream.
+            await capture_openai_request(raw_req, outcome="ok")
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:

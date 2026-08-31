@@ -91,6 +91,14 @@ STOP_REASON_MAP: Dict[str, AnthropicStopReason] = {
 ANTHROPIC_AUDIT_LOG_ENV = "TRTLLM_ANTHROPIC_AUDIT_LOG"
 ANTHROPIC_LCP_TRACKING_ENV = "TRTLLM_ANTHROPIC_LCP_TRACKING"
 ANTHROPIC_BENCH_CAPTURE_DIR_ENV = "TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR"
+# Same idea for the OpenAI routes. Separate variable rather than one switch
+# because these two carry different traffic: /v1/messages is the Claude Code
+# fleet, /v1/chat/completions is whatever else points at the same URL, and a
+# run usually wants to keep only one of them.
+OPENAI_BENCH_CAPTURE_DIR_ENV = "TRTLLM_OPENAI_BENCH_CAPTURE_DIR"
+# Routes that OPENAI_BENCH_CAPTURE_DIR_ENV covers. /v1/messages is deliberately
+# absent: it has its own audit-keyed capture above.
+OPENAI_CAPTURE_ROUTES = frozenset(("/v1/chat/completions", "/v1/completions"))
 _ANTHROPIC_BILLING_MARKER = "x-anthropic-billing-header:"
 # Real blocks top out at 94 characters; this only bounds the worst case.
 _ANTHROPIC_BILLING_MAX_CHARS = 512
@@ -248,6 +256,122 @@ async def capture_anthropic_message_request(
         logger.warning(
             "Failed to queue sensitive Anthropic message capture request_id=%s: %s",
             audit_record["audit_request_id"],
+            error,
+        )
+
+
+def _brief_validation_errors(errors: Any) -> Any:
+    """Reduce ``RequestValidationError.errors()`` to what is safe to store.
+
+    Two reasons, both load-bearing. ``input`` echoes the offending value, which
+    for a body-level failure is the whole request -- already stored beside this.
+    ``ctx`` can hold a live exception object, and one unserializable field would
+    make the writer drop the entire capture, losing exactly the payload this
+    exists to keep. Mirrors the [validation] log line's ``loc/type/msg``.
+    """
+    if not isinstance(errors, list):
+        return None
+    brief = []
+    for error in errors[:32]:
+        if not isinstance(error, dict):
+            brief.append({"msg": str(error)[:500]})
+            continue
+        brief.append({
+            "loc": [str(part) for part in error.get("loc", ())],
+            "type": str(error.get("type", "")),
+            "msg": str(error.get("msg", ""))[:500],
+        })
+    if len(errors) > 32:
+        brief.append({"msg": f"... {len(errors) - 32} more"})
+    return brief
+
+
+def _request_client(raw_request: Any) -> Optional[str]:
+    """Return ``host:port`` for the client socket, or None if unavailable."""
+    client = getattr(raw_request, "client", None)
+    if client is None:
+        return None
+    return f"{client.host}:{client.port}"
+
+
+async def capture_openai_request(
+    raw_request: Any,
+    *,
+    outcome: str,
+    validation_errors: Any = None,
+) -> None:
+    """Queue an opt-in full capture of an OpenAI-route request body.
+
+    The Anthropic capture above hangs off an audit record; /v1/chat/completions
+    and /v1/completions have none, so the client's source ``host:port`` is
+    carried instead. That is the field uvicorn prints in its access line, and it
+    is the only thing that joins a capture to the ``"POST /v1/chat/completions
+    HTTP/1.1" 400`` it produced.
+
+    ``outcome`` leads the filename so the rejected bodies are one ``ls reject-*``
+    away. They are the ones worth keeping: a request that fails body validation
+    never reaches a worker, and the 400 handler deliberately logs only the error
+    locations, so without this the payload that caused it is gone for good.
+    """
+    capture_dir_value = os.environ.get(OPENAI_BENCH_CAPTURE_DIR_ENV)
+    if not capture_dir_value:
+        return
+    # Guard here rather than at each call site: openai_chat is also reached
+    # from /v1/messages, which already has its own capture and must not be
+    # written twice under two different schemas.
+    if raw_request.url.path not in OPENAI_CAPTURE_ROUTES:
+        return
+
+    capture_id = uuid.uuid4().hex
+    try:
+        # Both call sites run after the body has been read (the route parsed it,
+        # or validation tried to), so Starlette replays it from its cache and
+        # this does not touch the receive channel.
+        raw_body = await raw_request.body()
+        try:
+            body = json.loads(raw_body)
+            body_parse_error = None
+        except ValueError as error:
+            # A body that is not JSON is exactly the kind that 400s, so keep the
+            # bytes rather than dropping the capture.
+            body = raw_body.decode("utf-8", "replace")
+            body_parse_error = str(error)
+        raw_headers = raw_request.scope.get("headers", ())
+        headers = [
+            [name.decode("latin-1"), value.decode("latin-1")]
+            for name, value in raw_headers
+        ]
+        relative_path = Path("requests") / f"{outcome}-{capture_id}.json.gz"
+        capture_path = Path(capture_dir_value) / relative_path
+        capture = {
+            "event": "openai_request_capture",
+            "captured_at": _utc_timestamp(),
+            "capture_id": capture_id,
+            "outcome": outcome,
+            "client": _request_client(raw_request),
+            "method": raw_request.method,
+            "path": raw_request.url.path,
+            "headers": headers,
+            "body": body,
+        }
+        if body_parse_error is not None:
+            capture["body_parse_error"] = body_parse_error
+        if validation_errors is not None:
+            capture["validation_errors"] = _brief_validation_errors(
+                validation_errors)
+        _ensure_anthropic_capture_writer()
+        _ANTHROPIC_CAPTURE_QUEUE.put_nowait((capture_path, capture))
+    except queue.Full:
+        logger.warning(
+            "Dropped OpenAI request capture %s (%s): writer queue is full",
+            capture_id,
+            outcome,
+        )
+    except Exception as error:  # noqa: BLE001 - capture must not break serving
+        logger.warning(
+            "Failed to queue OpenAI request capture %s (%s): %s",
+            capture_id,
+            outcome,
             error,
         )
 

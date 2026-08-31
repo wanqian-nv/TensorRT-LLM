@@ -22,15 +22,18 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from tensorrt_llm.serve.anthropic_adapter import (
+    capture_openai_request,
     flush_anthropic_message_captures,
 )
 from tensorrt_llm.serve.anthropic_protocol import AnthropicCountTokensResponse
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
@@ -378,6 +381,137 @@ def test_messages_route_captures_full_request_offline(
     assert stat.S_IMODE(capture_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(capture_path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(capture_path.stat().st_mode) == 0o600
+
+
+def _make_chat_route_client(chat_response):
+    """Mount /v1/chat/completions through the real disagg wrapper.
+
+    Not shared with ``_make_route_client``: that one stubs ``_wrap_entry_point``
+    out, and the wrapper is exactly what has to run here -- the capture hook
+    lives in it.
+    """
+    app = FastAPI()
+    server = object.__new__(OpenAIDisaggServer)
+    server._perf_metrics_collector = Mock()
+    server._allow_request_chat_template = True
+    server._collect_perf_metrics = False
+    backend = AsyncMock(return_value=chat_response)
+    app.add_api_route(
+        "/v1/chat/completions",
+        server._wrap_entry_point(backend, ChatCompletionRequest),
+        methods=["POST"],
+    )
+
+    # The 400 path is a closure inside OpenAIDisaggServer.__init__, so mirror
+    # its two capture lines rather than reaching into a half-built server.
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request, exc):
+        await capture_openai_request(request,
+                                     outcome="reject",
+                                     validation_errors=exc.errors())
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+    return TestClient(app), backend
+
+
+def _read_captures(capture_dir):
+    captures = []
+    for path in sorted((capture_dir / "requests").glob("*.json.gz")):
+        with gzip.open(path, "rt", encoding="utf-8") as capture_file:
+            captures.append((path, json.load(capture_file)))
+    return captures
+
+
+def _chat_request_body():
+    return {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "private chat prompt"}],
+    }
+
+
+def test_chat_completions_route_captures_full_request_offline(
+    tmp_path, monkeypatch
+):
+    capture_dir = tmp_path / "openai-private"
+    monkeypatch.setenv("TRTLLM_OPENAI_BENCH_CAPTURE_DIR", str(capture_dir))
+    client, _ = _make_chat_route_client(_chat_response())
+    request_body = _chat_request_body()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json=request_body,
+        headers={"authorization": "Bearer private-token"},
+    )
+    flush_anthropic_message_captures()
+
+    assert response.status_code == 200
+    (capture_path, capture), = _read_captures(capture_dir)
+    assert capture_path.name.startswith("ok-")
+    assert capture["event"] == "openai_request_capture"
+    assert capture["outcome"] == "ok"
+    assert capture["path"] == "/v1/chat/completions"
+    assert capture["body"] == request_body
+    assert capture["client"] is not None
+    assert ["authorization", "Bearer private-token"] in capture["headers"]
+    assert stat.S_IMODE(capture_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(capture_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(capture_path.stat().st_mode) == 0o600
+
+
+def test_chat_completions_route_captures_rejected_request(tmp_path, monkeypatch):
+    """The 400 body is the one with nowhere else to go: it never reaches a
+    worker, and the server-side log line carries only error locations."""
+    capture_dir = tmp_path / "openai-private"
+    monkeypatch.setenv("TRTLLM_OPENAI_BENCH_CAPTURE_DIR", str(capture_dir))
+    client, backend = _make_chat_route_client(_chat_response())
+    # `index` belongs to a streaming tool-call delta, not to a request-side tool
+    # call; a client that replays deltas verbatim sends it and gets a 400.
+    request_body = _chat_request_body() | {"parallel_tool_calls": True}
+
+    response = client.post("/v1/chat/completions", json=request_body)
+    flush_anthropic_message_captures()
+
+    assert response.status_code == 400
+    backend.assert_not_awaited()
+    (capture_path, capture), = _read_captures(capture_dir)
+    assert capture_path.name.startswith("reject-")
+    assert capture["outcome"] == "reject"
+    assert capture["body"] == request_body
+    assert {"loc": ["body", "parallel_tool_calls"],
+            "type": "extra_forbidden",
+            "msg": "Extra inputs are not permitted"} in (
+                capture["validation_errors"])
+    # Trimmed to loc/type/msg: `input` would duplicate the body stored above and
+    # `ctx` can hold a live exception, which would sink the whole capture.
+    assert all(set(error) <= {"loc", "type", "msg"}
+               for error in capture["validation_errors"])
+
+
+def test_chat_completions_capture_is_off_without_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("TRTLLM_OPENAI_BENCH_CAPTURE_DIR", raising=False)
+    client, _ = _make_chat_route_client(_chat_response())
+
+    assert client.post("/v1/chat/completions",
+                       json=_chat_request_body()).status_code == 200
+    flush_anthropic_message_captures()
+
+    assert not (tmp_path / "openai-private").exists()
+
+
+@pytest.mark.parametrize("server_kind", ["standard", "disagg"])
+def test_openai_capture_skips_the_anthropic_route(
+    tmp_path, monkeypatch, server_kind
+):
+    """openai_chat is also reached from /v1/messages, which has its own
+    audit-keyed capture; it must not be written a second time here."""
+    capture_dir = tmp_path / "openai-private"
+    monkeypatch.setenv("TRTLLM_OPENAI_BENCH_CAPTURE_DIR", str(capture_dir))
+    client, _ = _make_route_client(server_kind, _json_chat_response())
+
+    assert client.post("/v1/messages", json=_request()).status_code == 200
+    flush_anthropic_message_captures()
+
+    assert not capture_dir.exists()
 
 
 def test_messages_route_writes_final_stream_audit_record(tmp_path, monkeypatch):

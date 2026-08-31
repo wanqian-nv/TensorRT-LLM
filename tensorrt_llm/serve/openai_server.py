@@ -63,6 +63,7 @@ from tensorrt_llm.serve.anthropic_adapter import (
     anthropic_error_response,
     anthropic_lcp_tracking_enabled,
     capture_anthropic_message_request,
+    capture_openai_request,
     collect_anthropic_lcp_observation,
     convert_anthropic_count_tokens_request,
     convert_anthropic_request,
@@ -606,6 +607,15 @@ class OpenAIServer(_VideoRoutesMixin):
             # expect.
             if self.metrics_collector:
                 self.metrics_collector.log_request_error(http_code=400)
+            # Opt-in only; keeps the body that a 400 would otherwise take
+            # with it. See OPENAI_CAPTURE_ROUTES in anthropic_adapter.py.
+            try:
+                errors = exc.errors()
+            except Exception:  # noqa: BLE001
+                errors = None
+            await capture_openai_request(request,
+                                         outcome="reject",
+                                         validation_errors=errors)
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is ServerRole.VISUAL_GEN:
@@ -1702,6 +1712,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        # No-op unless TRTLLM_OPENAI_BENCH_CAPTURE_DIR is set, and skipped when
+        # this is the /v1/messages path reusing openai_chat.
+        await capture_openai_request(raw_request, outcome="ok")
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -2158,6 +2171,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
+        await capture_openai_request(raw_request, outcome="ok")
 
         async def completion_response(
                 promise: RequestOutput,

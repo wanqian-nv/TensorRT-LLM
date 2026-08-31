@@ -744,6 +744,12 @@ cmd_launch() {
     if [[ "${CFG_CAPTURE}" == "1" ]]; then
         export_env+=",TRTLLM_ANTHROPIC_AUDIT_LOG=${attempt_dir}/anthropic_audit.jsonl"
         export_env+=",TRTLLM_ANTHROPIC_BENCH_CAPTURE_DIR=${attempt_dir}/anthropic_message_capture"
+        # Same for the OpenAI routes. Separate directory because it holds a
+        # different population: /v1/messages is the Claude Code fleet, while
+        # /v1/chat/completions is whatever else was pointed at this URL, and
+        # only the latter keeps the bodies that failed request validation --
+        # those never reach a worker and appear nowhere else.
+        export_env+=",TRTLLM_OPENAI_BENCH_CAPTURE_DIR=${attempt_dir}/openai_request_capture"
         # How each response was split into visible text and tool calls: token
         # ids, the detokenized text, and the text after each of the two
         # parsers. Gated with the two above rather than with the route trace:
