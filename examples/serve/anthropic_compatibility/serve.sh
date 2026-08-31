@@ -796,7 +796,21 @@ cmd_launch() {
     # CFG_ENV_MULTI holds the env entries whose values contain commas and so
     # cannot ride in --export; setting them here puts them in srun's own
     # environment, which --export=ALL carries into every task.
+    #
+    # The two SLURM_*_PER_TASK variables leak the same way and are fatal rather
+    # than merely wrong. The gateway runs under --cpus-per-task 4, so its
+    # environment carries SLURM_TRES_PER_TASK=cpu=4; sbatch's default
+    # --export=ALL copies that into the serving job it submits, where Slurm also
+    # sets SLURM_CPUS_PER_TASK=1 for an allocation that asked for no such thing.
+    # srun then refuses to run at all -- "cpus-per-task set by two different
+    # environment variables" -- and the controller retries forever because a
+    # launch that never starts looks exactly like one that crashed. Job 608568
+    # burned two GB300 nodes over 260 attempts this way. Only the gateway's
+    # successors were affected; a job submitted by hand from a login shell has
+    # neither variable set. Unsetting both lets srun take its cpus-per-task from
+    # the allocation, which is what a hand submission does.
     local clean_env=(env -u NVIDIA_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES
+                     -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK
                      ${CFG_ENV_MULTI[@]+"${CFG_ENV_MULTI[@]}"})
 
     local install_cmd=(
