@@ -35,10 +35,37 @@ from pathlib import Path
 
 csv.field_size_limit(10 ** 9)
 
-# Claude Code rewrites the trailing message between turns (thinking
-# retention), so a clean continuation shows a common prefix of exactly
-# len(parent) - 1. Inherited from classify_causes.py, which measured it.
-TAIL_EDIT_SLACK = 1
+# There is deliberately no trailing-message tolerance here. One was carried for
+# a while on the belief that Claude Code rewrites the last message between
+# turns; measured, the only thing it ever absorbed was the API's two equivalent
+# encodings of a message body -- [{"type":"text","text":X}] on one turn and "X"
+# on the next, byte-identical text. `_canon` in extract_threads.py normalises
+# that, and with it normalised the tolerance changes nothing at all: threads,
+# links, negative gaps and the result-in-child invariant are identical with and
+# without it. A tolerance that forgives a real mismatch is a way to link two
+# requests that genuinely differ, so it is gone rather than kept "just in case".
+
+# One turn appends the assistant's reply plus the user's tool results, and
+# sometimes a harness-injected `role: system` message on top. Measured over
+# the 12,464 links the well-constrained digest key made on this run:
+# +2 messages 77.6%, +3 messages 22.3%, everything else 0.06%; tool calls
+# +1..+5 covers 99.2%. The digest key is constrained enough not to need a
+# bound, but the chain rescue is not -- without one, an empty chain prefix
+# matches every tool-less request, and 11 replayed requests were parented to
+# a 1-message stub 35 messages shallower than themselves. These are the
+# ceilings that rules out, set well above the observed spread.
+RESCUE_MAX_NEW_MSGS = 8
+RESCUE_MAX_NEW_CALLS = 8
+
+# The same ceiling on the digest path. It is well constrained about *ancestry*
+# -- the candidate's whole history must prefix the child's -- but says nothing
+# about *distance*, so when a request's immediate parent is missing from the
+# trace it happily attaches to a shallow ancestor instead. Observed once here:
+# a 75-message request linked to a 5-message turn 3, inventing a 96-minute gap
+# and a hit rate falling 0.93 -> 0.17 that no eviction caused. Once the jump is
+# past a few messages the immediate parent is simply absent, and an honest root
+# beats a fabricated 35-turn stride.
+LINK_MAX_NEW_MSGS = 8
 
 # --- result-text signatures, all verbatim from this run's captures ---------
 BG_LAUNCH = re.compile(r"^Command running in background with ID: (\w+)")
@@ -101,51 +128,180 @@ def _f(value) -> float | None:
 # --------------------------------------------------------------------------
 # stage 0 -- threads
 # --------------------------------------------------------------------------
-def build_threads(facts: dict, meta: dict) -> None:
+def _kind(fact: dict) -> str:
+    """What kind of agent this request belongs to.
+
+    `cc_is_subagent=true` in the billing header is the one authoritative flag;
+    the rest is read off the tool set and the persona line, which are what
+    actually differ. Carried on every row so a downstream report can group by
+    it without re-reading the captured bodies.
+    """
+    head = fact.get("sys_head") or ""
+    if "cc_is_subagent=true" in head:
+        return "subagent"
+    if not (fact.get("tool_names") or []):
+        # The tool-less title generator has one fixed prompt length; anything
+        # else tool-less is a probe or a one-shot extraction, not a session.
+        return "title" if fact.get("sys_chars") == 1327 else "no-tools"
+    if "You are Claude Code" in head:
+        return "main"
+    if "You are a Claude agent" in head:
+        return "sdk"
+    return "other"
+
+
+def _chain(fact: dict) -> tuple:
+    """The tool_use ids in this request's history, in order.
+
+    This is the conversation's causal spine and the one part of a prompt no
+    harness rewrites: an id is a random token the model minted on an earlier
+    turn and every later turn carries it verbatim. Keying threads on it makes
+    the reconstruction immune to everything that also *causes* a hit-rate drop
+    -- system prompt edits, tool-definition churn, `role: system` messages
+    appended into `messages` (measured: 22.4% of transitions), the
+    `<system-reminder>` block and its rolling `currentDate`, `cache_control`
+    migration, thinking retention. Keying on message digests instead couples
+    the two: the cause silently destroys the evidence, and a broken link is
+    indistinguishable from a genuinely new thread.
+    """
+    return tuple(u["id"] for u in fact.get("uses") or [] if u.get("id"))
+
+
+def build_threads(facts: dict, meta: dict) -> Counter:
     """Give every request a parent, a thread id and a gap against that parent.
 
-    The parent is the deepest earlier request in the same session whose whole
-    message list prefixes this one's (one trailing rewrite allowed). Indexing
-    prefixes by (length, hash) makes this a handful of dict lookups per
-    request rather than an all-pairs scan; the largest session here has 840
-    turns, which the quadratic form would not survive comfortably.
+    Two keys, in strict precedence -- and the order matters, because measuring
+    the other way round is what proved it:
+
+    1. message-digest prefix. Well constrained: the parent's whole history must
+       prefix the child's, so sibling branches cannot be confused.
+    2. tool_use chain, used *only* to rescue a request the digest left an
+       orphan. The chain is immune to everything a harness rewrites (system
+       prompt, tool definitions, `role: system` messages appended into
+       `messages` -- 22.4% of transitions -- `<system-reminder>` and its
+       rolling date, `cache_control`, thinking retention), so it recovers links
+       the digest drops when the harness edits the head of the prompt.
+
+    Running the chain as the *primary* key was tried and is wrong: it is
+    under-constrained, seeing only tool ids and none of the text, so it merges
+    sibling branches. Measured, it collapsed 1,229 threads to 572, produced 541
+    negative parent-relative gaps, and chose 218 parents whose history was not
+    even a prefix of the child. The rescue below therefore also demands the
+    parent had *finished* before the child started, which is what rules a
+    concurrently in-flight sibling out.
     """
+    checks: Counter = Counter()
     by_session: dict[str, list[str]] = defaultdict(list)
     for aid, fact in facts.items():
         by_session[fact.get("client_session_id") or ""].append(aid)
 
-    for session, ids in by_session.items():
+    for ids in by_session.values():
         ids.sort(key=lambda a: (meta[a]["started_at"] or 0.0, a))
+        chains = {a: _chain(facts[a]) for a in ids}
+        # Compare the conversation, not the harness's commentary. `messages`
+        # carries `role: "system"` entries the harness injects (the agent
+        # directory, the skill directory) and rewrites as MCP servers come and
+        # go -- measured on 22.4% of transitions. They are not conversation
+        # turns, so they are dropped before digesting; measured, this takes the
+        # result-in-child invariant from 99.99% to 100.00%.
+        # What an agent *is* cannot change mid-conversation: a subagent's
+        # turns are a different thread from its launcher's, however causally
+        # downstream they are. Measured, no legitimate link crosses this
+        # boundary (0 of 12,466) and no thread is internally mixed (0 of
+        # 1,227), so the constraint rejects nothing real -- but it is exactly
+        # what a chain rescue on an empty prefix got wrong, attaching three
+        # subagent threads to the main-agent turn that launched them.
+        # Rejections are counted rather than dropped: if this ever fires, the
+        # harness has grown a shape that needs looking at.
+        is_sub = {a: "cc_is_subagent=true" in (facts[a].get("sys_head") or "")
+                  for a in ids}
+        # `msgs_clean` is the per-message digest with `<system-reminder>`
+        # blocks already dropped by the extractor; combined with dropping
+        # `role: system` entries here, what is left is the conversation alone.
+        # Measured: 1,229 -> 1,227 roots and 16 -> 14 rooted mid-history, with
+        # both invariants unmoved.
+        convo = {a: [d for d, role in zip(facts[a].get("msgs_clean")
+                                          or facts[a]["msgs"],
+                                          facts[a].get("roles") or [])
+                     if role != "system"] for a in ids}
+        sizes = {a: len(convo[a]) for a in ids}
         exact: dict[tuple, list[str]] = defaultdict(list)
-        edited: dict[tuple, list[str]] = defaultdict(list)
-        for aid in ids:
-            msgs = facts[aid]["msgs"]
-            exact[(len(msgs), hash(tuple(msgs)))].append(aid)
-            if msgs:
-                edited[(len(msgs) - 1, hash(tuple(msgs[:-1])))].append(aid)
+        by_prefix: dict[tuple, list[str]] = defaultdict(list)
+        for a in ids:
+            msgs = convo[a]
+            exact[(len(msgs), hash(tuple(msgs)))].append(a)
+            by_prefix[chains[a]].append(a)
 
-        for aid in ids:
-            msgs = facts[aid]["msgs"]
-            mine = meta[aid]
-            parent = None
-            # Deepest first: the immediate parent, not a distant ancestor.
+        for a in ids:
+            mine, msgs, size = meta[a], convo[a], sizes[a]
+            started = mine["started_at"] or 0.0
+            best, how = None, ""
             for k in range(len(msgs) - 1, 0, -1):
                 key = (k, hash(tuple(msgs[:k])))
-                pool = exact.get(key, []) + edited.get(key, [])
-                # Only an earlier request can be a parent, and it must be
-                # strictly shorter or the two are the same turn re-sent.
-                cands = [c for c in pool
-                         if c != aid
-                         and (meta[c]["started_at"] or 0.0) <= (mine["started_at"] or 0.0)
-                         and len(facts[c]["msgs"]) < len(msgs)]
+                raw = exact.get(key, [])
+                pool = [c for c in raw
+                        if c != a
+                        and (meta[c]["started_at"] or 0.0) <= started
+                        and sizes[c] < size
+                        and size - sizes[c] <= LINK_MAX_NEW_MSGS]
+                checks["stride rejected"] += sum(
+                    1 for c in raw
+                    if c != a and (meta[c]["started_at"] or 0.0) <= started
+                    and sizes[c] < size and size - sizes[c] > LINK_MAX_NEW_MSGS)
+                cands = [c for c in pool if is_sub[c] == is_sub[a]]
+                checks["subagent-boundary rejected"] += len(pool) - len(cands)
                 if cands:
-                    parent = max(cands, key=lambda c: (len(facts[c]["msgs"]),
-                                                       meta[c]["started_at"] or 0.0))
+                    best = max(cands, key=lambda c: (sizes[c],
+                                                     meta[c]["started_at"] or 0.0))
+                    how = "digest"
                     break
-            mine["parent"] = parent
-            mine["prefix_depth"] = len(facts[parent]["msgs"]) if parent else 0
+            if best is None and chains[a]:
+                chain = chains[a]
+                # k >= 1: the parent has to share an actual tool_use id. The
+                # empty prefix matches every request that has not called a tool
+                # yet, and it linked three subagent threads to the main-agent
+                # turn that launched them -- causally downstream, but a
+                # different conversation sharing no prefix at all, so counting
+                # it as "turn N+1" would report a fabricated hit-rate cliff.
+                for k in range(len(chain) - 1, 0, -1):
+                    cands = [c for c in by_prefix.get(chain[:k], [])
+                             if c != a
+                             and is_sub[c] == is_sub[a]
+                             and len(chains[c]) < len(chain)
+                             and sizes[c] < size
+                             # finished, not merely started: an in-flight
+                             # request is a sibling branch, not a parent
+                             and (meta[c]["finished_at"] or 0.0) <= started
+                             # and it has to be one turn back, not a stub
+                             and size - sizes[c] <= RESCUE_MAX_NEW_MSGS
+                             and len(chain) - len(chains[c]) <= RESCUE_MAX_NEW_CALLS]
+                    if cands:
+                        best = max(cands, key=lambda c: (len(chains[c]), sizes[c]))
+                        how = "chain-rescue"
+                        break
+            mine["parent"] = best
+            # carried so a downstream report can partition a miss by cause
+            # without re-reading the captured bodies
+            mine["sys_digest"] = facts[a].get("system")
+            mine["kind"] = _kind(facts[a])
+            mine["n_msgs"] = len(facts[a]["msgs"])
+            # The role of the LAST message in the request body. On DeepSeek-V4
+            # a trailing role:"system" is re-roled to latest_reminder by
+            # _map_trailing_system_to_reminder, and _render_message then defers
+            # the generation prompt past it -- so the generation prompt and the
+            # reminder swap order between this turn and the next, and this
+            # turn's token sequence stops being a prefix of its child's. The
+            # separation is near total: on the 08-26 run P(parent's prefix is
+            # unreusable) is 81.6% when this is "system" and 0.03% when it is
+            # "user". Carried here so the report can name that cause without
+            # re-reading 14k captured bodies.
+            mine["tail_role"] = (facts[a].get("roles") or [None])[-1]
+            mine["parent_chain_len"] = len(chains[best]) if best else 0
+            mine["chain_len"] = len(chains[a])
+            mine["link_key"] = how
+            mine["is_subagent"] = is_sub[a]
+            checks[how or "root"] += 1
 
-    # thread id = the root each chain reaches; depth = position in the chain
     for aid in facts:
         seen, node = set(), aid
         while meta[node].get("parent") and node not in seen:
@@ -160,6 +316,7 @@ def build_threads(facts: dict, meta: dict) -> None:
         if parent and meta[parent]["finished_at"] and mine["started_at"]:
             mine["true_gap_ms"] = (
                 mine["started_at"] - meta[parent]["finished_at"]) * 1000.0
+    return checks
 
 
 # --------------------------------------------------------------------------
@@ -297,16 +454,35 @@ def main() -> int:
                 for call in (rec.get("response") or {}).get("tool_calls_emitted") or []:
                     if call.get("id"):
                         emitted[call["id"]] = aid
-    print(f"audit: {len(meta):,} matched, {len(emitted):,} emitted tool calls",
-          file=sys.stderr)
+    # A capture with no audit record has no timestamps, so it cannot be placed
+    # in a thread; observed on requests the gateway logged but never finished.
+    orphans = [aid for aid in facts if aid not in meta]
+    for aid in orphans:
+        del facts[aid]
+    print(f"audit: {len(meta):,} matched, {len(emitted):,} emitted tool calls"
+          + (f", {len(orphans)} capture(s) dropped for having no audit record"
+             if orphans else ""), file=sys.stderr)
 
-    build_threads(facts, meta)
+    checks = build_threads(facts, meta)
+    if checks["stride rejected"]:
+        print(f"stride guard rejected {checks['stride rejected']:,} candidate "
+              f"parent(s) more than {LINK_MAX_NEW_MSGS} messages back",
+              file=sys.stderr)
+    if checks["subagent-boundary rejected"]:
+        print(f"subagent-boundary guard rejected "
+              f"{checks['subagent-boundary rejected']:,} candidate parent(s)",
+              file=sys.stderr)
+    print(f"links: {checks['digest']:,} by digest prefix, "
+          f"{checks['chain-rescue']:,} rescued by tool-chain, "
+          f"{checks['root']:,} thread roots", file=sys.stderr)
     tool_rows = build_tool_calls(facts, meta, emitted)
     print(f"tool calls resolved: {len(tool_rows):,}", file=sys.stderr)
 
     with (work / "threads.csv").open("w", newline="", encoding="utf-8") as handle:
         cols = ["audit_request_id", "session_id", "thread_id", "thread_depth",
-                "parent", "prefix_depth", "started_at", "finished_at",
+                "parent", "parent_chain_len", "chain_len", "link_key",
+                "is_subagent", "kind", "sys_digest", "n_msgs", "tail_role",
+                "started_at", "finished_at",
                 "true_gap_ms", "in_window", "request_index", "kv_hit_rate",
                 "isl_total", "isl_cached", "osl", "match_len_best",
                 "match_len_chosen", "routed_rank", "session_turn_index",
@@ -317,7 +493,9 @@ def main() -> int:
             src = by_aid.get(aid, {})
             out.writerow({"audit_request_id": aid, **{
                 k: mine.get(k) for k in ("session_id", "thread_id", "thread_depth",
-                                         "parent", "prefix_depth", "started_at",
+                                         "parent", "parent_chain_len", "chain_len",
+                                         "link_key", "is_subagent", "kind", "sys_digest",
+                                         "n_msgs", "tail_role", "started_at",
                                          "finished_at", "true_gap_ms", "in_window")},
                 **{k: src.get(k) for k in ("request_index", "kv_hit_rate", "isl_total",
                                            "isl_cached", "osl", "match_len_best",

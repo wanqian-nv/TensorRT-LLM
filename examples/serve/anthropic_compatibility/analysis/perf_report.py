@@ -44,7 +44,7 @@ import json
 import os
 import re
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -64,6 +64,20 @@ _KV_CAPACITY = re.compile(
 _KV_V2 = re.compile(r"KV cache manager v2")
 
 HIT_RATE_FLOOR = 0.90  # below this a request is called out for investigation
+
+# Mirrors KVCacheAwareADPRouter's default `match_rate_threshold`. Below this
+# ratio the router forces every rank's match to 0, so all scores tie and the
+# decision falls through to the tie-breaks -- which is what makes a routing
+# reason readable at all. Not read from the worker config: a deployment that
+# overrides it will mislabel ties, so the reason table names the assumption.
+ROUTER_MATCH_RATE_THRESHOLD = 0.1
+
+# Prefix reuse is block-aligned, so a prompt's trailing partial block never
+# matches. One block is therefore the only shortfall that is not a loss.
+# Worth keeping conservative: it is the line between "the cache is fine" and
+# "the cache dropped something", and a percentage there hides partial evictions
+# in exact proportion to how long the prompt is.
+BLOCK_TOLERANCE = 128
 
 # Where every report goes: `_reports` beside this checkout, not beside the runs
 # it describes. The trace root holds raw capture that gets rsynced and cleaned
@@ -586,6 +600,7 @@ def build_requests(run: Run) -> list[dict]:
     # silently, since the ids collide only in the small-integer range. Kept in a
     # separate index, and a client id that more than one worker used resolves to
     # nothing rather than to whichever file happened to sort first.
+    _label_route_reasons(decisions)
     route_index = _index_by_ids(decisions, ("req_id",))
     client_index: dict[str, dict] = {}
     client_ambiguous: set[str] = set()
@@ -660,6 +675,130 @@ def _phase(perf: dict, side: str) -> dict:
         "first_iter": inner.get("first_iter"),
         "last_iter": inner.get("last_iter"),
     }
+
+
+def _label_route_reasons(decisions: list[dict]) -> None:
+    """Stamp each routing decision with *why* that rank won.
+
+    Replays the router's scoring loop per batch. The load figures in the trace
+    are a pre-batch snapshot, so the tie-break on active tokens can only be
+    reproduced by re-accumulating `effective_added` across the batch exactly as
+    `route_requests` does -- reading `load_before` directly says every rank was
+    idle and gets the tie-breaks wrong.
+    """
+    batches: dict[tuple, list[dict]] = defaultdict(list)
+    for decision in decisions:
+        batches[(decision.get("_worker"), decision.get("_iter"))].append(decision)
+
+    for batch in batches.values():
+        load = batch[0].get("_load_before") or {}
+        tokens = [float(v) for v in (load.get("num_active_tokens") or [])]
+        for decision in batch:
+            matches = decision.get("match_lens")
+            rank = decision.get("best_rank")
+            if decision.get("phase") != "scored" or not matches:
+                decision["_reason"] = f"{decision.get('phase') or 'unknown'} (unscored)"
+            else:
+                req = decision.get("req_tokens") or 0
+                eligible = sorted(int(k) for k in matches)
+                # The gate the router applies before scoring: under it, every
+                # match is forced to 0 and the scores tie by construction.
+                gated = (max(matches.values()) / max(req, 1)
+                         ) > ROUTER_MATCH_RATE_THRESHOLD
+                score = {r: req - (matches[str(r)] if gated else 0) for r in eligible}
+                best = min(score.values())
+                winners = [r for r in eligible if score[r] == best]
+                if len(winners) == 1:
+                    # A short candidate list means the fair-share cap dropped a
+                    # rank for the rest of the batch -- possibly the one holding
+                    # the prefix, which the trace cannot show either way.
+                    decision["_reason"] = (
+                        "best match (candidates capped)"
+                        if tokens and len(matches) < len(tokens) else "best match")
+                else:
+                    least = min((tokens[r] for r in winners if r < len(tokens)),
+                                default=0.0)
+                    tied = [r for r in winners
+                            if r < len(tokens) and tokens[r] == least]
+                    decision["_reason"] = ("tie, fewest active tokens"
+                                           if len(tied) == 1
+                                           else "tie, req_id shuffle")
+            if rank is not None and rank < len(tokens):
+                tokens[rank] += max(
+                    (decision.get("req_tokens") or 0)
+                    - ((matches or {}).get(str(rank)) or 0), 0)
+
+
+# Counters the attention-DP context pad leaves untouched. The pad is a real
+# request with real blocks, but kv_cache_manager_v2 calls stop_committing() on
+# it, so nothing reaches the radix tree and every one of these stands still.
+_PAD_FROZEN = ("kv_reused_blocks", "kv_missed_blocks",
+               "kv_alloc_total_blocks", "kv_alloc_new_blocks")
+
+
+def _is_adp_pad(entry: dict, previous: dict | None, max_num_tokens: int | None) -> bool:
+    """Is this rank-iteration the attention-DP context pad rather than work?
+
+    Under attention DP every rank must step together, so a rank with nothing
+    to do is handed a dummy sized at exactly ``max_num_tokens``
+    (py_executor._pad_attention_dp_dummy_request). On a context-only
+    disaggregated worker that dummy is always the CONTEXT flavour, and
+    ``model_engine`` filters ``is_attention_dp_dummy`` only inside its
+    *generation* branch -- the context loop that feeds ``num_ctx_tokens =
+    len(input_ids)`` does not. So the pad lands in the iteration log looking
+    exactly like a full chunk of real prefill.
+
+    It is not a rounding error. Measured on two runs it was 84.5% and 87.6% of
+    every context token the log reports, which is the whole of the 6.5x and
+    8.1x gap between this column and the tokens the requests actually needed:
+    removing it left a residual of *zero* on one run. Counting it inflates the
+    per-rank token totals and pins mean utilisation near 1.0 whatever the
+    worker was really doing -- the more idle the rank, the busier it looks.
+
+    THE TEST IS A CONJUNCTION, AND BOTH HALVES ARE LOAD-BEARING.
+
+    Size alone would be wrong: 8.6% of the rank-iterations at exactly
+    ``max_num_tokens`` are genuine full chunks, and they are kept because their
+    counters move (a real 8192-token chunk allocates 8192/128 = 64 blocks, seen
+    as ``kv_missed_blocks`` +68 with the boundary block). Frozen counters alone
+    would also be wrong: an iteration that is a pure cache hit allocates
+    nothing either, so it too would stand still. Only both together identify
+    the pad.
+
+    THE PREMISE, stated so it can be re-checked rather than assumed: the dummy
+    is sized at *exactly* ``max_num_tokens``. py_executor sets
+    ``token_num = min(max_num_tokens, engine.max_num_tokens, engine.max_seq_len,
+    kv_cache_manager.max_seq_len)`` and then clamps it to
+    ``block_capacity - extra_kv_tokens``. On these deployments the first term
+    wins and the clamp is inert, but a configuration where the clamp bites
+    would size the pad below the budget and this test would silently stop
+    finding it -- undercounting pads, not overcounting them, so the symptom is
+    the ratio below creeping back up.
+
+    THE CHECK that catches exactly that: with the pads removed, the summed
+    context tokens should equal the audit's ``isl_new`` for the same window.
+    Measured 0 residual on 08-26 and +0.29% on 08-23 (the latter being 30
+    requests whose ctx perf records carry ``ctx_request_id: null`` and which
+    the audit therefore never saw). If that agreement drifts, re-derive the
+    dummy's size before trusting any prefill figure in section 3.
+    """
+    if not max_num_tokens:
+        return False
+    if (entry.get("num_ctx_tokens") or 0) != max_num_tokens:
+        return False
+    seen = [entry.get(k) for k in _PAD_FROZEN]
+    if any(v is None for v in seen):
+        return False
+    if previous is None:
+        # A rank's first logged step has nothing to stand still against. The
+        # counters are cumulative from zero, so a real chunk of this size must
+        # already have allocated max_num_tokens/tokens_per_block blocks; all
+        # four still at zero means nothing was committed and this is the pad.
+        # Measured, this is 7 rank-iterations on one run -- the four of the
+        # KV-sizing dry-run engine plus three ranks idle on the real engine's
+        # first step -- and skipping it leaves exactly 7 x 8192 unexplained.
+        return all(v == 0 for v in seen)
+    return all(entry.get(k) == previous.get(k) for k in _PAD_FROZEN)
 
 
 def _request_row(audit: dict, perf: dict, route: dict, tool_map: dict) -> dict:
@@ -751,7 +890,14 @@ def _request_row(audit: dict, perf: dict, route: dict, tool_map: dict) -> dict:
         "match_len_chosen": (route.get("match_lens") or {}).get(
             str(route.get("best_rank"))),
         "match_len_best": max((route.get("match_lens") or {}).values(), default=None),
+        # The whole per-rank probe, not just its extremes. `match_len_best` is a
+        # max over the dict and so cannot tell "every rank was asked and none
+        # had it" from "the rank that had it was never asked" -- and those are a
+        # capacity problem and a routing problem respectively.
+        "route_match_lens": "|".join(
+            f"{k}:{v}" for k, v in sorted((route.get("match_lens") or {}).items())),
         "cache_affinity_active": route.get("cache_affinity_active"),
+        "route_reason": route.get("_reason"),
         "effective_added": route.get("effective_added"),
         # --- tools ---
         "tool_names": "|".join(sorted({t["tool"] for t in tools if t["tool"]})),
@@ -898,6 +1044,58 @@ def _rank_hit_rates(ranks: list[dict], prev: dict[int, dict]) -> list[float | No
         missed = (entry["kv_missed_blocks"] or 0) - (before["kv_missed_blocks"] or 0)
         out.append(reused / (reused + missed) if reused + missed else None)
     return out
+
+
+TIER_FIELDS = (("offload", "kv_offload_blocks"),
+               ("onboard", "kv_onboard_blocks"),
+               ("host_dropped", "kv_host_dropped_blocks"))
+
+
+def _rank_tier_deltas(ranks: list[dict], prev: dict[int, dict]) -> list[dict]:
+    """Each rank's own cross-tier block movement for one iteration.
+
+    Must be called before :func:`_kv_deltas`, which advances ``prev``. The
+    pooled version sums the ranks first, which answers "did the worker offload"
+    but not "which rank did", and on an attention-DP worker those are different
+    questions: one rank holding the long-lived prefixes offloads while its
+    peers never touch the host tier.
+    """
+    out: list[dict] = []
+    for entry in ranks:
+        before = prev.get(entry["rank"])
+        row = {}
+        for key, field in TIER_FIELDS:
+            row[key] = (None if not before or entry[field] is None
+                        or before[field] is None
+                        else (entry[field] or 0) - (before[field] or 0))
+        out.append(row)
+    return out
+
+
+def _pooled_cum_hit(ranks: list[dict]) -> float | None:
+    """The instance's lifetime hit rate: counters summed over ranks, divided once.
+
+    Pooling before dividing is the point -- averaging each rank's ratio would
+    weight a rank that acquired a hundred blocks the same as one that acquired
+    a million. Needs no ``prev``: the log's counters run since engine start, so
+    a single line already carries the answer.
+    """
+    reused = missed = 0.0
+    seen = False
+    for entry in ranks:
+        if entry["kv_reused_blocks"] is None:
+            continue
+        seen = True
+        reused += entry["kv_reused_blocks"]
+        missed += entry["kv_missed_blocks"] or 0
+    if not seen or reused + missed == 0:
+        return None
+    return reused / (reused + missed)
+
+
+def _cum_hits(ranks: list[dict]) -> list[float | None]:
+    """Each rank's own lifetime ratio, index-aligned with ``ranks``."""
+    return [entry["kv_hit_rate"] for entry in ranks]
 
 
 def _kv_deltas(ranks: list[dict], prev: dict[int, dict]
@@ -1160,6 +1358,8 @@ def build_gen_iters(run: Run, max_batch_size: int) -> list[dict]:
                 "kv_util_max": max(util, default=None),
                 "kv_util_spread": _spread(util),
                 "kv_hit_rate_spread": _spread(per_rank_hit),
+                "kv_hit_rate_cum": _pooled_cum_hit(ranks),
+                "kv_hit_rate_cum_spread": _spread(_cum_hits(ranks)),
                 "device_step_spread": _spread(device),
                 "gen_tokens_spread": _spread(tokens),
                 "kv_hit_rate_iter": (
@@ -1219,9 +1419,13 @@ def build_ctx_iters(run: Run, max_num_tokens: int
                     ) -> tuple[list[dict], dict, list[dict], list[dict]]:
     """One row per (prefill instance, iteration), plus the KV capacity found.
 
-    Utilization is the mean context tokens across that instance's ranks over
-    the per-rank token budget. Imbalance is (max - mean) / mean across the
-    same ranks: 0 means every rank got the same prefill work this iteration.
+    Utilization is the mean context tokens across *all* of that instance's
+    ranks over the per-rank token budget, counting an attention-DP pad as the
+    0 tokens of real work it did rather than dropping it from the average --
+    see the comment on ctx_tokens below for why neither dropping it nor taking
+    its logged size works. Imbalance is (max - mean) / mean across the same
+    ranks: 0 means every rank got the same prefill work this iteration, and
+    ranks - 1 means one rank got all of it.
     """
     rows: list[dict] = []
     # Per (worker, rank, iteration). The aggregate rows pool a worker's ranks,
@@ -1233,6 +1437,9 @@ def build_ctx_iters(run: Run, max_num_tokens: int
     # is the same question the allocator asks.
     pg_rows: list[dict] = []
     capacity: dict[str, Any] = {}
+    # previous entry per (instance, rank), for the pad test -- the pad is
+    # recognised by what stands still since that rank last stepped
+    pad_prev: dict[tuple, dict] = {}
     for path in run.prefill_logs():
         worker = run.worker_name(path)
         manager_v2 = run.kv_manager_v2()
@@ -1246,6 +1453,14 @@ def build_ctx_iters(run: Run, max_num_tokens: int
         tokens_per_block = tokens_per_block or 128
 
         entries = parse_iter_log(path)
+        # Stamp the attention-DP pad flag once, walking each rank's own
+        # timeline, so the pooled and per-rank paths below agree and neither
+        # has to care about loop order.
+        for entry in sorted(entries, key=lambda e: (str(e["instance"]), e["rank"],
+                                                    e["iter"])):
+            key = (entry["instance"], entry["rank"])
+            entry["_adp_pad"] = _is_adp_pad(entry, pad_prev.get(key), max_num_tokens)
+            pad_prev[key] = entry
         slots = _pool_capacity(entries)
         pg_slots = _pool_capacity_by_pg(entries)
         pg_roles = parse_pool_group_roles(path)
@@ -1279,12 +1494,30 @@ def build_ctx_iters(run: Run, max_num_tokens: int
                 prev.clear()
                 current_instance = instance
             ranks = per_iter[key]
-            ctx_tokens = [r["num_ctx_tokens"] or 0 for r in ranks]
+            # A pad contributes 0 tokens, but it still occupies its rank for
+            # the iteration, so it stays in the denominator. Dropping the pad
+            # row instead divides by the busy ranks alone, and then a rank
+            # working alone beside three idle ones reads utilization 1.000,
+            # imbalance 0.000 -- indistinguishable from all four running a
+            # full chunk. On this run that is 85% of prefilling iterations,
+            # and it moved utilization 0.129 -> 0.413 (p99 0.521 -> 1.000)
+            # and imbalance 2.810 -> 0.066, 87% of it exact zero.
+            # Counting the pad at its logged size is the other wrong
+            # answer: it is emitted at exactly max_num_tokens, which pins peak
+            # at the ceiling and makes imbalance identically 1/utilization - 1
+            # (verified on 14,006 of 14,006 pad-bearing iterations), a column
+            # with no information the utilization column did not already have.
+            ctx_tokens = [0 if r.get("_adp_pad") else (r["num_ctx_tokens"] or 0)
+                          for r in ranks]
             mean = statistics.fmean(ctx_tokens) if ctx_tokens else 0.0
+            # Zeroed pads cannot raise the max, so this is still the largest
+            # real chunk, and has_prefill below gates on the same iterations
+            # it did before.
             peak = max(ctx_tokens, default=0)
 
             per_rank_hit = _rank_hit_rates(ranks, prev)
-            for entry, hit in zip(ranks, per_rank_hit):
+            per_rank_tier = _rank_tier_deltas(ranks, prev)
+            for entry, hit, tier_delta in zip(ranks, per_rank_hit, per_rank_tier):
                 rank_rows.append({
                     "worker": worker,
                     "rank": entry["rank"],
@@ -1292,7 +1525,34 @@ def build_ctx_iters(run: Run, max_num_tokens: int
                     "instance": entry["instance"],
                     "iter": iteration,
                     "timestamp": entry["timestamp"],
+                    # Both forms, because they answer different questions and
+                    # neither substitutes for the other. The delta is what
+                    # moved on this iteration -- bursty, mostly zero, and the
+                    # only way to see *when*. The cumulative counter is the
+                    # log's own field passed straight through, and it is what
+                    # the charts draw: a count series cannot survive the
+                    # time-window averaging in _downsample, whereas a monotone
+                    # curve can, and "how many blocks by now" is read off it
+                    # directly while the rate is its slope.
+                    **{f"kv_{key}_blocks_iter": tier_delta[key]
+                       for key, _ in TIER_FIELDS},
+                    **{f"kv_{key}_blocks_cum": entry[field]
+                       for key, field in TIER_FIELDS},
                     "kv_hit_rate_iter": hit,
+                    # The log's own lifetime ratio: reused/(reused+missed)
+                    # over every block this rank has acquired since the
+                    # engine started. Charted in place of the per-iteration
+                    # delta because the delta divides by the handful of
+                    # blocks a single iteration happened to acquire, and a
+                    # chunked prefill's continuation chunk acquires only
+                    # fresh blocks by construction -- it reads exactly 0
+                    # however warm the request was. On this run 15.7% of
+                    # prefilling iterations read 0 that way, pulling an
+                    # unweighted mean to 0.780 on a run whose counters say
+                    # 0.941. The counters only rise, so this is a running
+                    # total, not a rate: free to move early, nearly pinned
+                    # late, when the denominator is already millions.
+                    "kv_hit_rate_cum": entry["kv_hit_rate"],
                     # Named for what it is rather than what the log calls it:
                     # this is 1 - available/max, and available counts a retained
                     # reusable block as free, so it only ever measures slots
@@ -1303,6 +1563,7 @@ def build_ctx_iters(run: Run, max_num_tokens: int
                     "kv_capacity_blocks": slots.get((entry["instance"], entry["rank"])),
                     "kv_pool_filled": _pool_filled(entry, slots),
                     "num_ctx_tokens": entry["num_ctx_tokens"],
+                    "is_adp_pad": entry.get("_adp_pad"),
                     "utilization": ((entry["num_ctx_tokens"] or 0) / max_num_tokens
                                     if max_num_tokens else None),
                 })
@@ -1381,6 +1642,8 @@ def build_ctx_iters(run: Run, max_num_tokens: int
                     or [0.0]),
                 "kv_util_spread": _spread([r["kv_cache_util"] for r in ranks]),
                 "kv_hit_rate_spread": _spread(per_rank_hit),
+                "kv_hit_rate_cum": _pooled_cum_hit(ranks),
+                "kv_hit_rate_cum_spread": _spread(_cum_hits(ranks)),
                 "device_step_spread": _spread(device),
                 "paused_requests": sum(int(r["num_paused_requests"] or 0) for r in ranks),
                 "scheduled_requests": sum(r["num_scheduled_requests"] for r in ranks),
@@ -1561,7 +1824,8 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
            pct: bool = False, origin: float | None = None,
            time_field: str = "timestamp", series_field: str = "worker",
            marker_only: bool = False, toggle: bool = False,
-           mean_line: bool = False) -> str:
+           mean_line: bool = False,
+           vlines: list[float] | None = None, vlabel: str | None = None) -> str:
     """One series per prefill instance against wall clock, as an inline PNG.
 
     Three choices worth stating, because the obvious version of this chart
@@ -1583,6 +1847,18 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
     ``mean_line`` draws the series mean as a horizontal rule. On a metric with
     a structural ceiling -- token-budget utilization, or an imbalance pinned at
     ``ranks - 1`` -- the eye tracks the excursions and misreads the level.
+
+    ``vlines`` are absolute timestamps drawn as thin grey rules behind the
+    curves, for marking when some event happened against a metric measured
+    elsewhere. Thin and translucent on purpose: these arrive in the thousands,
+    so any one rule is unreadable and what the layer actually shows is where
+    the events bunch up. Overlaying them assumes the two clocks agree --
+    request stamps come from the serve edge, the curve from the worker log,
+    and _parse_stamp reads the worker's naive stamp as *local* time. On the
+    run this was written for the two agreed to within one second because the
+    analysis host and the worker share a timezone; on a host that does not,
+    this layer silently shifts by the offset. The count is printed on the
+    chart so a shifted layer is at least visible as one.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1606,6 +1882,9 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
         return ""
 
     fig, axis = plt.subplots(figsize=(9, 2.6), dpi=130)
+    for stamp in (vlines or []):
+        axis.axvline((stamp - origin) / 60.0, color="#94a3b8", linewidth=0.35,
+                     alpha=0.30, zorder=0.5)
     colors = [ACCENT, WARN, "#0f766e", "#7c3aed"]
     drawn: list[tuple[str, list[tuple[float, float]]]] = []
     handles: list[Any] = []
@@ -1640,6 +1919,11 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
                           xytext=(-3, 3), textcoords="offset points",
                           ha="right", va="bottom", fontsize=7, color=INK)
     axis.set_title(title, fontsize=10, color=INK, loc="left")
+    if vlines and vlabel:
+        axis.annotate(f"{len(vlines):,} {vlabel}", xy=(0.0, 1.0),
+                      xycoords="axes fraction", xytext=(2, -3),
+                      textcoords="offset points", ha="left", va="top",
+                      fontsize=7, color="#94a3b8")
     axis.set_xlabel("minutes into the run", fontsize=8, color=MUTED)
     axis.set_ylabel(ylabel, fontsize=8, color=MUTED)
     axis.tick_params(labelsize=7, colors=MUTED)
@@ -1727,6 +2011,145 @@ def _chart(ctx_iters: list[dict], field: str, title: str, ylabel: str,
             '<script type="application/json">%s</script></figure>'
             % (title, base, stack, chips,
                json.dumps(payload, separators=(",", ":"))))
+
+
+def _annotate_thread_gaps(requests: list[dict], threads: dict | None) -> int:
+    """Per request, wall clock until the next turn *of its own thread* starts.
+
+    Not "the next request in the session". A session id is a client handle,
+    not a conversation: several threads run under one at the same time, plus
+    the subagents they launch. Ordering a session by start time and
+    differencing neighbours therefore pairs turns from unrelated threads, and
+    on this run 5,024 of 13,211 such gaps came out *negative* -- the next
+    request to start had started before this one finished, because it belonged
+    to a thread that was already running. That column is kept as
+    ``legacy_gap_to_next_in_session_ms``.
+
+    This one takes the earliest child in the rebuilt thread, so it is a real
+    interval by construction (build_threads only links a parent that finished
+    before its child started, so no negatives exist). Where a turn fans out to
+    several children -- a parallel tool batch, or a subagent launch -- the
+    earliest is the one that ends the idle period.
+
+    A negative value here is not a long tail, it is a broken parent link, so
+    they are dropped rather than averaged in and the count is returned for the
+    caller to surface. On a healthy rebuild it is 0.
+    """
+    kids: dict[str, list[dict]] = defaultdict(list)
+    for node in (threads or {}).values():
+        if node.get("parent"):
+            kids[node["parent"]].append(node)
+    gaps, negative = {}, 0
+    for parent, group in kids.items():
+        first = min(group, key=lambda n: _f(n.get("started_at")) or 0.0)
+        value = _f(first.get("true_gap_ms"))
+        if value is None:
+            continue
+        if value < 0:
+            negative += 1
+            continue
+        gaps[parent] = value
+    for row in requests:
+        row["gap_to_child_ms"] = gaps.get(row.get("audit_request_id"))
+    return negative
+
+
+def _tok(value: float) -> str:
+    return f"{value:,.0f}"
+
+
+def _ratio_fmt(value: float) -> str:
+    return f"{value:,.2f}" if value < 100 else f"{value:,.0f}"
+
+
+def _sec(value: float) -> str:
+    if value < 1:
+        return f"{value * 1000:.0f}ms"
+    if value < 60:
+        return f"{value:.1f}s"
+    if value < 3600:
+        return f"{value / 60:.1f}m"
+    return f"{value / 3600:.1f}h"
+
+
+def _distributions(panels: list[tuple[str, list[float], str, Any]],
+                   cols: int = 3) -> str:
+    """One log-x histogram per metric, as a single inline PNG.
+
+    One panel each rather than one shared axis: these are tokens, a bare ratio
+    and a duration, and nothing makes them comparable on one y. Log x on all of
+    them because each spans three decades or more -- gap to next turn runs 49ms
+    to 2.5h -- and on a linear axis the entire distribution lands in the first
+    pixel column with a lone outlier at the far edge, which is the shape of the
+    axis, not of the data.
+
+    Percentile rules rather than a summary table because the question these
+    answer is where the mass sits, not what the mean is: every one of these is
+    heavy-tailed enough that the mean falls above p50 and describes no actual
+    request. The mean is printed anyway, next to p50, so the size of that gap
+    is visible instead of implied.
+    """
+    import math
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    live = [(label, [v for v in values if v is not None and v > 0], xlabel, fmt)
+            for label, values, xlabel, fmt in panels]
+    live = [panel for panel in live if len(panel[1]) > 1]
+    if not live:
+        return ""
+    rows = math.ceil(len(live) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(9, 2.1 * rows + 0.3), dpi=130)
+    flat = list(axes.flat) if hasattr(axes, "flat") else [axes]
+    for axis in flat[len(live):]:
+        axis.set_visible(False)
+    for axis, (label, values, xlabel, fmt) in zip(flat, live):
+        lo, hi = min(values), max(values)
+        if hi <= lo:
+            hi = lo * 1.1
+        low, high = math.log10(lo), math.log10(hi)
+        edges = [10 ** (low + (high - low) * i / 40) for i in range(41)]
+        axis.hist(values, bins=edges, color=ACCENT, alpha=0.75, linewidth=0)
+        axis.set_xscale("log")
+        stat = _stats(values)
+        for q, color, style in ((stat["p50"], INK, (0, (4, 2))),
+                                (stat["p90"], WARN, (0, (2, 2))),
+                                (stat["p99"], WARN, (0, (1, 2)))):
+            if q:
+                axis.axvline(q, color=color, linewidth=0.9, linestyle=style,
+                             zorder=3)
+        axis.set_title(label, fontsize=9, color=INK, loc="left")
+        axis.set_xlabel(xlabel, fontsize=7, color=MUTED)
+        axis.tick_params(labelsize=6.5, colors=MUTED)
+        for spine in ("top", "right"):
+            axis.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            axis.spines[spine].set_color("#d8dee5")
+        axis.grid(axis="y", color="#eef1f4", linewidth=0.8)
+        axis.set_axisbelow(True)
+        text = "\n".join([
+            f'n {stat["n"]:,}',
+            f'p50 {fmt(stat["p50"])}   mean {fmt(stat["mean"])}',
+            f'p90 {fmt(stat["p90"])}',
+            f'p99 {fmt(stat["p99"])}',
+        ])
+        # Headroom before the annotation, not after: the tallest bar is often
+        # under the top-right corner where the numbers go, and a bbox alone
+        # then hides the mode it is describing.
+        top = axis.get_ylim()[1]
+        axis.set_ylim(top=top * 1.42)
+        axis.text(0.97, 0.96, text, transform=axis.transAxes, ha="right",
+                  va="top", fontsize=6.5, color=MUTED, linespacing=1.5,
+                  bbox={"facecolor": "white", "edgecolor": "none",
+                        "alpha": 0.82, "pad": 1.5}, zorder=4)
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png")
+    plt.close(fig)
+    return ('<figure class="dist"><img alt="request metric distributions" '
+            'src="data:image/png;base64,%s"></figure>'
+            % base64.b64encode(buffer.getvalue()).decode())
 
 
 # Idle to saturated. Steps rather than a continuous ramp because the counts
@@ -2052,6 +2475,21 @@ def _tier_table(ctx_iters: list[dict], rank_iters: list[dict]) -> str:
         + "</p>")
 
 
+def _rank_hit(acc: dict) -> float | None:
+    """A rank's whole-run hit rate, preferring the log's own counter.
+
+    Last, not mean: the counters are cumulative, so the final reading already
+    is the rate over the whole run, and averaging a running total would report
+    roughly where it sat halfway. Logs predating the field fall back to the
+    mean of the differenced curve, which is all they carry.
+    """
+    if acc.get("hit"):
+        return acc["hit"][-1]
+    if acc.get("hit_delta"):
+        return statistics.fmean(acc["hit_delta"])
+    return None
+
+
 def _rank_totals(rank_iters: list[dict]) -> str:
     """Cumulative per-rank prefill share over the whole run.
 
@@ -2063,13 +2501,17 @@ def _rank_totals(rank_iters: list[dict]) -> str:
     """
     per: dict[tuple[str, int], dict] = {}
     for row in rank_iters:
-        if not row.get("num_ctx_tokens"):
+        if not row.get("num_ctx_tokens") or row.get("is_adp_pad"):
+            # The attention-DP pad is a full-budget dummy handed to an idle
+            # rank; counting it would make the least busy rank look busiest.
             continue
         acc = per.setdefault((row["worker"], row["rank"]),
                              {"iters": 0, "tokens": 0, "hit": [], "util": []})
         acc["iters"] += 1
         acc["tokens"] += row["num_ctx_tokens"]
-        for key, field in (("hit", "kv_hit_rate_iter"), ("util", "kv_cache_util"),
+        for key, field in (("hit", "kv_hit_rate_cum"),
+                           ("hit_delta", "kv_hit_rate_iter"),
+                           ("util", "kv_cache_util"),
                            ("filled", "kv_pool_filled")):
             if row.get(field) is not None:
                 acc.setdefault(key, []).append(row[field])
@@ -2084,7 +2526,10 @@ def _rank_totals(rank_iters: list[dict]) -> str:
             f"<tr><td>{worker} r{rank}</td><td>{acc['iters']:,}</td>"
             f"<td>{acc['tokens']:,}</td>"
             f'<td class="imb">{share * 100:.1f}%</td>'
-            f'<td class="lead">{_num(statistics.fmean(acc["hit"]) if acc["hit"] else None, 3)}</td>'
+            # Last, not mean: the counters are cumulative, so the final
+            # reading already is the rank's whole-run rate. Averaging a running
+            # total would instead report roughly where it sat halfway.
+            f'<td class="lead">{_num(_rank_hit(acc), 3)}</td>'
             f'<td>{_num(statistics.fmean(acc["util"]) if acc["util"] else None, 3)}</td>'
             # Peak, not mean: the pool fills monotonically, so a mean over the
             # run would report roughly half of how full it actually got.
@@ -2246,6 +2691,7 @@ tr.total td{border-top:2px solid #d8dee5;font-weight:650;background:#fafbfc}
 margin:12px 0;font-size:12px;color:#41505f}
 img{max-width:100%;display:block;margin:6px 0}
 figure.chart{margin:6px 0;position:relative}
+figure.dist{margin:10px 0}
 figure.chart .stack{position:relative}
 figure.chart .stack img{display:block;width:100%}
 figure.chart .stack img.layer{position:absolute;left:0;top:0;pointer-events:none}
@@ -2269,14 +2715,242 @@ code{background:#f2f5f7;padding:1px 4px;border-radius:3px;font-size:11px}
 """
 
 
+def rank_thread_assignment(requests: list[dict], threads: dict) -> dict | None:
+    """Which rank each conversation landed on, and why.
+
+    A thread is pinned: 94% of them never leave the rank their opening turn was
+    routed to, because every later turn carries the whole previous prompt and
+    that rank's match is unbeatable. So the root's routing decision, taken once,
+    decides where the thread's entire compute goes -- which is why this is
+    keyed on roots and totals the whole chain's `isl_new` rather than the root's.
+    """
+    if not threads:
+        return None
+    kinds, chain, roots = {}, defaultdict(float), {}
+    for row in requests:
+        node = threads.get(row["audit_request_id"])
+        if not node:
+            continue
+        tid = node["thread_id"]
+        chain[tid] += row.get("isl_new") or 0
+        if str(node.get("thread_depth")) == "1":
+            roots[tid] = row
+            kinds[tid] = node.get("kind") or "unknown"
+    by_rank: dict[str, Counter] = defaultdict(Counter)
+    reason: dict[str, Counter] = defaultdict(Counter)
+    tokens: dict[str, float] = defaultdict(float)
+    for tid, row in roots.items():
+        rank = row.get("routed_rank")
+        if rank in (None, ""):
+            continue
+        rank = str(rank)
+        by_rank[rank][kinds.get(tid) or "unknown"] += 1
+        tokens[rank] += chain[tid]
+        reason[rank][row.get("route_reason") or "no routing record"] += 1
+    if not by_rank:
+        return None
+    return {"kinds": by_rank, "tokens": tokens, "reason": reason,
+            "roots": sum(sum(c.values()) for c in by_rank.values())}
+
+
+def _cross_thread_reuse(report_dir: Path | None) -> dict | None:
+    """`cross_thread_reuse.json`, if that analysis has been run.
+
+    It is a separate script because splitting boilerplate reuse from real
+    reuse means reading the captured bodies, which this report never does.
+    """
+    if report_dir is None:
+        return None
+    path = report_dir / "cross_thread_reuse.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _probe(encoded: str | None) -> dict[str, float]:
+    """`route_match_lens` back into {rank: matched tokens}."""
+    out = {}
+    for pair in (encoded or "").split("|"):
+        rank, _, value = pair.partition(":")
+        if value:
+            try:
+                out[rank] = float(value)
+            except ValueError:
+                pass
+    return out
+
+
+def kv_miss_cost(requests: list[dict], threads: dict) -> dict | None:
+    """What each cause of a KV miss actually costs, as a share of the run.
+
+    For one parent -> child transition the tokens the engine computed split
+    exactly two ways::
+
+        child.isl_new = (child.isl_total - parent.isl_total)   new content
+                      + (parent.isl_total - child.isl_cached)  recomputed
+
+    The first term is content that never existed before and had to be
+    computed. The second is prefix the cache already held on the previous turn
+    and failed to serve -- the only part any optimisation could recover. This
+    reports that second term per cause, against two denominators: every token
+    the run computed, and every millisecond it spent in prefill.
+
+    Prefill time is attributed pro rata on tokens (`prefill_ms * missed /
+    isl_new`), which assumes prefill cost is linear in tokens computed. That
+    holds well under chunked prefill and is stated on the table rather than
+    hidden.
+
+    The point of the table is the denominator. A cause worth a fraction of a
+    percent of prefill is not worth engineering effort however unpleasant it
+    looks per request, and that is a decision this makes on evidence.
+    """
+    if not threads:
+        return None
+    by_aid = {r["audit_request_id"]: r for r in requests}
+    buckets: dict[str, dict] = defaultdict(
+        lambda: {"n": 0, "tok": 0.0, "ms": 0.0, "hit": [], "aids": [],
+                 "missed": {}})
+    total_new = total_prefill = 0.0
+    classified = 0
+    for row in requests:
+        new, prefill = _f(row.get("isl_new")), _f(row.get("prefill_ms"))
+        total_new += new or 0.0
+        total_prefill += prefill or 0.0
+        node = threads.get(row["audit_request_id"])
+        if not node or not node.get("parent"):
+            continue
+        parent = by_aid.get(node["parent"])
+        pnode = threads.get(node["parent"])
+        if parent is None or pnode is None:
+            continue
+        pisl, cached = _f(parent.get("isl_total")), _f(row.get("isl_cached"))
+        if pisl is None or cached is None:
+            continue
+        classified += 1
+        # The ceiling is what the child actually SHARED with the parent, not
+        # the parent's whole prompt. Those differ: DeepSeek-V4's template
+        # re-roles a trailing system message and defers the generation prompt
+        # past it, so a parent that ended on one is not a prefix of its child
+        # at all -- measured, the shared prefix stops a median 305 tokens
+        # short. Charging the difference to the cache blamed it for tokens the
+        # child never sent, and inflated this table 3.4x (12.08M -> 3.52M on
+        # the 08-26 run).
+        #
+        # prompt_lcp_tokens is NOT a parent-to-child LCP, and using it as one
+        # is wrong on 36.8% of pairs. AnthropicPromptLcpTracker keeps one prior
+        # prompt PER SESSION (anthropic_adapter.py:379-423, a 16-entry LRU
+        # against 338 sessions here), so it is the LCP against whatever request
+        # ran last in that session -- and a session interleaves several
+        # threads, so that is usually not this turn's parent. Applied blindly
+        # it silently deleted 993 pairs carrying 5,011,567 real missed tokens
+        # (8.44% of everything the run computed) through the `missed <= 0` gate
+        # below. It is only usable when the thread parent IS that previous
+        # request, and the audit says so itself: previous_prompt_tokens equals
+        # the parent's prompt on 99.84% of session-adjacent pairs against 1.86%
+        # of the rest. Otherwise fall back to the parent's whole prompt -- safe
+        # because tail_role already carries the divergence case, and a
+        # user-tail parent whose message list is a prefix of the child's is a
+        # token prefix on 99.91% of pairs.
+        lcp = _f(row.get("prompt_lcp_tokens"))
+        prev_len = _f(row.get("previous_prompt_tokens"))
+        adjacent = prev_len is not None and abs(prev_len - pisl) < 1
+        ceiling = min(lcp, pisl) if (adjacent and lcp is not None) else pisl
+        missed = ceiling - cached
+        # A branch point shares more than the parent's prompt: a sibling that
+        # ran first leaves blocks the second one legitimately matches past the
+        # parent, so the ceiling is not the parent alone. Those come out
+        # negative and are not misses.
+        if missed <= 0:
+            continue
+        if node.get("sys_digest") != pnode.get("sys_digest"):
+            cause = "SYSTEM_CHANGED"
+        elif pnode.get("tail_role") == "system":
+            # Server-side, not the client's doing. See tail_role in
+            # threads_and_tools.py: the generation prompt and the trailing
+            # reminder swap order between the two turns, so the parent's
+            # tokens are not a prefix of the child's however warm the cache
+            # is. On 594 pairs whose parent message list is an exact prefix of
+            # the child's, the token divergence is still >= 88 (exactly 88 on
+            # 53.7%); on the same 738 pairs without a system tail it is 0 on
+            # 100%. Ranked above the cache-side tests because it is the reason
+            # they fire, not a competitor to them.
+            cause = "PROMPT_DIVERGENCE"
+        elif _f(node.get("n_msgs")) is not None and _f(pnode.get("n_msgs")) is not None \
+                and _f(node["n_msgs"]) < _f(pnode["n_msgs"]):
+            cause = "HISTORY_REWRITTEN"
+        else:
+            # Server side, named positively from the router's per-rank probe
+            # rather than by elimination. A residual bucket would quietly
+            # absorb any mechanism nobody has thought of yet and report it as
+            # the server's fault; anything that matches none of the three known
+            # shapes is called out as unexplained instead.
+            probe = _probe(row.get("route_match_lens"))
+            held = probe.get(str(parent.get("routed_rank")))
+            chosen = _f(row.get("match_len_chosen"))
+            if not probe:
+                cause = "UNEXPLAINED (no routing probe)"
+            elif held is None:
+                cause = "ROUTE_CANDIDATE_ABSENT"
+            elif held < pisl - BLOCK_TOLERANCE:
+                # NOT named EVICTED any more, and the rename is the point.
+                # `held` is the router's probe of the parent's rank, and it
+                # equals this request's own isl_cached on 12,033 of 12,063
+                # pairs (99.75%; match_len_chosen equals it on 100%), so this
+                # test is arithmetically `missed > BLOCK_TOLERANCE` and
+                # carries no independent evidence of eviction. The budget says
+                # the same: under the old name this bucket claimed 96,824
+                # blocks of lost prefix on the 08-26 run, against 24,938
+                # blocks ever offloaded and 15,490 ever host-dropped across
+                # all four ranks -- 3.9x short. And it does not move with idle
+                # time: holding parent.isl_new in [2000, 8000), the rate is
+                # 20.7 / 25.7 / 22.2 / 17.6% across gaps of <0.3s / 0.3-2s /
+                # 2-60s / >60s.
+                #
+                # What is left here after PROMPT_DIVERGENCE has taken the
+                # system-tail turns is prefix the parent committed that the
+                # tree no longer serves. Capacity eviction is one way to get
+                # there; on this deployment the bigger one looks to be
+                # enable_swa_scratch_reuse (a silent DeepseekV4ForCausalLM
+                # model default, absent from ctx_config.yaml), which leaves
+                # scratch blocks without a windowed page so _prune_match walks
+                # the match back to the last block that has one. Named for the
+                # observation rather than for either mechanism.
+                cause = "PREFIX_NOT_IN_TREE"
+            elif chosen is not None and chosen < held - BLOCK_TOLERANCE:
+                cause = "ROUTE_LOSS"
+            else:
+                cause = "UNEXPLAINED (rank held it and was chosen)"
+        b = buckets[cause]
+        b["n"] += 1
+        b["aids"].append(row["audit_request_id"])
+        b["missed"][row["audit_request_id"]] = missed
+        b["tok"] += missed
+        if _f(row.get("kv_hit_rate")) is not None:
+            b["hit"].append(_f(row["kv_hit_rate"]))
+        if prefill and new:
+            b["ms"] += prefill * min(missed / new, 1.0)
+    return {"buckets": dict(buckets), "total_new": total_new,
+            "total_prefill": total_prefill, "classified": classified,
+            "transitions": sum(1 for r in requests
+                               if (threads.get(r["audit_request_id"]) or {}).get("parent"))}
+
+
 def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                 ctx_iters: list[dict], gen_iters: list[dict],
                 rank_iters: list[dict], summary: dict, notes: list[str],
                 rank_pg_iters: list[dict] | None = None,
-                capacity_meta: dict | None = None) -> str:
+                capacity_meta: dict | None = None,
+                threads: dict | None = None,
+                report_dir: Path | None = None) -> str:
     stamps = [_parse_stamp(r.get("timestamp"))
               for r in (ctx_iters + gen_iters) if r.get("timestamp")]
     run_origin = min((t for t in stamps if t is not None), default=None)
+    # Filled by _annotate_thread_gaps in main, before the CSVs are written, so
+    # every figure below is checkable against requests.csv.
+    child_gaps = any(r.get("gap_to_child_ms") is not None for r in requests)
     low = [r for r in requests if r["low_hit_rate"]]
     merged = len(runs) > 1
     shape = "disaggregated" if any(r.disagg for r in runs) else "aggregated"
@@ -2312,6 +2986,39 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
 
     # ---- 1 ----
     parts.append("<h2>1 · Requests</h2>")
+
+    # How the requests group into conversations, which every per-turn figure
+    # below is keyed on. `session_id` is not the unit: Claude Code fans
+    # subagents and background tasks out over one id, so a session is a forest
+    # rather than a chain and the ratio here is what says how bushy.
+    if threads:
+        in_window = {r["audit_request_id"] for r in requests}
+        placed = [t for a, t in threads.items() if a in in_window]
+        n_thread = len({t["thread_id"] for t in placed})
+        n_sess = len({t["session_id"] for t in placed if t["session_id"]})
+        if n_thread:
+            parts.append(
+                '<p class="sub">'
+                f'<b>{len(requests):,}</b> requests · <b>{n_thread:,}</b> threads · '
+                f'<b>{n_sess:,}</b> sessions — '
+                f'{len(requests) / n_thread:.1f} turns per thread, '
+                f'{n_thread / n_sess:.1f} threads per session. '
+                "A thread is one conversation, rebuilt by prefix-matching the "
+                "captured prompts; a session id can carry several of them at once."
+                '</p>')
+        reuse = _cross_thread_reuse(report_dir)
+        if reuse:
+            new_all = sum(r["isl_new"] or 0 for r in requests) or 1
+            parts.append(
+                '<p class="sub">Opening turns reused <b>'
+                f'{reuse["root_cached"]:,.0f}</b> tokens from other threads '
+                f'({reuse["roots"]:,} thread openings, excluding title calls). '
+                f'<b>{reuse["beyond"] / new_all * 100:.2f}%</b> of every token this '
+                "run computed was saved by sharing that goes past the "
+                "system-prompt-and-tools block "
+                f'({reuse["beyond"]:,.0f} tokens); the other '
+                f'{reuse["root_cached"] - reuse["beyond"]:,.0f} is boilerplate every '
+                "thread on the same client build shares.</p>")
     parts.append("<h3>Latency</h3><table><thead><tr><th>metric</th><th>n</th>"
                  "<th>mean</th><th>p50</th><th>p90</th><th>p99</th></tr></thead><tbody>")
     for label, field, ratio in (("TTFT (client)", "ttft_ms", False),
@@ -2321,7 +3028,9 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                                 ("Prefill queue", "prefill_queue_ms", True),
                                 ("Prefill", "prefill_ms", True),
                                 ("KV transfer", "kv_transfer_ms", True),
-                                ("Gap to next turn", "gap_to_next_turn_ms", False),
+                                ("Gap to next turn",
+                                 "gap_to_child_ms" if child_gaps
+                                 else "gap_to_next_turn_ms", False),
                                 ("Tool call (max/turn)", "tool_latency_max_ms", False)):
         shares = None
         if ratio:
@@ -2342,8 +3051,18 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                  "queueing, tokenisation, detokenisation and transport, so the "
                  "phases will not sum to it.<br>"
                  "<b>Gap to next turn</b> is the wall clock between one turn "
-                 "finishing and the next starting in the same session — all "
-                 "client-side time, whatever it went on. <b>Tool call</b> is the "
+                 "finishing and the next turn "
+                 + ("<i>of the same thread</i> starting" if child_gaps
+                    else "starting <i>in the same session</i>")
+                 + " — all client-side time, whatever it went on. "
+                 + ("" if child_gaps else
+                    "<b>Session ordering is the wrong key and this row shows it:</b> "
+                    "one session id carries several concurrent threads, so "
+                    "differencing neighbours pairs turns from unrelated "
+                    "conversations and a large share of these come out negative. "
+                    "Re-run with <code>--threads</code> for the thread-keyed "
+                    "version, which cannot be negative by construction. ")
+                 + "<b>Tool call</b> is the "
                  "interval for one specific <code>tool_use_id</code> to come back, "
                  "matched by id. They coincide when a turn emits one tool and the "
                  "result arrives in the very next turn, and diverge when a turn "
@@ -2362,10 +3081,117 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
     parts.append("</tbody></table>")
 
     parts.append(f'<p class="sub">{len(low)} of {len(requests)} requests fell '
-                 f"below {HIT_RATE_FLOOR:.0%} — listed with their cause in "
-                 '<a href="#low-hit">the appendix</a>.</p>'
+                 f"below {HIT_RATE_FLOOR:.0%}. A low ratio is usually a turn "
+                 "appending new content to a prefix the cache served in full, which "
+                 "costs nothing recoverable — "
+                 'the table below prices each cause instead of listing '
+                 'the requests.</p>'
                  if low else '<p class="sub">No request fell below '
                  f'{HIT_RATE_FLOOR:.0%}.</p>')
+
+    # Section 1's payoff, and the reason it sits here rather than in an
+    # appendix: the hit-rate stats above say a ratio is low, and this says
+    # whether that costs anything. It replaces a per-request listing of every
+    # low-hit request, which named requests without ever pricing them -- and on
+    # agent traffic almost all of those are a turn appending content to a prefix
+    # the cache served in full, which is free.
+    cost = kv_miss_cost(requests, threads or {})
+    if cost and report_dir is not None:
+        # The table in section 1 is a per-cause summary; this is the roster
+        # behind it, so a cause can be chased back to individual turns.
+        by_aid_all = {r["audit_request_id"]: r for r in requests}
+        _write_csv(report_dir / "kv_miss_causes.csv", [
+            {"audit_request_id": aid,
+             "rid": by_aid_all.get(aid, {}).get("rid"),
+             "cause": cause,
+             "started_at": by_aid_all.get(aid, {}).get("started_at"),
+             "gap_from_parent_ms": _f(
+                 (threads or {}).get(aid, {}).get("true_gap_ms")),
+             # Same formula as the section 1 table, deliberately. These
+             # disagreed once (by 3,579,062 tokens on one bucket) because the
+             # table gained the ceiling and this did not.
+             "missed_tokens": bucket["missed"].get(aid),
+             "isl_total": by_aid_all.get(aid, {}).get("isl_total"),
+             "isl_cached": by_aid_all.get(aid, {}).get("isl_cached"),
+             "kv_hit_rate": by_aid_all.get(aid, {}).get("kv_hit_rate"),
+             "routed_rank": by_aid_all.get(aid, {}).get("routed_rank"),
+             "thread_id": (threads or {}).get(aid, {}).get("thread_id")}
+            for cause, bucket in sorted(cost["buckets"].items())
+            for aid in bucket["aids"]])
+    if cost and cost["buckets"]:
+        tok_all, ms_all = cost["total_new"], cost["total_prefill"]
+        order = ["PROMPT_DIVERGENCE", "PREFIX_NOT_IN_TREE",
+                 "ROUTE_CANDIDATE_ABSENT", "ROUTE_LOSS",
+                 "SYSTEM_CHANGED", "HISTORY_REWRITTEN"]
+        label = {
+            "PROMPT_DIVERGENCE": "Prompt diverged — parent turn ended on a "
+                                 "<code>role:\"system\"</code> block",
+            "PREFIX_NOT_IN_TREE": "Shared prefix was not in the reuse tree",
+            "ROUTE_CANDIDATE_ABSENT": "Router never asked the rank that held it",
+            "ROUTE_LOSS": "Router had the rank that held it and chose another",
+            "SYSTEM_CHANGED": "System prompt changed — prefix invalidated from token 0",
+            "HISTORY_REWRITTEN": "History rewritten — compaction or truncation"}
+        detail = ['<h3>What each cause of a KV miss costs</h3>',
+                  "<table><thead><tr><th>cause</th><th>turns</th>"
+                  "<th>hit rate p50</th><th>hit rate mean</th>"
+                  "<th>share of all tokens computed</th>"
+                  "<th>share of all prefill</th></tr></thead><tbody>"]
+        tot_tok = tot_ms = 0.0
+        for key in order + [k for k in cost["buckets"] if k not in order]:
+            b = cost["buckets"].get(key)
+            if not b:
+                continue
+            tot_tok += b["tok"]
+            tot_ms += b["ms"]
+            hits = sorted(b["hit"])
+            p50 = f"{hits[len(hits) // 2]:.3f}" if hits else "—"
+            mean = f"{sum(hits) / len(hits):.3f}" if hits else "—"
+            detail.append(
+                f"<tr><td>{label.get(key, key)}</td><td>{b['n']:,}</td>"
+                f"<td>{p50}</td><td>{mean}</td>"
+                f"<td class=lead>{b['tok'] / tok_all * 100 if tok_all else 0:.2f}%</td>"
+                f"<td class=lead>{b['ms'] / ms_all * 100 if ms_all else 0:.2f}%</td></tr>")
+        all_hits = sorted(h for b in cost["buckets"].values() for h in b["hit"])
+        t_p50 = f"{all_hits[len(all_hits) // 2]:.3f}" if all_hits else "—"
+        t_mean = f"{sum(all_hits) / len(all_hits):.3f}" if all_hits else "—"
+        detail.append(
+            "<tr class=total><td>all causes</td>"
+            f"<td>{sum(b['n'] for b in cost['buckets'].values()):,}</td>"
+            f"<td>{t_p50}</td><td>{t_mean}</td>"
+            f"<td class=lead>{tot_tok / tok_all * 100 if tok_all else 0:.2f}%</td>"
+            f"<td class=lead>{tot_ms / ms_all * 100 if ms_all else 0:.2f}%</td></tr>")
+        detail.append("</tbody></table>")
+        detail.append(
+            '<p class="sub">For one turn the tokens the engine computed split exactly '
+            "two ways: <code>isl_new = (this ISL &minus; parent ISL) + (parent ISL "
+            "&minus; this cached)</code>. The first term is content that never existed "
+            "before; only the second was ever recoverable, and it is what this counts. "
+            "Prefill is attributed pro rata on tokens, which assumes prefill cost is "
+            "linear in tokens computed &mdash; true enough under chunked prefill. "
+            f"Denominators are the whole run: {tok_all:,.0f} tokens computed and "
+            f"{_dur(ms_all)} of prefill across {len(requests):,} requests. "
+            f"{cost['classified']:,} of {cost['transitions']:,} parent&rarr;child "
+            "transitions could be costed; the rest are thread roots or lack a parent "
+            "in the window.</p>")
+        wall = _f(summary.get("wall_s"))
+        anchor = (f" That is <b>{tot_ms / 1000 / wall * 100:.2f}% of the run's wall "
+                  f"clock</b> ({_dur(tot_ms)} of {wall / 3600:.1f} h)." if wall else "")
+        detail.append(
+            '<p class="sub"><b>Read the share, not the count.</b> A cause worth a '
+            "fraction of a percent of prefill is not worth engineering effort however "
+            "bad it looks on a single request. A turn that appends a lot of new content "
+            "shows a low hit rate and costs nothing recoverable &mdash; it is absent "
+            "from this table by construction, which is the point."
+            + anchor +
+            " A share of prefill is not a share of the run: prefill itself is only part "
+            "of it, so carry the wall-clock figure into any decision about whether to "
+            "act.</p>")
+        parts.append(f'<div id="kv-miss">{"".join(detail)}</div>')
+    elif cost is None:
+        parts.append('<div class="note">Per-cause KV-miss cost needs the rebuilt '
+                     "threads: run <code>analysis/threads_and_tools.py</code>, then "
+                     "re-run this with <code>--threads &lt;report&gt;/_threadstudy/"
+                     "threads.csv</code>.</div>")
 
     # ---- 2 ----
     parts.append("<h2>2 · Sessions</h2>")
@@ -2373,13 +3199,6 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
     parts.append(f'<p class="sub">{len(sessions)} sessions, {turns_total} turns '
                  f'({turns_total / len(sessions):.1f} per session).</p>'
                  if sessions else '<p class="sub">No sessions.</p>')
-    footer = {"session_id": f"mean of {len(sessions)}", "_total": True}
-    for key in ("turns", "span_ms", "isl_cached_mean", "isl_new_mean", "osl_mean",
-                "kv_hit_rate", "ttft_sum_ms", "decode_sum_ms", "client_time_ms",
-                "isl_max", "sessions_per_rank"):
-        vals = [x[key] for x in sessions if x[key] is not None]
-        footer[key] = statistics.fmean(vals) if vals else None
-    footer["ranks_used"] = ""
     session_origin = min((r["started_at"] for r in requests
                           if r.get("started_at") is not None), default=None)
     parts.append(_request_chart(requests, sessions, session_origin))
@@ -2391,40 +3210,55 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                  "below counts requests in flight across all sessions: that is the "
                  "load the server saw, and it shares the x axis so a peak traces "
                  "back to the sessions that caused it.</p>")
-    for row in sessions + [footer]:
-        for key in ("ttft_sum_ms", "decode_sum_ms", "client_time_ms", "span_ms"):
-            row[key + "_fmt"] = _dur(row.get(key))
-    session_columns = [
-        ("session_id", "session"), ("turns", "reqs"), ("span_ms_fmt", "span"),
-        ("isl_cached_mean", "cached ISL"), ("isl_new_mean", "new ISL"),
-        ("osl_mean", "OSL"), ("kv_hit_rate", "hit"),
-        ("ttft_sum_ms_fmt", "prefill"), ("decode_sum_ms_fmt", "decode"),
-        ("client_time_ms_fmt", "client"), ("isl_max", "max ISL"),
-        ("sessions_per_rank", "fit/rank")]
-    # Only worth a column when something routed: without an ADP route trace the
-    # rank a request landed on is unknown, and an empty column reads as "one
-    # rank" rather than "not measured".
-    if any(x.get("ranks_used") for x in sessions):
-        session_columns.append(("ranks_used", "ranks"))
-    parts.append(_table(sessions + [footer], session_columns))
+    # Per request, not per session. A session mean flattens the thing worth
+    # seeing: these distributions are heavy-tailed and multi-modal, and
+    # averaging a 92-turn session into one row destroys both. The per-session
+    # rows are still written to sessions.csv.
+    panels = [
+        ("new ISL", [_f(r.get("isl_new")) for r in requests], "tokens", _tok),
+        ("OSL", [_f(r.get("osl")) for r in requests], "tokens", _tok),
+        ("new ISL / OSL",
+         [_f(r["isl_new"]) / _f(r["osl"])
+          for r in requests
+          if _f(r.get("isl_new")) is not None and _f(r.get("osl"))],
+         "ratio", _ratio_fmt),
+        ("ISL (cached + new)", [_f(r.get("isl_total")) for r in requests],
+         "tokens", _tok),
+    ]
+    if child_gaps:
+        panels.append(
+            ("Gap to next turn (same thread)",
+             [r["gap_to_child_ms"] / 1000.0 for r in requests
+              if r.get("gap_to_child_ms") is not None],
+             "seconds", _sec))
+    parts.append(_distributions(panels))
     parts.append('<p class="sub">'
-                 "<code>reqs</code> is the request count; <code>cached ISL</code>, "
-                 "<code>new ISL</code> and <code>OSL</code> are means per request, "
-                 "not session totals — a 92-turn session would otherwise top every "
-                 "one of them without any single turn being large. Totals are in "
-                 "<code>sessions.csv</code>. "
-                 + ("" if any(x.get("ranks_used") for x in sessions) else
-                    "The <code>ranks</code> column is omitted: no ADP route trace "
-                    "was recorded, so which rank served a request is unknown. "
-                    "Set <code>TRTLLM_ADP_ROUTE_TRACE</code> to get it. ")
-                 + "<code>client</code> = session span − union of its request "
-                 "intervals, i.e. the time inside the session with no request in "
-                 "flight: "
-                 "tool execution plus client think time, measured without relying on "
-                 "tool matching. <code>fit/rank</code> = KV capacity ÷ longest prompt, "
-                 "i.e. how many such sessions one rank holds at once."
+                 "One panel per metric over <b>requests</b>, log x, counts on y. "
+                 "The dashed rules are p50 (dark), p90 and p99 (orange). "
+                 "<code>ISL</code> is the whole prompt and splits exactly into "
+                 "<code>cached ISL + new ISL</code>; only <b>new ISL</b> was "
+                 "computed, so it, not ISL, is what prefill cost tracks. "
+                 "<b>new ISL / OSL</b> is per request, which is not the ratio of "
+                 "the two panels beside it — a turn that appends a tool result "
+                 "and emits one token sits far right, and there are many of them. "
+                 + ("<b>Gap to next turn</b> is wall clock from this turn "
+                    "finishing to the next turn <i>of the same thread</i> "
+                    "starting, i.e. tool execution plus client think time. It is "
+                    "taken from the rebuilt threads, not from session ordering: "
+                    "one session id carries several concurrent threads, so "
+                    "differencing neighbours within a session pairs unrelated "
+                    "turns and yields a negative gap on 38% of them. Turns with "
+                    "no child in the window — thread tails — are absent. "
+                    if child_gaps else
+                    "<b>Gap to next turn</b> is omitted: it needs the rebuilt "
+                    "threads, so re-run with <code>--threads</code>. The "
+                    "session-ordered version is not a substitute, because one "
+                    "session id carries several concurrent threads. ")
+                 + "Per-session rows, including the client-time and fit-per-rank "
+                 "columns this replaced, are in <code>sessions.csv</code>."
                  + ("" if summary["kv_capacity_tokens"] else
-                    " Capacity was not in this run's logs, so it is blank.") + "</p>")
+                    " KV capacity was not in this run's logs, so the fit-per-rank "
+                    "column there is blank.") + "</p>")
 
     # ---- 3 ----
     parts.append("<h2>3 · Prefill server</h2>")
@@ -2535,13 +3369,35 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
         # The KV manager's own reused/missed block counters, differenced per
         # rank. Pooling ranks would average away the rank that is missing while
         # its peers hit -- the one case the curve exists to show.
-        iter_hits = _chart(rank_occupancy, "kv_hit_rate_iter",
-                           "KV hit rate per rank (server block counters)",
-                           "reused / (reused+missed)", pct=True,
+        # Prefer the log's cumulative ratio; older logs carry only the
+        # counters, and there the differenced curve is all there is.
+        hit_cum = any(r.get("kv_hit_rate_cum") is not None
+                      for r in rank_occupancy)
+        hit_field = "kv_hit_rate_cum" if hit_cum else "kv_hit_rate_iter"
+        iter_hits = _chart(rank_occupancy, hit_field,
+                           "KV hit rate per rank (server block counters"
+                           + (", cumulative)" if hit_cum else ")"),
+                           "reused / (reused+missed)"
+                           + (", since engine start" if hit_cum else ""),
+                           pct=True,
                            origin=run_origin, series_field="series",
                            toggle=True)
         parts.append(iter_hits)
         notes_html = ["Per rank, from the KV manager's own block counters in "
+                      "the worker log: of every block the rank has acquired "
+                      "since the engine started, the share that came from "
+                      "reuse. Block-level, so a partially matched block counts "
+                      "wholly as a miss. The counters only rise, so this is a "
+                      "running total rather than a rate — it moves freely "
+                      "through warmup and barely at all late, once the "
+                      "denominator is millions of blocks, so a late dip is "
+                      "damped rather than shown. It is the correctly weighted "
+                      "figure nonetheless: every block counts once, which the "
+                      "per-iteration mean in the table below does not do. The "
+                      "per-request view lives in section 1, where a single "
+                      "request can be named."
+                      if hit_cum else
+                      "Per rank, from the KV manager's own block counters in "
                       "the worker log: of the blocks acquired between two "
                       "iterations, the share that came from reuse. Block-level, "
                       "so a partially matched block counts wholly as a miss. "
@@ -2568,18 +3424,91 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                      "<th>p50</th><th>p90</th><th>p99</th></tr></thead><tbody>")
         for label, field, digits, spread in (
                 ("Utilization", "utilization", 3, "imbalance"),
-                ("Hit rate", "kv_hit_rate_iter", 3, "kv_hit_rate_spread"),
+                ("Hit rate", "kv_hit_rate_cum", 3, "kv_hit_rate_cum_spread"),
                 ("Pool filled", "kv_pool_filled", 3, "kv_pool_filled_spread"),
                 ("Evicted tokens", "kv_evicted_tokens", 0, None),
                 ("Pinned by in-flight", "kv_util_mean", 3, "kv_util_spread"),
                 ("Device step ms", "device_step_time_ms", 1, "device_step_spread"),
                 ("Host step ms", "host_step_time_ms", 1, None)):
+            if field == "kv_hit_rate_cum":
+                # A running total has no distribution. Its p90 would be a time
+                # quantile -- where the curve happened to sit 90% of the way
+                # through -- not a spread over comparable samples, and printing
+                # one invites it to be read as tail behaviour. Only the endpoint
+                # carries meaning, so only the endpoint is shown. The imbalance
+                # cell survives because it is a spread across ranks at one
+                # instant, which stays a real quantity: it is the gap between
+                # the ranks' whole-run rates.
+                have = [c.get(field) for c in ctx_iters if c.get(field) is not None]
+                imb = [c.get(spread) for c in ctx_iters if c.get(spread) is not None]
+                if not have:
+                    # Log predates the cumulative field; the differenced curve
+                    # is all there is, so report it as the distribution it is.
+                    parts.append(_stat_row(
+                        label, [c.get("kv_hit_rate_iter") for c in ctx_iters],
+                        digits=digits, with_spread=True,
+                        spread=[c.get("kv_hit_rate_spread") for c in ctx_iters]))
+                    continue
+                parts.append(
+                    f"<tr><td>{label}</td><td>{len(have)}</td>"
+                    f'<td class="lead">{_num(have[-1] if have else None, 3)}</td>'
+                    f'<td class="imb">{_num(imb[-1] if imb else None, 3)}</td>'
+                    "<td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>")
+                continue
             parts.append(_stat_row(
                 label, [c[field] for c in ctx_iters], digits=digits,
                 duration="ms" in label, with_spread=True,
                 spread=[c.get(spread) for c in ctx_iters] if spread else None))
         parts.append("</tbody></table>")
         parts.append(_tier_table(occupancy, rank_iters))
+        # Drawn over every iteration, not just the prefilling ones: a block can
+        # be offloaded on an iteration that scheduled no context work, and
+        # restricting the curve would make the counter appear to jump.
+        # When a turn's parent prefix was evicted, the rank that prefilled it
+        # had to give the blocks up -- which is the same pool pressure this
+        # curve is made of. Marking when those turns *started* puts the two on
+        # one axis instead of asking the reader to hold both in their head.
+        unserved_at = sorted(
+            t for t in (_f(by_aid_all.get(aid, {}).get("started_at"))
+                        for aid in ((cost or {}).get("buckets", {})
+                                    .get("PREFIX_NOT_IN_TREE", {}).get("aids", [])))
+            if t is not None) if cost else []
+        tier_charts = [
+            _chart(rank_iters, f"kv_{key}_blocks_cum", title,
+                   "blocks since engine start", origin=run_origin,
+                   series_field="series", toggle=True,
+                   vlines=marks, vlabel=vlabel)
+            for key, title, marks, vlabel in (
+                ("offload", "Blocks offloaded GPU → host, per rank",
+                 unserved_at, "turns whose shared prefix was not in the tree (grey)"),
+                ("onboard", "Blocks onboarded host → GPU, per rank", None, None))]
+        if any(tier_charts):
+            parts.extend(c for c in tier_charts if c)
+            parts.append(
+                '<p class="sub">Cumulative, straight from the KV manager\'s own '
+                "counters in the worker log — the slope is the rate and the "
+                "separation between ranks is the imbalance. Cumulative rather "
+                "than per-iteration because the per-iteration series is zero on "
+                "most iterations and dense enough to be time-window averaged "
+                "before it is drawn, which turns a burst into a small number "
+                "rather than a spike; the per-iteration deltas are in "
+                "<code>ctx_rank_iters.csv</code> as "
+                "<code>kv_offload_blocks_iter</code> and "
+                "<code>kv_onboard_blocks_iter</code> for anyone who wants the "
+                "bursts. The grey rules on the offload chart mark the start of "
+                "every turn whose shared prefix was not in the reuse tree "
+                "(<code>PREFIX_NOT_IN_TREE</code> in section 1, rostered in "
+                "<code>kv_miss_causes.csv</code>). Read them <i>against</i> "
+                "the curves, not as their cause: on the run this was built "
+                "for they do not line up, and that mismatch is part of why "
+                "the bucket is no longer called eviction. "
+                "<b>Offload</b> is a block leaving GPU memory but "
+                "surviving on the host tier, so it is still reusable at the "
+                "cost of a copy back; <b>onboard</b> is that copy back actually "
+                "happening, i.e. a hit that the GPU no longer held. Neither is "
+                "a loss — <b>dropped</b> in the table above is. A counter that "
+                "steps down rather than up means the engine restarted inside "
+                "the window, since these run since engine start.</p>")
         parts.append(_rank_totals(rank_iters))
         parts.append('<p class="sub">'
                      "The imbalance column is (max − mean) / mean across that "
@@ -2610,6 +3539,18 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                         "<code>alloc_total − alloc_new</code>, which counts blocks "
                         "taken while still holding reusable content — an upper "
                         "bound, since a freed partial block lands there too. ") +
+                     "<b>Hit rate</b> is the run's lifetime figure, "
+                     "<code>reused / (reused+missed)</code> over every block the "
+                     "instance acquired, read straight off the counters rather "
+                     "than averaged: it carries no p50/p90/p99 because a running "
+                     "total has no distribution — those cells would report where "
+                     "the curve sat at a moment, not a spread. Averaging the "
+                     "per-iteration deltas instead, as this row used to, divides "
+                     "by whatever handful of blocks one iteration happened to "
+                     "acquire, so a chunked prefill's continuation chunk — which "
+                     "acquires only fresh blocks by construction — scores 0 "
+                     "however warm its request was, and enough of those drag the "
+                     "mean far below the rate the run actually achieved. "
                      "<code>device step</code> brackets the whole loop body, so it "
                      "tracks wall clock rather than GPU-busy time.</p>")
     else:
@@ -2655,6 +3596,76 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                      "<code>decode_ms ÷ osl</code>, since each step emits that many "
                      "tokens per request. A gap is time spent outside the loop — "
                      "queueing, detokenisation, transport.</p>")
+
+    # Where each conversation was sent, and why. It belongs in section 3
+    # because it is what the `imbalance` column above is actually made of: the
+    # router balances *requests*, but a thread is pinned for its whole life, so
+    # what a rank really takes on is the compute of every conversation whose
+    # opening turn landed there.
+    assign = rank_thread_assignment(requests, threads or {})
+    if assign:
+        kinds = assign["kinds"]
+        order = [k for k in ("main", "subagent", "title", "sdk", "no-tools",
+                             "other", "unknown")
+                 if any(c.get(k) for c in kinds.values())]
+        total_tok = sum(assign["tokens"].values()) or 1.0
+        parts.append("<h3>Thread roots per rank</h3>")
+        parts.append("<table><thead><tr><th>rank</th>"
+                     + "".join(f"<th>{k}</th>" for k in order)
+                     + "<th>threads</th><th>thread ISL new</th><th>share</th>"
+                     "</tr></thead><tbody>")
+        for rank in sorted(kinds, key=lambda r: int(r) if r.isdigit() else r):
+            c = kinds[rank]
+            tok = assign["tokens"][rank]
+            parts.append(
+                f"<tr><td>{rank}</td>"
+                + "".join(f"<td>{c.get(k, 0):,}</td>" for k in order)
+                + f"<td>{sum(c.values()):,}</td><td>{tok:,.0f}</td>"
+                f"<td class=lead>{tok / total_tok * 100:.1f}%</td></tr>")
+        totals = Counter()
+        for c in kinds.values():
+            totals.update(c)
+        parts.append(
+            "<tr class=total><td>all</td>"
+            + "".join(f"<td>{totals.get(k, 0):,}</td>" for k in order)
+            + f"<td>{assign['roots']:,}</td><td>{total_tok:,.0f}</td>"
+            "<td class=lead>100.0%</td></tr></tbody></table>")
+        parts.append(
+            '<p class="sub"><b>ISL new is the whole chain, not the opening turn.</b> '
+            "A thread stays on the rank its first turn was routed to — every later "
+            "turn carries the previous prompt, so that rank's match is unbeatable — "
+            "which makes one routing decision own all of a conversation's compute. "
+            "Read this against <code>imbalance</code> above: near-equal thread counts "
+            "with unequal token totals is not the router misdividing, it is one kind "
+            "of conversation being heavier than another and affinity keeping each "
+            "kind together.</p>")
+
+        parts.append("<h3>Why each thread landed there</h3>")
+        reasons = assign["reason"]
+        cols = sorted({k for c in reasons.values() for k in c},
+                      key=lambda k: -sum(c.get(k, 0) for c in reasons.values()))
+        parts.append("<table><thead><tr><th>rank</th>"
+                     + "".join(f"<th>{k}</th>" for k in cols)
+                     + "</tr></thead><tbody>")
+        for rank in sorted(reasons, key=lambda r: int(r) if r.isdigit() else r):
+            parts.append(f"<tr><td>{rank}</td>"
+                         + "".join(f"<td>{reasons[rank].get(k, 0):,}</td>"
+                                   for k in cols) + "</tr>")
+        parts.append("<tr class=total><td>all</td>"
+                     + "".join(f"<td>{sum(c.get(k, 0) for c in reasons.values()):,}</td>"
+                               for k in cols) + "</tr></tbody></table>")
+        parts.append(
+            '<p class="sub">Replayed from the routing trace. <b>best match</b> is one '
+            "rank scoring strictly lowest — cache affinity deciding. <b>tie, req_id "
+            "shuffle</b> is every candidate scoring identically <i>and</i> carrying "
+            "the same load, so the winner is the first entry of a permutation seeded "
+            f"on the request id; that happens when a prompt matches under "
+            f"{ROUTER_MATCH_RATE_THRESHOLD:.0%} of itself anywhere, which forces every "
+            "match to zero. <b>candidates capped</b> means the fair-share cap had "
+            "already dropped a rank for the rest of that batch — possibly the one "
+            "holding the prefix, which the trace cannot show. The gate assumes the "
+            "router's default threshold; a deployment that overrides it will mislabel "
+            "the ties.</p>")
 
     # ---- 4 ----
     parts.append("<h2>4 · Run totals</h2>")
@@ -2727,46 +3738,6 @@ def render_html(runs: list[Run], requests: list[dict], sessions: list[dict],
                     "<code>disable_overlap_scheduler: true</code> reports it.")
                  + "</div>")
 
-    # An appendix, and closed by default: it is a per-request drill-down, read
-    # after the four sections have said whether anything needs drilling into.
-    if low:
-        detail = []
-        detail.append(f"<h3>Hit rate below {HIT_RATE_FLOOR:.0%} "
-                     f"({len(low)} of {len(requests)})</h3>")
-        if low:
-            healthy = _stats([r["ttft_ms"] or r["ttft_engine_ms"]
-                              for r in requests if not r["low_hit_rate"]])["p50"]
-            rows = []
-            for row in sorted(low, key=lambda r: -(r["ttft_ms"] or r["ttft_engine_ms"] or 0)):
-                ttft = row["ttft_ms"] or row["ttft_engine_ms"]
-                rows.append({
-                    "request_index": row["request_index"],
-                    "session_turn_index": row["session_turn_index"],
-                    "ttft": _dur(ttft),
-                    "vs_healthy": (f"{ttft / healthy:.1f}×"
-                                   if ttft and healthy else "—"),
-                    "kv_hit_rate": row["kv_hit_rate"],
-                    "isl_total": row["isl_total"],
-                    "cause": row.get("cause") or "",
-                    "low_hit_rate": True,
-                })
-            detail.append(_table(rows, [
-                ("request_index", "#"), ("session_turn_index", "turn"),
-                ("ttft", "TTFT"), ("vs_healthy", "vs healthy p50"),
-                ("kv_hit_rate", "hit"), ("isl_total", "ISL"),
-                ("cause", "cause")], flag="low_hit_rate"))
-            if not any(r["cause"] for r in rows):
-                detail.append('<p class="sub">The <code>cause</code> column is filled by '
-                             "the analyst, not the script: separating an evicted prefix "
-                             "from a rewritten prompt needs the captured request bodies. "
-                             "Write one line per row into a CSV of "
-                             "<code>request_index,cause</code> and re-run with "
-                             "<code>--causes</code>.</p>")
-        else:
-            detail.append('<p class="sub">None.</p>')
-        parts.append(f'<details id="low-hit"><summary>Hit rate below '
-                     f'{HIT_RATE_FLOOR:.0%} — {len(low)} of {len(requests)} '
-                     f'requests</summary>{"".join(detail)}</details>')
     return (f"<!doctype html><meta charset=utf-8><title>{title}</title>"
             f"<style>{CSS}</style>" + "".join(parts) + CHART_JS)
 
@@ -2924,6 +3895,10 @@ def main() -> int:
                         help=f"report label under {REPORTS_ROOT}, or an "
                              "absolute path to write outside it "
                              "(default: the run's own name)")
+    parser.add_argument("--threads", type=Path, default=None,
+                        help="threads.csv from analysis/threads_and_tools.py; "
+                             "adds section 1's per-cause KV-miss cost table, "
+                             "which needs each request's parent turn")
     parser.add_argument("--causes", type=Path, default=None,
                         help="CSV of request_index,cause to annotate the "
                              "low-hit-rate table")
@@ -2971,6 +3946,13 @@ def main() -> int:
                       for r in csv.DictReader(handle)}
         for row in requests:
             row["cause"] = causes.get(str(row["request_index"]), "")
+
+    # Optional: the rebuilt threads, which section 1's KV-miss cost table needs
+    # to know each request's previous turn. Absent, the section says how to get it.
+    threads: dict = {}
+    if args.threads and args.threads.exists():
+        with args.threads.open(encoding="utf-8") as handle:
+            threads = {t["audit_request_id"]: t for t in csv.DictReader(handle)}
 
     sessions = build_sessions(requests, capacity)
     for session in sessions:
@@ -3051,6 +4033,14 @@ def main() -> int:
                "one saturates and evicts."
                if capacity.get("slots_per_rank_by_pg") else ""))
 
+    negative_gaps = _annotate_thread_gaps(requests, threads)
+    if negative_gaps:
+        notes.append(
+            f"{negative_gaps} thread parent links have the child starting before "
+            "the parent finished. That is impossible by build_threads' own rule "
+            "and means the rebuild is stale or wrong; those gaps are dropped "
+            "rather than reported.")
+
     _write_csv(out / "requests.csv", requests)
     _write_csv(out / "sessions.csv", sessions)
     _write_csv(out / "ctx_iters.csv", ctx_iters)
@@ -3061,7 +4051,7 @@ def main() -> int:
     _write_csv(out / "summary.csv", [summary])
     (out / "REPORT.html").write_text(
         render_html(runs, requests, sessions, ctx_iters, gen_iters, rank_iters,
-                    summary, notes, rank_pg_iters, capacity),
+                    summary, notes, rank_pg_iters, capacity, threads, out),
         encoding="utf-8")
 
     label = (f"{len(runs)} runs merged" if len(runs) > 1 else runs[0].name)

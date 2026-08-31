@@ -29,7 +29,7 @@ from pathlib import Path
 # it, plus enough identity to group calls that behave alike.
 KEEP_INPUT = {
     "Bash": ("run_in_background", "timeout"),
-    "Agent": ("subagent_type", "model", "isolation"),
+    "Agent": ("subagent_type", "model", "isolation", "description", "prompt"),
     "Task": ("subagent_type",),
     "TaskCreate": ("subagent_type", "model"),
     "Monitor": ("timeout", "interval"),
@@ -47,6 +47,12 @@ RESULT_HEAD = 400
 # <task-notification> block injected into a later user message, and that block
 # carries the launching <tool-use-id>. It is the only link between a launch
 # and the moment the work actually finished, so it is extracted here.
+# What a thread is actually doing, with the harness's preamble removed. Done
+# here rather than downstream because a <system-reminder> carrying CLAUDE.md
+# can run to 14k characters -- past any truncation window -- so downstream the
+# closing tag is often missing and the block cannot be matched at all.
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
 NOTIFY = re.compile(
     r"<task-notification>\s*<task-id>(?P<task>[^<]*)</task-id>\s*"
     r"<tool-use-id>(?P<use>[^<]*)</tool-use-id>"
@@ -65,6 +71,34 @@ def _strip(value):
     if isinstance(value, list):
         return [_strip(v) for v in value]
     return value
+
+
+# The harness also injects `<system-reminder>` blocks *inside* user messages
+# -- not as `role: system` entries -- and it inserts them at the head, which
+# shifts every following block and breaks a per-message digest on message 0.
+# Observed doing exactly that to the first message of a subagent's turn 2.
+# They are harness commentary, not conversation, so they come out too.
+def _drop_reminders(message):
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    kept = [b for b in content
+            if not (isinstance(b, dict) and b.get("type") == "text"
+                    and (b.get("text") or "").lstrip().startswith("<system-reminder>"))]
+    return {**message, "content": kept}
+
+
+# The API accepts a message body either as a string or as a one-element text
+# block, and Claude Code alternates between the two forms for the same content:
+# on 52 links here the parent sent [{"type":"text","text":X}] and the child sent
+# "X", byte-identical text under different encodings. Canonicalising to the
+# block form makes those compare equal, which is what removes the need for a
+# trailing-message tolerance rather than papering over it.
+def _canon(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return {**message, "content": [{"type": "text", "text": content}]}
+    return message
 
 
 def _digest(value) -> str:
@@ -115,7 +149,8 @@ def distil(path: Path) -> dict | None:
                 name = block.get("name") or ""
                 raw = block.get("input")
                 raw = raw if isinstance(raw, dict) else {}
-                keep = {k: raw.get(k) for k in KEEP_INPUT.get(name, ())
+                keep = {k: (v[:400] if isinstance(v := raw.get(k), str) else v)
+                        for k in KEEP_INPUT.get(name, ())
                         if raw.get(k) is not None}
                 uses.append({
                     "i": index, "id": block.get("id"), "name": name,
@@ -130,12 +165,43 @@ def distil(path: Path) -> dict | None:
                     "chars": len(text), "head": text[:RESULT_HEAD],
                 })
 
+    # What a thread *is* shows up in three places: the tool set it was given
+    # (subagents get a restricted one), the system prompt it runs under, and
+    # the opening user message. Roots are compared on these.
+    system = body.get("system")
+    sys_text = ""
+    if isinstance(system, list):
+        sys_text = "\n".join(b.get("text") or "" for b in system
+                              if isinstance(b, dict))
+    elif isinstance(system, str):
+        sys_text = system
+    tool_names = sorted(t.get("name") or "" for t in (body.get("tools") or []))
+    first_user = ""
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            first_user = content
+        elif isinstance(content, list):
+            first_user = "\n".join(b.get("text") or "" for b in content
+                                    if isinstance(b, dict) and b.get("type") == "text")
+        break
+
     return {
         "audit_request_id": cap.get("audit_request_id"),
+        "tool_names": tool_names,
+        "sys_chars": len(sys_text),
+        "sys_head": sys_text[:400],
+        "first_user_head": first_user[:4000],
+        "first_user_task": " ".join(REMINDER.sub(" ", first_user).split())[:300],
+        "first_user_chars": len(first_user),
         "client_session_id": cap.get("client_session_id"),
         "captured_at": cap.get("captured_at"),
         # thread reconstruction inputs
-        "msgs": [_digest(m) for m in messages],
+        "msgs": [_digest(_canon(m)) for m in messages],
+        "msgs_clean": [_digest(_drop_reminders(_canon(m))) for m in messages],
+        "roles": [m.get("role") for m in messages],
         "system": _digest(body.get("system")),
         "system_msgs": sum(1 for m in messages if m.get("role") == "system"),
         "n_tools": len(body.get("tools") or []),
