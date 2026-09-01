@@ -16,10 +16,13 @@ cluster + model pair; everything else is derived.
 ```
 
 To hand the server to other people, put a [gateway](#gateway) in front of it:
-one address that survives the serving job being rescheduled.
+one address that survives the serving job being rescheduled, and that decides on
+request whether any GPUs are held at all.
 
 ```bash
-./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --submit
+./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --submit  # once, lives a week
+./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --start   # take GPUs, serve
+./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --stop    # give them back
 ```
 
 Inside an existing `salloc` allocation, skip `sbatch` and run the controller
@@ -39,6 +42,7 @@ sends SIGHUP and kills a server that may still be loading weights.
 
 ```text
 serve.sh                            launcher: submit / run / launch / gateway / start|restart|stop|quit|status
+                                    (gateway --start|--stop|--status drives a running gateway)
 gateway.py                          the gateway process serve.sh starts (standard library only)
 deployments/
   computelab_glm5.2.yaml            one file per cluster + model pair
@@ -176,7 +180,7 @@ Once per deployment, then only when the gateway's seven days run out:
 vi deployments/gateway_users.txt                                        # one username per line (not enforced right now)
 ./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --submit
 curl -s http://lego-c2-qs-26:8333/_gateway/health
-# {"status": "no_backend", "active": null, "uptime_s": 12}
+# {"status": "stopped", "deployment": "computelab_glm5.2", "active": null, "desired": "stopped", ...}
 ```
 
 For the unpinned coreai deployment, wait for Slurm to start the job and read the
@@ -187,23 +191,82 @@ chosen hostname instead of assuming one:
 cat /lustre/fsw/portfolios/coreai/users/serli/claude-traces/_fleet/coreai_deepseek_v4_flash/gateway_url
 ```
 
-`no_backend` is the correct answer here: the gateway is up, there is simply no
-serving job yet. Start one the usual way -- the command is unchanged:
+`stopped` is the correct answer here, and not a fault: the gateway is up and it
+is deliberately holding nothing. It costs four cores, so it is meant to sit
+there for a week; the GPUs are the expensive half and they are only taken when
+somebody asks.
+
+### Starting and stopping the serving job
 
 ```bash
-./serve.sh submit --yaml deployments/computelab_glm5.2.yaml --label bringup
+./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --start
+# {"action": "submitted", "desired": "running", "job_id": "3452201", ...}
 ```
 
-Weights take a while, and `/health` flips when they are loaded:
+That submits the serving job, and from then on the gateway keeps one up by
+itself: it relays a successor in 45 minutes before the wall clock, moves routing
+when the successor is healthy, reclaims the predecessor after three minutes, and
+resubmits outright if the fleet is ever lost. Weights take a while, and
+`/health` flips when they are loaded:
 
 ```bash
-curl -s http://lego-c2-qs-26:8333/_gateway/health
-# {"status": "ok", "active": "3452201", "uptime_s": 900}
+./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --status
+# {"status": "ok", "active": "3452201", "desired": "running", "pending": null, ...}
 ```
 
-After that it runs itself: the successor is submitted 45 minutes before the wall
-clock, routing moves when it is healthy, and the predecessor is reclaimed once
-the successor has held up for three minutes.
+Giving the GPUs back is the same command with `--stop`:
+
+```bash
+./serve.sh gateway --yaml deployments/computelab_glm5.2.yaml --stop
+# {"action": "stopped", "released": ["3452201"], "still_allocated": [], "failed": [], ...}
+```
+
+Every serving job is released through `serve.sh quit`, which stops the server
+and lets the controller exit, which under `sbatch` ends the job and returns the
+nodes. A job that never got far enough to have a run directory is `scancel`ed
+instead, and so is one whose `quit` fails outright. Routing stops in the same
+instant, before anything is torn down, so a client sees a clean `503` rather
+than a truncated reply. The gateway keeps running on the same address.
+
+`quit` only writes a control file, so it returning cleanly does not by itself
+mean the GPUs came back. `--stop` waits for Slurm to agree before it says
+`released`, and reports anything that stopped serving but is still holding
+nodes under `still_allocated` instead of claiming otherwise:
+
+- `released` -- the server is down and Slurm has the nodes back.
+- `still_allocated` -- the server is down, the allocation is not this script's
+  to end. Normal for a controller started by hand inside an `salloc`, where the
+  allocation is your shell. `scancel` it yourself if you want the nodes; the
+  gateway will not, because guessing there ends your session too.
+- `failed` -- neither `quit` nor `scancel` worked. The job id is in the reply
+  and in the log; it is still routable, because it is still serving.
+
+Before it sends either POST, `--start` and `--stop` ask the address in
+`gateway_url` which deployment it serves and refuse if the answer is not this
+one. That file outlives the gateway that wrote it and a pinned hostname can come
+back hosting something else; releasing another model's GPUs is not a mistake
+worth being able to make. `--status` skips the check, since it changes nothing
+and is what you reach for when you suspect the file is stale.
+
+`--start` is idempotent: it adopts a serving job that is already there instead
+of submitting a second one, including one submitted by hand with `serve.sh
+submit`, and including one that is still loading weights. So retrying it when
+you are not sure the first call landed is safe.
+
+The endpoints behind those three flags are plain HTTP, if you would rather not
+go through `serve.sh`:
+
+```bash
+curl -XPOST http://lego-c2-qs-26:8333/_gateway/start_server
+curl -XPOST http://lego-c2-qs-26:8333/_gateway/stop_server
+curl -XPOST 'http://lego-c2-qs-26:8333/_gateway/start_server?label=bringup'
+```
+
+They are unauthenticated, like `/v1/*`. `POST` is required and nothing else is
+accepted, so a mistyped `GET` or a link preview cannot release an allocation --
+which is the only guard there is. Anyone who can reach the port can start and
+stop the GPUs; that is the same trust boundary the model itself already sits
+behind on this network.
 
 ### Using it
 
@@ -281,7 +344,7 @@ What the three failures mean:
 | Response | Meaning | What to do |
 |---|---|---|
 | `401` | Not on the allowlist | **The allowlist check is currently commented out in `Gateway.handle`, so `/v1/*` no longer returns this.** With it on: ask for a line in `gateway_users.txt`; it takes effect without a restart |
-| `503` | Backends are rotating, or none has started | Wait -- clients retry on their own. Tens of minutes means no serving job is running |
+| `503` | Backends are rotating, or none has started | Wait -- clients retry on their own. The message says which of the two it is; `no serving job is running` means nobody has called `--start` |
 | `overloaded_error` partway through a reply | The backend went away mid-stream | Resend; the partial reply cannot be recovered |
 
 ### Registration and election
@@ -322,6 +385,9 @@ which is what `serve.sh restart` looks like from here.
 | Connection refused, or `/health` non-200 | Out of rotation at once; the process is gone |
 | `/health` times out | Tolerated for 20 consecutive probes |
 | No healthy backend | `503` with `Retry-After`, so clients back off instead of erroring |
+| Stopped on request | `503` naming `start_server`, and `/_gateway/health` reports `stopped` rather than `no_backend` -- nothing to page on |
+| Serving a job nobody started | `/_gateway/health` reports `unmanaged` and the log warns every sweep; traffic is unaffected until that job's wall clock |
+| Fleet lost while running | Resubmits on its own, backing off 30s, 60s, 120s ... up to 10 minutes if `sbatch` keeps refusing |
 | Backend disappears mid-stream | Injects an Anthropic `error` event, so the client sees a protocol error rather than a reset |
 | Job vanishes without deregistering | Heartbeat ages out after 30s |
 
@@ -336,9 +402,20 @@ curl -s http://<gateway>:8333/_gateway/health                       # unauthenti
 curl -s -H "x-api-key: $USER" http://<gateway>:8333/_gateway/fleet  # every backend, with its state
 ```
 
+`/_gateway/health` answers one of four, plus `deployment`, `desired` and the id
+of any job still loading:
+
+| `status` | Meaning |
+|---|---|
+| `ok` | Serving, and this gateway owns the job: it will relay a successor in |
+| `unmanaged` | Serving a job it merely found. Nothing will be submitted before that job's wall clock -- one `--start` adopts it |
+| `no_backend` | A serving job was asked for and is not up yet |
+| `stopped` | None was asked for. Not a fault, nothing to page on |
+
 `/_gateway/fleet` reports `healthy`, `healthy_for_s`, `probe_timeouts`,
-`inflight`, `ends_in_s`, `superseded` and `draining` per backend, which is
-enough to see exactly where a handover is stuck.
+`inflight`, `ends_in_s`, `superseded`, `draining` and `stopping` per backend,
+which is enough to see exactly where a handover is stuck, and
+`submit_retry_in_s` when `sbatch` has been refusing the job.
 
 ### Limits
 
@@ -350,9 +427,17 @@ enough to see exactly where a handover is stuck.
   A CNAME at https://itss.nvidia.com/dns/hostrecord (self-service for
   3rd-level `*.nvidia.com` names) turns that into a two-minute edit nobody else
   has to hear about. Worth having before it is needed.
-- **Nothing restarts after a total outage.** The relay only submits while a
-  backend is alive, so if the gateway and the serving job are cancelled
-  together, recovery is manual: resubmit the gateway, then the serving job.
+- **A restarted gateway comes up idle.** It boots holding nothing, by design, so
+  a gateway whose seven days ran out -- or that was cancelled with its serving
+  job, or requeued after a node failure -- needs `--start` after it is
+  resubmitted. It still routes to a serving job it finds already running, so
+  nobody loses access; what it will not do is relay that job in before its wall
+  clock, or reclaim it. That state is `status: "unmanaged"` in
+  `/_gateway/health` and a warning in the log on every supervisor sweep, so it
+  is alertable rather than something to remember. One `--start` adopts the job
+  and clears it. The alternative -- persisting `desired` across restarts --
+  would also resurrect a deployment somebody had deliberately stopped, so the
+  idle boot is the safer default and the health status is the mitigation.
 - **A third deployment needs its own node or port.** The two checked-in gateways
   both use 8333 and stay out of each other's way by being pinned to different
   nodes; a new one has to keep that true.

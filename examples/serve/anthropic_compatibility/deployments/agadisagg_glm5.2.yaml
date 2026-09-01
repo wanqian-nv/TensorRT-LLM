@@ -26,13 +26,17 @@ model:
 
 slurm:
   account: coreai_mlperf_inference
-  partition: batch
+  # batch_long, not batch: the two partitions share the same 5400 nodes, the
+  # same PriorityTier and the same PriorityJobFactor, and differ only in MaxTime
+  # -- 4h against 7d. A 4h wall clock means six handovers a day, each costing a
+  # ~10 minute reload, for no scheduling benefit.
+  partition: batch_long
   # interactive rather than normal: priority 700 against normal's 100, which
   # matters because two whole nodes must land at once. The QoS caps at
   # MaxTRESPU node=4 with DenyOnLimit, so this deployment's 2 nodes leave room
   # for one more 2-node deployment and no more.
   qos: interactive
-  time: "4:00:00"
+  time: "24:00:00"
   nodes: 2
   gpus_per_node: 4
   extra_args: []
@@ -44,10 +48,15 @@ container:
     - /lustre/fsw:/lustre/fsw
 
 server:
-  # The proxy port on the first allocated node; the workers take 8335 and 8336
+  # The proxy port on the first allocated node; the workers take 8334 and 8335
   # and are never addressed by clients. Unrelated to gateway.port below, which
   # lives on a CPU node.
-  port: 8334
+  #
+  # 8333 rather than the 8334 this used to use: the port is the address users
+  # hold, and this deployment now replaces agadisagg_deepseek_v4_pro rather than
+  # running beside it. Only one of the two can be up at a time, which is the
+  # same relationship the Pro file already documents for the Flash deployments.
+  port: 8333
   install_repo: true
   # GB300 NVL72 has two Grace sockets per node, and the reference benchmark
   # config turns numa_bind on for exactly this hardware.
@@ -82,7 +91,10 @@ trace:
   root: /scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/serli/claude-traces
 
 gateway:
-  port: 8334
+  # 8333, taking over the address agadisagg_deepseek_v4_pro used to hold. The
+  # fleet directories differ (cluster_name + model.name), so the two never mix
+  # backends, but only one of them can bind the port -- they are alternatives.
+  port: 8333
   account: coreai_mlperf_inference
   partition: cpu
   qos: cpu-long
@@ -92,4 +104,12 @@ gateway:
   # up three processes, and the proxy only answers once both workers have
   # loaded 433 GiB of weights.
   lead_time: 2700
-  extra_args: ["--exclusive"]
+  # Pinned to cpu-0044, the node the Pro gateway held, so the URL users keep in
+  # ANTHROPIC_BASE_URL survives the switch. There is no automatic successor for
+  # a gateway -- it is submitted by hand -- so a fixed node is safe here.
+  #
+  # No --exclusive: the gateway proxies HTTP on 4 of the node's 90 CPUs and has
+  # no claim on the rest, while asking for the whole machine makes the pin queue
+  # on any node that is merely partly busy. That is exactly how an earlier pin to
+  # cpu-0033 got stuck behind a 7-day reservation instead of starting.
+  extra_args: ["--nodelist=cpu-0044"]

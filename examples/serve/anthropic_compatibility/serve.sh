@@ -38,6 +38,11 @@ commands:
   gateway --yaml FILE [--submit]         stable front door for the serving
                                          jobs; --submit runs it as a long
                                          CPU-only Slurm job instead of here
+  gateway --yaml FILE --start            ask a running gateway to find GPUs and
+                                         bring a serving job up
+  gateway --yaml FILE --stop             ask it to release every serving job;
+                                         only the gateway keeps running
+  gateway --yaml FILE --status           what that gateway is doing
   start|restart|stop|quit|status RUN_DIR drive a controller already running
 EOF
 }
@@ -334,12 +339,16 @@ parse_args() {
     ARG_LABEL=""
     ARG_ATTEMPT_DIR=""
     ARG_SUBMIT=""
+    ARG_CONTROL=""
     while (( $# )); do
         case "$1" in
             --yaml) ARG_YAML="${2:?--yaml needs a value}"; shift 2 ;;
             --label) ARG_LABEL="${2:?--label needs a value}"; shift 2 ;;
             --attempt-dir) ARG_ATTEMPT_DIR="${2:?--attempt-dir needs a value}"; shift 2 ;;
             --submit) ARG_SUBMIT="1"; shift ;;
+            --start) ARG_CONTROL="start"; shift ;;
+            --stop) ARG_CONTROL="stop"; shift ;;
+            --status) ARG_CONTROL="status"; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -348,11 +357,20 @@ parse_args() {
     ARG_YAML="$(readlink -f "${ARG_YAML}")"
 }
 
+# --start/--stop/--status drive a gateway; every other command parses the same
+# flags and would silently ignore them. `serve.sh submit --yaml X --stop` would
+# then allocate GPUs, which is the exact opposite of what was typed.
+reject_control_flags() {
+    [[ -z "${ARG_CONTROL}" ]] || die "--${ARG_CONTROL} only applies to \
+'serve.sh gateway'; you probably meant: serve.sh gateway --yaml ${ARG_YAML} --${ARG_CONTROL}"
+}
+
 # --------------------------------------------------------------------------
 # submit: build the sbatch command line from the YAML
 # --------------------------------------------------------------------------
 cmd_submit() {
     parse_args "$@"
+    reject_control_flags
     load_config
 
     local log_dir="${CFG_TRACE_ROOT}/_sbatch_logs"
@@ -521,6 +539,7 @@ start_attempt() {
 
 cmd_run() {
     parse_args "$@"
+    reject_control_flags
     : "${SLURM_JOB_ID:?serve.sh run must execute inside a Slurm allocation}"
     : "${SLURM_JOB_NODELIST:?serve.sh run must execute inside a Slurm allocation}"
     load_config
@@ -702,6 +721,7 @@ format_cmd() {
 
 cmd_launch() {
     parse_args "$@"
+    reject_control_flags
     [[ -n "${ARG_ATTEMPT_DIR}" ]] || die "--attempt-dir is required"
     : "${SLURM_JOB_ID:?serve.sh launch must execute inside a Slurm allocation}"
     load_config
@@ -1099,9 +1119,85 @@ gateway_submit() {
     sbatch "${sbatch_args[@]}" "${CFG_SERVE_SH}" gateway --yaml "${ARG_YAML}"
 }
 
+# The gateway holds no GPUs until asked. Two POST endpoints decide that, and
+# curl against them works just as well -- this exists so that driving a gateway
+# uses the same `--yaml` the rest of this script does, instead of making
+# somebody look the published address up by hand first.
+# One curl, with the response body and the status code kept apart. Writes
+# GW_BODY and GW_CODE; the return status says only whether curl itself ran, so
+# an HTTP error still leaves its body -- which carries the reason -- readable.
+GW_BODY=""
+GW_CODE=""
+gateway_curl() {
+    local timeout="$1" response
+    shift
+    # Command substitution strips trailing newlines, and %{http_code} ends
+    # without one, so the code is always the last line however the body ends.
+    response="$(curl --silent --show-error --max-time "${timeout}" \
+                     --write-out $'\n%{http_code}' "$@")" || return 1
+    GW_CODE="${response##*$'\n'}"
+    GW_BODY="${response%$'\n'*}"
+    return 0
+}
+
+# The gateway holds no GPUs until asked. Two POST endpoints decide that, and
+# curl against them works just as well -- this exists so that driving a gateway
+# uses the same `--yaml` the rest of this script does, instead of making
+# somebody look the published address up by hand first.
+gateway_control() {
+    local action="$1" url url_file seen
+    url_file="${CFG_FLEET_DIR}/gateway_url"
+    [[ -f "${url_file}" ]] || die "no gateway has published an address in ${url_file}
+start one with: serve.sh gateway --yaml ${ARG_YAML} --submit"
+    url="$(head -1 "${url_file}")"
+    [[ -n "${url}" ]] || die "empty gateway address in ${url_file}"
+
+    # gateway_url outlives the gateway that wrote it, and a pinned hostname can
+    # come back hosting somebody else's. Releasing the wrong deployment's GPUs
+    # is not a mistake worth being able to make, so ask who is answering before
+    # sending anything that changes state. Skipped for --status, which changes
+    # nothing and is the thing you reach for when you suspect the file is stale.
+    if [[ "${action}" != "status" ]]; then
+        gateway_curl 20 "${url}/_gateway/health" \
+            || die "cannot reach the gateway at ${url}
+that address came from ${url_file} and may be stale; check the gateway job:
+  squeue -u ${USER:-$(id -un)} -n ${CFG_NAME}-gateway"
+        [[ "${GW_CODE}" == 2?? ]] \
+            || die "the gateway at ${url} answered HTTP ${GW_CODE} on /_gateway/health
+refusing to ${action} anything until it says which deployment it serves"
+        seen="$(printf '%s' "${GW_BODY}" \
+                | sed -n 's/.*"deployment": *"\([^"]*\)".*/\1/p')"
+        [[ -n "${seen}" ]] \
+            || die "the gateway at ${url} did not name a deployment in /_gateway/health
+it predates this check; upgrade it, or use curl -XPOST ${url}/_gateway/${action}_server"
+        [[ "${seen}" == "${CFG_NAME}" ]] \
+            || die "${url} is the gateway for '${seen}', not '${CFG_NAME}'
+${url_file} is stale. Refusing to ${action} another deployment's serving jobs."
+    fi
+
+    # Long enough for stop to walk every backend: each one is released and then
+    # watched until Slurm confirms the nodes came back.
+    case "${action}" in
+        start)  gateway_curl 180 --request POST "${url}/_gateway/start_server" ;;
+        stop)   gateway_curl 180 --request POST "${url}/_gateway/stop_server" ;;
+        status) gateway_curl 30 "${url}/_gateway/health" ;;
+    esac || die "cannot reach the gateway at ${url}
+check that its Slurm job is still running: squeue -u ${USER:-$(id -un)} -n ${CFG_NAME}-gateway"
+
+    printf '%s\n' "${GW_BODY}"
+    [[ "${GW_CODE}" == 2?? ]] || die "gateway answered HTTP ${GW_CODE}"
+}
+
 cmd_gateway() {
     parse_args "$@"
     load_config
+
+    # Driving a gateway that is already running needs neither the gateway
+    # script nor the users file, only the address that gateway published.
+    if [[ -n "${ARG_CONTROL}" ]]; then
+        gateway_control "${ARG_CONTROL}"
+        return
+    fi
 
     [[ -f "${CFG_GW_SCRIPT}" ]] || die "gateway script not found: ${CFG_GW_SCRIPT}"
     [[ -f "${CFG_GW_USERS}" ]] || die "users file not found: ${CFG_GW_USERS}
@@ -1122,6 +1218,7 @@ create it with one username per line; every request is checked against it"
     echo "  ANTHROPIC_BASE_URL=${url}"
     echo "  users: ${CFG_GW_USERS}"
     echo "  fleet: ${CFG_FLEET_DIR}"
+    echo "  idle: no serving job until 'serve.sh gateway --yaml ${ARG_YAML} --start'"
     exec python3 "${CFG_GW_SCRIPT}" \
         --fleet-dir "${CFG_FLEET_DIR}" \
         --users "${CFG_GW_USERS}" \

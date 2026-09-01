@@ -53,7 +53,11 @@ max_num_tokens: 128
 max_seq_len: 1048576
 
 moe_config:
-  backend: CUTEDSL
+  # TRTLLM, matching the context worker and the Pro deployment -- see the longer
+  # note in glm5.2_ctx_tep4.yaml. CUTEDSL should suit an nvfp4 checkpoint, but it
+  # is unproven on this model and its failure mode is a silent per-layer
+  # fallback, so it is an experiment to run deliberately rather than a default.
+  backend: TRTLLM
   # Added from the reference recipes, which set it on every decode worker.
   use_low_precision_moe_combine: true
 moe_expert_parallel_size: 4
@@ -73,6 +77,21 @@ scheduler_config:
   capacity_scheduler_policy: MAX_UTILIZATION
   context_chunking_policy: EQUAL_PROGRESS
 sparse_attention_config:
+  # The discriminator, and not optional: sparse_attention_config is a tagged
+  # union keyed on `algorithm`, so a block without it fails TorchLlmArgs
+  # validation outright -- "Unable to extract tag using discriminator
+  # 'algorithm'" -- and the generation worker dies before it loads a single
+  # weight (job 623663). dsa is the tag this model resolves to: model_config.py
+  # rebuilds the field as DeepSeekSparseAttentionConfig for
+  # GlmMoeDsaForCausalLM, which declares algorithm: Literal["dsa"].
+  #
+  # That rebuild happens AFTER validation, which is why it cannot rescue a
+  # missing tag -- and it reads the two settings below off the validated object
+  # rather than discarding them, so they are live: index_topk is honoured
+  # because model_fields_set records it as explicitly set, and
+  # enable_heuristic_topk is taken verbatim. Drop the whole block and both fall
+  # back to the checkpoint, with enable_heuristic_topk defaulting to false.
+  algorithm: dsa
   enable_heuristic_topk: true
   index_topk: 2048
 # 20 rather than the aggregated 10, following the reference recipes.
